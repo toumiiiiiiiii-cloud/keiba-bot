@@ -1,124 +1,110 @@
 import os
 import re
-import time
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, request, abort
-from linebot.v3 import WebhookHandler
-from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.messaging import (
-    Configuration,
-    ApiClient,
-    MessagingApi,
-    ReplyMessageRequest,
-    TextMessage
-)
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
+from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 app = Flask(__name__)
 
-CHANNEL_SECRET = os.getenv('LINE_CHANNEL_SECRET')
-CHANNEL_ACCESS_TOKEN = os.getenv('LINE_CHANNEL_ACCESS_TOKEN')
+# 環境変数からLINEのアクセスキーを取得
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
+LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
 
-configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(CHANNEL_SECRET)
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# 12桁のレースIDをテキストやURLから抽出する関数
-def extract_race_id(text):
-    match = re.search(r'\d{12}', text)
-    if match:
-        return match.group(0)
-    return None
+@app.route("/", methods=['GET'])
+def index():
+    return "OK"
 
-# netkeibaから該当レースを取得して予想する関数
-def get_netkeiba_prediction(race_id):
+@app.route("/callback", methods=['POST'])
+def callback():
+    signature = request.headers.get('X-Line-Signature')
+    body = request.get_data(as_text=True)
+
+    try:
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        abort(400)
+
+    return 'OK'
+
+def get_netkeiba_data(race_id):
+    """netkeibaから出走表データを取得する関数（文字化け対策済み）"""
     url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
     
     try:
-        time.sleep(1)
-        response = requests.get(url, headers=headers)
-        response.encoding = 'EUC-JP'
-        soup = BeautifulSoup(response.text, 'html.parser')
+        res = requests.get(url, headers=headers, timeout=10)
         
-        # レース名
-        race_name_tag = soup.find('div', class_='RaceName')
-        race_name = race_name_tag.text.strip() if race_name_tag else f"レースID: {race_id}"
+        # ★netkeiba特有の文字コード(EUC-JP)を設定して文字化けを完全防止
+        res.encoding = 'euc-jp'
         
-        # 馬名・馬番・オッズの取得
+        soup = BeautifulSoup(res.text, 'html.parser')
+        
+        # 馬名と馬番の取得
         horses = []
-        rows = soup.find_all('tr', class_='HorseList')
+        rows = soup.select('tr.HorseList')
+        
         for row in rows:
-            horse_name_tag = row.find('span', class_='HorseName')
-            umaban_tag = row.find('td', class_='Umaban')
-            odds_tag = row.find('span', class_='Odds')
+            umaban_elem = row.select_one('.Umaban')
+            name_elem = row.select_one('.HorseName')
             
-            if horse_name_tag:
-                name = horse_name_tag.text.strip()
-                umaban = umaban_tag.text.strip() if umaban_tag else "?"
-                odds = odds_tag.text.strip() if odds_tag else "---"
-                horses.append({'umaban': umaban, 'name': name, 'odds': odds})
+            if umaban_elem and name_elem:
+                umaban = umaban_elem.text.strip()
+                name = name_elem.text.strip()
+                horses.append({'umaban': umaban, 'name': name})
         
-        if not horses:
-            return f"⚠️ レースID[{race_id}]の出馬表を取得できませんでした。\nURLが正しいか、出馬表が発表されているかご確認ください。"
-        
-        # 予想ロジック（上位出走馬から選定）
-        honmei = horses[0] if len(horses) > 0 else {"umaban": "-", "name": "不明"}
-        taikou = horses[1] if len(horses) > 1 else {"umaban": "-", "name": "不明"}
-        anama  = horses[2] if len(horses) > 2 else {"umaban": "-", "name": "不明"}
-        
-        msg = f"🏇【AI予想結果】🏇\n"
-        msg += f"📍 {race_name}\n"
-        msg += f"----------------------\n"
-        msg += f"◎ 本命: {honmei['umaban']}番 {honmei['name']}\n"
-        msg += f"○ 対抗: {taikou['umaban']}番 {taikou['name']}\n"
-        msg += f"▲ 穴馬: {anama['umaban']}番 {anama['name']}\n"
-        msg += f"----------------------\n"
-        msg += f"出走頭数: {len(horses)}頭\n"
-        msg += f"※ netkeibaから自動取得しました。"
-        return msg
-
+        return horses
     except Exception as e:
-        return f"エラーが発生しました: {str(e)}"
+        print(f"データ取得エラー: {e}")
+        return []
 
-@app.route("/callback", methods=['POST'])
-def callback():
-    signature = request.headers.get('X-Line-Signature', '')
-    body = request.get_data(as_text=True)
-    try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        abort(400)
-    return 'OK'
-
-@handler.add(MessageEvent, message=TextMessageContent)
+@handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
-    user_text = event.message.text.strip()
-    
-    # URLやテキストの中から12桁のレースIDを探す
-    race_id = extract_race_id(user_text)
-    
-    if race_id:
-        reply_text = get_netkeiba_prediction(race_id)
-    else:
-        reply_text = (
-            "【使い方】\n"
-            "netkeibaの出馬表ページの「URL」か「12桁のレースID」を送信してください！\n\n"
-            "例:\n"
-            "https://race.netkeiba.com/race/shutuba.html?race_id=202405010811"
-        )
+    user_text = event.message.text
 
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text=reply_text)]
+    # レースIDの自動抽出 (URLから12桁の数字を取得)
+    match = re.search(r'race_id=(\d{12})', user_text) or re.search(r'\b(\d{12})\b', user_text)
+
+    if match:
+        race_id = match.group(1)
+        horses = get_netkeiba_data(race_id)
+
+        if horses:
+            total_count = len(horses)
+            
+            # 各印の馬を設定
+            honmei = horses[0] if len(horses) > 0 else {"umaban": "-", "name": "不明"}
+            taikou = horses[1] if len(horses) > 1 else {"umaban": "-", "name": "不明"}
+            anama  = horses[2] if len(horses) > 2 else {"umaban": "-", "name": "不明"}
+
+            reply_text = (
+                f"🏇【AI予想結果】🏇\n"
+                f"📍 レースID: {race_id}\n"
+                f"--------------------\n"
+                f"◎ 本命: {honmei['umaban']}番 {honmei['name']}\n"
+                f"◯ 対抗: {taikou['umaban']}番 {taikou['name']}\n"
+                f"▲ 穴馬: {anama['umaban']}番 {anama['name']}\n"
+                f"--------------------\n"
+                f"出走頭数: {total_count}頭\n"
+                f"※ netkeibaから自動取得しました。"
             )
-        )
+        else:
+            reply_text = f"レースID: {race_id} の出走表データが取得できませんでした。"
+    else:
+        reply_text = "netkeibaのレースURLを送信してください！"
+
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(text=reply_text)
+    )
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 10000))
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
