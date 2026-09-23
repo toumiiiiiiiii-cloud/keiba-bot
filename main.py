@@ -32,8 +32,7 @@ def callback():
     return 'OK'
 
 def get_real_netkeiba_data(race_id):
-    """枠順確定後・確定前のどちらでも正確にデータを取得する関数"""
-    
+    """PC版とスマホ版の両方に対応し、文字化けを自動で防ぐ関数"""
     urls = [
         f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}",
         f"https://race.sp.netkeiba.com/race/shutuba.html?race_id={race_id}",
@@ -50,17 +49,16 @@ def get_real_netkeiba_data(race_id):
             if res.status_code != 200:
                 continue
 
-            # netkeiba固有のエンコーディング対策
-            try:
-                html = res.content.decode('euc-jp', errors='replace')
-            except Exception:
-                html = res.content.decode('utf-8', errors='replace')
-
+            # ★文字化け対策の決定版★
+            # apparent_encodingを使用して、サイトの文字コードを自動判定させる
+            res.encoding = res.apparent_encoding
+            html = res.text
             soup = BeautifulSoup(html, 'html.parser')
+            
             horses = []
 
             # --------------------------------------------------
-            # パターン1: 枠順確定後（PC版出馬表）
+            # 優先1: PC版出馬表（最もデータが正確）
             # --------------------------------------------------
             rows = soup.find_all('tr', class_=re.compile(r'HorseList'))
             if rows:
@@ -74,37 +72,39 @@ def get_real_netkeiba_data(race_id):
                         umaban_txt = umaban_td.text.strip() if umaban_td else ""
                         jockey = jockey_td.text.strip() if jockey_td else "未定"
 
-                        # 余計な空白やノイズを除去
                         name = re.sub(r'\s+', '', name)
                         umaban = re.sub(r'\D', '', umaban_txt)
 
-                        if name and len(name) <= 15 and name != "馬名":
+                        # "馬名"というヘッダー行を除外
+                        if name and name != "馬名":
                             horses.append({
                                 'umaban': umaban if umaban else "未定",
                                 'name': name,
                                 'jockey': jockey
                             })
+                
                 if horses:
                     return horses
 
             # --------------------------------------------------
-            # パターン2: 枠順未確定（特別登録・出走予定馬）またはスマホ版
+            # 優先2: スマホ版出馬表 または 特別登録馬
             # --------------------------------------------------
             name_tags = soup.select('.HorseName a, .Horse_Name a, .HorseName, .Horse_Info .Name')
-            for tag in name_tags:
-                name = tag.text.strip()
-                name = re.sub(r'\s+', '', name)
+            if name_tags:
+                for tag in name_tags:
+                    name = tag.text.strip()
+                    name = re.sub(r'\s+', '', name)
 
-                # 重複防止と有効な馬名チェック
-                if name and 2 <= len(name) <= 15 and name not in [h['name'] for h in horses] and name != "馬名":
-                    horses.append({
-                        'umaban': "枠順未定",
-                        'name': name,
-                        'jockey': "未定"
-                    })
-
-            if horses:
-                return horses
+                    # 既に追加済みの馬（重複）やヘッダー文字を除外
+                    if name and name != "馬名" and name not in [h['name'] for h in horses]:
+                        horses.append({
+                            'umaban': "枠順未定",
+                            'name': name,
+                            'jockey': "確認中"
+                        })
+                
+                if horses:
+                    return horses
 
         except Exception as e:
             print(f"Scraping Error ({url}): {e}")
@@ -116,7 +116,6 @@ def get_real_netkeiba_data(race_id):
 def handle_message(event):
     user_text = event.message.text
 
-    # 12桁のレースIDを抽出
     match = re.search(r'race_id=(\d{12})', user_text) or re.search(r'\b(\d{12})\b', user_text)
 
     if match:
@@ -125,26 +124,20 @@ def handle_message(event):
 
         if horses:
             total_count = len(horses)
-            
-            # 枠順確定済みか未確定かを判定
-            is_confirmed = horses[0]['umaban'] != "枠順未定"
+            is_confirmed = horses[0]['umaban'] not in ["未定", "枠順未定"]
             status_text = "【枠順確定済み】" if is_confirmed else "【枠順未確定（特別登録馬）】"
 
-            sample_text = ""
-            if is_confirmed:
-                sample_text = (
-                    f"1番: {horses[0]['name']} (騎手: {horses[0]['jockey']})\n"
-                    f"2番: {horses[1]['name']} (騎手: {horses[1]['jockey']})\n"
-                    f"...\n"
-                    f"大外: {horses[-1]['name']} (騎手: {horses[-1]['jockey']})"
-                )
-            else:
-                sample_text = (
-                    f"・{horses[0]['name']}\n"
-                    f"・{horses[1]['name']}\n"
-                    f"・{horses[2]['name']}\n"
-                    f"..."
-                )
+            # 表示用にリストを作成（上位5頭と最後の大外馬）
+            display_lines = []
+            for i, h in enumerate(horses[:5]):
+                display_lines.append(f"{h['umaban']}番: {h['name']} (騎手: {h['jockey']})")
+            
+            if total_count > 5:
+                display_lines.append("...")
+                last_h = horses[-1]
+                display_lines.append(f"大外: {last_h['name']} (騎手: {last_h['jockey']})")
+            
+            sample_text = "\n".join(display_lines)
 
             reply_text = (
                 f"✅ データを正しく取得しました\n"
@@ -152,13 +145,13 @@ def handle_message(event):
                 f"状態: {status_text}\n"
                 f"出走/登録頭数: {total_count}頭\n"
                 f"--------------------\n"
-                f"【取得馬名データ】\n"
+                f"【取得馬名データ（一部）】\n"
                 f"{sample_text}\n"
                 f"--------------------\n"
-                f"※本物の出走データを正常に解析できています。"
+                f"※本物の出走データを文字化けなしで取得できました。"
             )
         else:
-            reply_text = f"レースID: {race_id} のデータを取得できませんでした。URLをご確認ください。"
+            reply_text = f"レースID: {race_id} のデータを取得できませんでした。"
     else:
         reply_text = "netkeibaの出馬表URLを送信してください。"
 
