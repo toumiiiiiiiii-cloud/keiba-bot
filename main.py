@@ -38,7 +38,7 @@ def callback():
 def handle_message(event):
     user_text = event.message.text
     
-    # 対策1：スマホ用URL(sp.)をPC用に自動変換
+    # 対策1：スマホ用URLをPC用に自動変換
     if "race.sp.netkeiba.com" in user_text:
         user_text = user_text.replace("race.sp.netkeiba.com", "race.netkeiba.com")
     
@@ -57,18 +57,17 @@ def generate_ai_prediction(url):
         return "エラー：AIモデル（keiba_ai_model.pkl）が読み込めませんでした。"
         
     try:
-        # 対策2：アクセス拒否（Bot弾き）を防ぐUser-Agent偽装
+        # 対策2：アクセス拒否を防ぐ偽装
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         }
         
         res = requests.get(url, headers=headers)
         
-        # 対策3：完全な文字化け対策（生データからEUC-JPとして強制デコード）
-        html = res.content.decode('euc-jp', 'replace')
-        soup = BeautifulSoup(html, 'html.parser')
+        # ★最終対策：文字コードをサイトの実際の応答に自動で合わせる（文字化けの完全解消）
+        res.encoding = res.apparent_encoding
+        soup = BeautifulSoup(res.text, 'html.parser')
         
-        # レース名の取得
         race_title_elem = soup.select_one('.RaceName')
         race_name = race_title_elem.text.strip() if race_title_elem else "対象レース"
         
@@ -85,15 +84,14 @@ def generate_ai_prediction(url):
             jockey = jockey_elem.text.strip() if jockey_elem else "不明"
             
             weight = 55.0 
-            jockey_td = row.select_one('.Jockey')
-            if jockey_td:
-                text_parts = jockey_td.get_text(separator='|').split('|')
-                for part in text_parts:
-                    try:
-                        weight = float(part.strip())
-                        break
-                    except ValueError:
-                        continue
+            tds = row.select('td')
+            if len(tds) > 5:
+                try:
+                    weight_text = tds[5].text.strip()
+                    if weight_text:
+                        weight = float(weight_text)
+                except ValueError:
+                    pass
             
             odds = 50.0 
             odds_td = row.select_one('.Txt_R') or row.select_one('.Popular')
