@@ -58,8 +58,13 @@ def generate_ai_prediction(url):
         return "エラー：AIモデル（keiba_ai_model.pkl）が読み込めませんでした。"
         
     try:
+        # ★追加：人間のブラウザからのアクセスに見せかける設定（アクセス拒否対策）
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
+        }
+        
         # 1. netkeibaのページ情報を取得 (文字化け対策 EUC-JP)
-        res = requests.get(url)
+        res = requests.get(url, headers=headers)
         res.encoding = 'EUC-JP'
         soup = BeautifulSoup(res.text, 'html.parser')
         
