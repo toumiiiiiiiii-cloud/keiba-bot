@@ -38,7 +38,7 @@ def callback():
 def handle_message(event):
     user_text = event.message.text
     
-    # 対策1：スマホ用URLをPC用に自動変換
+    # スマホ用URLをPC用に自動変換
     if "race.sp.netkeiba.com" in user_text:
         user_text = user_text.replace("race.sp.netkeiba.com", "race.netkeiba.com")
     
@@ -57,14 +57,11 @@ def generate_ai_prediction(url):
         return "エラー：AIモデル（keiba_ai_model.pkl）が読み込めませんでした。"
         
     try:
-        # 対策2：アクセス拒否を防ぐ偽装
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         }
         
         res = requests.get(url, headers=headers)
-        
-        # ★最終対策：文字コードをサイトの実際の応答に自動で合わせる（文字化けの完全解消）
         res.encoding = res.apparent_encoding
         soup = BeautifulSoup(res.text, 'html.parser')
         
@@ -83,6 +80,7 @@ def generate_ai_prediction(url):
             jockey_elem = row.select_one('.Jockey a')
             jockey = jockey_elem.text.strip() if jockey_elem else "不明"
             
+            # 斤量の取得
             weight = 55.0 
             tds = row.select('td')
             if len(tds) > 5:
@@ -93,15 +91,26 @@ def generate_ai_prediction(url):
                 except ValueError:
                     pass
             
+            # オッズの取得（馬体重との混同を完全に防ぐロジック）
             odds = 50.0 
-            odds_td = row.select_one('.Txt_R') or row.select_one('.Popular')
-            if odds_td:
+            if len(tds) > 9:
                 try:
-                    odds_str = odds_td.text.strip()
+                    odds_str = tds[9].text.strip()
                     if odds_str and odds_str != '---':
                         odds = float(odds_str)
                 except ValueError:
                     pass
+                    
+            # 予備のオッズ取得（表の形が違う地方競馬などへの対策）
+            if odds == 50.0:
+                for el in row.select('.Txt_R'):
+                    try:
+                        val = float(el.text.strip())
+                        # 馬体重（通常400kg以上）を除外してオッズだけを拾う
+                        if val < 350: 
+                            odds = val
+                    except ValueError:
+                        pass
             
             horses_data.append({
                 '馬名': horse_name,
