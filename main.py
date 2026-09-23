@@ -31,66 +31,44 @@ def callback():
 
     return 'OK'
 
-def get_netkeiba_data(user_text, race_id):
-    """中央競馬・地方競馬・スマホ版URLの全てに対応したデータ取得関数"""
+def get_netkeiba_data(race_id):
+    """文字化けを直して馬名・馬番を綺麗に取得する関数"""
+    urls = [
+        f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}",
+        f"https://nar.netkeiba.com/race/shutuba.html?race_id={race_id}"
+    ]
     
-    # ユーザーが送ってきたURLから中央/地方を判定、無ければIDで判定
-    is_nar = 'nar.sp.netkeiba.com' in user_text or 'nar.netkeiba.com' in user_text
-    
-    # URLの組み立て
-    if is_nar:
-        urls = [
-            f"https://nar.sp.netkeiba.com/race/shutuba.html?race_id={race_id}",
-            f"https://nar.netkeiba.com/race/shutuba.html?race_id={race_id}"
-        ]
-    else:
-        urls = [
-            f"https://race.sp.netkeiba.com/race/shutuba.html?race_id={race_id}",
-            f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
-        ]
-
     headers = {
-        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
 
     for url in urls:
         try:
-            res = requests.get(url, headers=headers, timeout=8)
+            res = requests.get(url, headers=headers, timeout=10)
             
-            # 文字コードの判定（UTF-8 または EUC-JP）
-            try:
-                html = res.content.decode('utf-8')
-            except UnicodeDecodeError:
-                html = res.content.decode('euc-jp', errors='ignore')
-                
+            # EUC-JPで直接デコードして文字化けを解消
+            html = res.content.decode('euc-jp', errors='replace')
             soup = BeautifulSoup(html, 'html.parser')
+            
             horses = []
-
-            # 抽出パターン1 (スマホ版出走表)
-            items = soup.select('.HorseList, .RaceList_DataItem, tr.HorseList')
-            for item in items:
-                umaban_elem = item.select_one('.Umaban, .Umaban_Num, .td_umaban')
-                name_elem = item.select_one('.HorseName, .Horse_Name, .Horse_Info .Name')
+            rows = soup.select('tr.HorseList')
+            
+            for row in rows:
+                umaban_elem = row.select_one('.Umaban')
+                # 馬名はリンクタグ内から正確に取得
+                name_elem = row.select_one('.HorseName a') or row.select_one('.HorseName')
                 
                 if umaban_elem and name_elem:
-                    u_txt = re.sub(r'\D', '', umaban_elem.text)
-                    n_txt = name_elem.text.strip().replace('\n', '')
-                    if u_txt and n_txt:
-                        horses.append({'umaban': u_txt, 'name': n_txt})
-
-            # 抽出パターン2 (汎用フォールバック)
-            if not horses:
-                name_elems = soup.select('.HorseName a, .Horse_Name a, span.HorseName')
-                for idx, name_elem in enumerate(name_elems, start=1):
-                    n_txt = name_elem.text.strip()
-                    if n_txt:
-                        horses.append({'umaban': str(idx), 'name': n_txt})
-
+                    umaban = umaban_elem.text.strip()
+                    name = name_elem.text.strip()
+                    if umaban and name:
+                        horses.append({'umaban': umaban, 'name': name})
+            
             if horses:
                 return horses
 
         except Exception as e:
-            print(f"取得試行エラー ({url}): {e}")
+            print(f"取得エラー ({url}): {e}")
             continue
 
     return []
@@ -99,12 +77,12 @@ def get_netkeiba_data(user_text, race_id):
 def handle_message(event):
     user_text = event.message.text
 
-    # レースIDの抽出（12桁の数字）
+    # レースID（12桁の数字）を読み取る
     match = re.search(r'race_id=(\d{12})', user_text) or re.search(r'\b(\d{12})\b', user_text)
 
     if match:
         race_id = match.group(1)
-        horses = get_netkeiba_data(user_text, race_id)
+        horses = get_netkeiba_data(race_id)
 
         if horses:
             total_count = len(horses)
