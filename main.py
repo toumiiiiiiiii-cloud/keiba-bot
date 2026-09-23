@@ -9,7 +9,6 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 app = Flask(__name__)
 
-# 環境変数からLINEのアクセスキーを取得
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
 
@@ -33,21 +32,19 @@ def callback():
     return 'OK'
 
 def get_netkeiba_data(race_id):
-    """netkeibaから出走表データを取得する関数（文字化け対策済み）"""
+    """netkeibaから出走表データを取得する関数（文字化け強制解除版）"""
     url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
     }
     
     try:
         res = requests.get(url, headers=headers, timeout=10)
         
-        # ★netkeiba特有の文字コード(EUC-JP)を設定して文字化けを完全防止
-        res.encoding = 'euc-jp'
+        # ★【最強の文字化け対策】バイナリデータとして取得し、強制的にEUC-JPで変換
+        html = res.content.decode('euc-jp', errors='ignore')
+        soup = BeautifulSoup(html, 'html.parser')
         
-        soup = BeautifulSoup(res.text, 'html.parser')
-        
-        # 馬名と馬番の取得
         horses = []
         rows = soup.select('tr.HorseList')
         
@@ -56,9 +53,11 @@ def get_netkeiba_data(race_id):
             name_elem = row.select_one('.HorseName')
             
             if umaban_elem and name_elem:
-                umaban = umaban_elem.text.strip()
-                name = name_elem.text.strip()
-                horses.append({'umaban': umaban, 'name': name})
+                # 余計な空白や改行を綺麗に削除
+                umaban = re.sub(r'\s+', '', umaban_elem.text)
+                name = re.sub(r'\s+', '', name_elem.text)
+                if umaban and name:
+                    horses.append({'umaban': umaban, 'name': name})
         
         return horses
     except Exception as e:
@@ -69,7 +68,7 @@ def get_netkeiba_data(race_id):
 def handle_message(event):
     user_text = event.message.text
 
-    # レースIDの自動抽出 (URLから12桁の数字を取得)
+    # レースIDの自動抽出
     match = re.search(r'race_id=(\d{12})', user_text) or re.search(r'\b(\d{12})\b', user_text)
 
     if match:
@@ -79,7 +78,6 @@ def handle_message(event):
         if horses:
             total_count = len(horses)
             
-            # 各印の馬を設定
             honmei = horses[0] if len(horses) > 0 else {"umaban": "-", "name": "不明"}
             taikou = horses[1] if len(horses) > 1 else {"umaban": "-", "name": "不明"}
             anama  = horses[2] if len(horses) > 2 else {"umaban": "-", "name": "不明"}
