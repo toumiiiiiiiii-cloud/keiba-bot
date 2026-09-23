@@ -1,8 +1,8 @@
 import os
-import re
 import requests
-import joblib
 from bs4 import BeautifulSoup
+import pandas as pd
+import joblib
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -10,152 +10,138 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 app = Flask(__name__)
 
+# 環境変数からLINEのキーを取得
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# アップロードしたAIモデル（脳みそ）を読み込む
-try:
-    model = joblib.load('keiba_ai_model.pkl')
-    print("AIモデルの読み込みに成功しました！")
-except Exception as e:
-    model = None
-    print(f"AIモデルの読み込みに失敗しました: {e}")
-
-@app.route("/", methods=['GET'])
-def index():
-    return "OK"
+# AIモデルの読み込み
+model_path = 'keiba_ai_model.pkl'
+if os.path.exists(model_path):
+    ai_model = joblib.load(model_path)
+else:
+    ai_model = None
 
 @app.route("/callback", methods=['POST'])
 def callback():
-    signature = request.headers.get('X-Line-Signature')
+    signature = request.headers['X-Line-Signature']
     body = request.get_data(as_text=True)
-
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
         abort(400)
     return 'OK'
 
-def get_real_netkeiba_data(race_id):
-    """ネットケイバから出馬表データを取得する"""
-    urls = [
-        f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}",
-        f"https://race.sp.netkeiba.com/race/shutuba.html?race_id={race_id}",
-        f"https://nar.netkeiba.com/race/shutuba.html?race_id={race_id}"
-    ]
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    }
-
-    for url in urls:
-        try:
-            res = requests.get(url, headers=headers, timeout=10)
-            if res.status_code != 200:
-                continue
-
-            res.encoding = res.apparent_encoding
-            html = res.text
-            soup = BeautifulSoup(html, 'html.parser')
-            horses = []
-
-            # PC版出馬表
-            rows = soup.find_all('tr', class_=re.compile(r'HorseList'))
-            if rows:
-                for row in rows:
-                    umaban_td = row.select_one('td.Umaban')
-                    name_td = row.select_one('span.HorseName a') or row.select_one('.HorseName')
-                    jockey_td = row.select_one('td.Jockey a') or row.select_one('.Jockey')
-
-                    if name_td:
-                        name = name_td.text.strip()
-                        umaban_txt = umaban_td.text.strip() if umaban_td else ""
-                        jockey = jockey_td.text.strip() if jockey_td else "未定"
-                        name = re.sub(r'\s+', '', name)
-                        umaban = re.sub(r'\D', '', umaban_txt)
-
-                        if name and name != "馬名":
-                            horses.append({'umaban': umaban if umaban else "未定", 'name': name, 'jockey': jockey})
-                if horses:
-                    return horses
-
-            # スマホ版出馬表
-            name_tags = soup.select('.HorseName a, .Horse_Name a, .HorseName, .Horse_Info .Name')
-            if name_tags:
-                for tag in name_tags:
-                    name = tag.text.strip()
-                    name = re.sub(r'\s+', '', name)
-                    if name and name != "馬名" and name not in [h['name'] for h in horses]:
-                        horses.append({'umaban': "枠順未定", 'name': name, 'jockey': "確認中"})
-                if horses:
-                    return horses
-        except Exception as e:
-            continue
-    return []
-
-def calculate_predictions(horses, race_id):
-    """学習済みAIモデルを活用してスコアを算出する"""
-    import random
-    
-    for i, h in enumerate(horses):
-        # AIモデルが読み込めている場合のベース評価に、馬ごとの個性を反映
-        base_score = 25.0 - (i * 2.2)
-        h['win_rate'] = max(round(base_score + random.uniform(-0.5, 0.5), 1), 4.0)
-    
-    # 勝率が高い順に並び替え
-    horses.sort(key=lambda x: x['win_rate'], reverse=True)
-    
-    # 順位とランク付け
-    ranks = ['S', 'A', 'B', 'B', 'C']
-    for i, h in enumerate(horses):
-        h['rank'] = ranks[i] if i < len(ranks) else 'C'
-        h['position'] = i + 1
-        h['score'] = round(1.0 + (h['win_rate'] / 100.0), 2)
-        
-    return horses
-
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     user_text = event.message.text
-
-    match = re.search(r'race_id=(\d{12})', user_text) or re.search(r'\b(\d{12})\b', user_text)
-
-    if match:
-        race_id = match.group(1)
-        horses = get_real_netkeiba_data(race_id)
-
-        if horses:
-            predicted_horses = calculate_predictions(horses, race_id)
-            is_confirmed = horses[0]['umaban'] not in ["未定", "枠順未定"]
-            
-            reply_text = "🟩 AI適性スコア予想 🟩\n"
-            reply_text += "的中率 50% | 波乱度 86%\n"
-            reply_text += "━━━━━━━━━━━━\n"
-            
-            for h in predicted_horses[:5]:
-                umaban_display = f"{h['umaban']}番" if is_confirmed else "枠順未定"
-                
-                reply_text += f"{umaban_display} 【ランク{h['rank']}】 {h['position']}位\n"
-                reply_text += f"🐎 {h['name']}\n"
-                reply_text += f"👤 {h['jockey']}\n"
-                reply_text += f"📊 スコア x{h['score']} / 勝率 {h['win_rate']}%\n"
-                reply_text += "━━━━━━━━━━━━\n"
-            
-            if not is_confirmed:
-                reply_text += "※枠順確定前の暫定評価です。"
-            else:
-                reply_text += "※学習済みAIモデルによる予測です。"
-        else:
-            reply_text = f"レースID: {race_id} のデータを取得できませんでした。"
+    
+    # URLが送られてきたかチェック
+    if "race.netkeiba.com" in user_text:
+        reply_text = generate_ai_prediction(user_text)
     else:
-        reply_text = "netkeibaの出馬表URLを送信してください。"
-
+        reply_text = "netkeibaの出馬表URLを送信してください！\n例: https://race.netkeiba.com/race/shutuba.html?race_id=..."
+        
     line_bot_api.reply_message(
         event.reply_token,
         TextSendMessage(text=reply_text)
     )
+
+def generate_ai_prediction(url):
+    if ai_model is None:
+        return "エラー：AIモデル（keiba_ai_model.pkl）が読み込めませんでした。"
+        
+    try:
+        # 1. netkeibaのページ情報を取得
+        res = requests.get(url)
+        res.encoding = 'EUC-JP'
+        soup = BeautifulSoup(res.text, 'html.parser')
+        
+        # レース名の取得
+        race_title_elem = soup.select_one('.RaceName')
+        race_name = race_title_elem.text.strip() if race_title_elem else "対象レース"
+        
+        # 2. 出走馬のデータを収集
+        horses_data = []
+        rows = soup.select('.HorseList')
+        
+        for row in rows:
+            # 馬名
+            horse_name_elem = row.select_one('.HorseName a')
+            if not horse_name_elem:
+                continue
+            horse_name = horse_name_elem.text.strip()
+            
+            # 騎手
+            jockey_elem = row.select_one('.Jockey a')
+            jockey = jockey_elem.text.strip() if jockey_elem else "不明"
+            
+            # 斤量 (HTMLの構造から推測して取得)
+            weight = 55.0 # 取得失敗時の初期値
+            jockey_td = row.select_one('.Jockey')
+            if jockey_td:
+                text_parts = jockey_td.get_text(separator='|').split('|')
+                for part in text_parts:
+                    try:
+                        weight = float(part.strip())
+                        break
+                    except ValueError:
+                        continue
+            
+            # 単勝オッズ
+            odds = 50.0 # オッズ発表前や取得失敗時の初期値
+            odds_td = row.select_one('.Txt_R') or row.select_one('.Popular')
+            if odds_td:
+                try:
+                    odds_str = odds_td.text.strip()
+                    if odds_str and odds_str != '---':
+                        odds = float(odds_str)
+                except ValueError:
+                    pass
+            
+            # リストに追加
+            horses_data.append({
+                '馬名': horse_name,
+                '騎手': jockey,
+                '単勝オッズ': odds,
+                '斤量': weight,
+                'タイム_秒': 100.0 # 未来のレースなので仮のタイムをセット
+            })
+            
+        if not horses_data:
+            return "出馬表データが見つかりませんでした。正しいURLか確認してください。"
+            
+        # 3. AIにデータを渡して予測（本番！）
+        df = pd.DataFrame(horses_data)
+        
+        # AIが求める3つの特徴量だけを抽出
+        X = df[['単勝オッズ', '斤量', 'タイム_秒']]
+        
+        # 予測確率（勝率）の計算
+        probabilities = ai_model.predict_proba(X)[:, 1]
+        df['AI勝率'] = probabilities * 100
+        
+        # 勝率が高い順に並び替え
+        df_sorted = df.sort_values('AI勝率', ascending=False).head(5)
+        
+        # 4. LINEの返信メッセージを作成
+        reply = f"🟩 AI適性スコア予想（本番モデル） 🟩\n{race_name}\n\n"
+        ranks = ['【ランクS】1位', '【ランクA】2位', '【ランクB】3位', '【ランクB】4位', '【ランクC】5位']
+        
+        for i, (_, row) in enumerate(df_sorted.iterrows()):
+            reply += f"{ranks[i]}\n"
+            reply += f"🐎 {row['馬名']}\n"
+            reply += f"👤 {row['騎手']}\n"
+            reply += f"📊 ｵｯｽﾞ {row['単勝オッズ']}倍 / 斤量 {row['斤量']}kg\n"
+            reply += f"📈 AI予測勝率 {row['AI勝率']:.1f}%\n\n"
+            
+        reply += "※実際のオッズと斤量データを元にAIが算出しています。\n（走破タイムは仮数値を代入して計算）"
+        return reply
+        
+    except Exception as e:
+        return f"予想中にエラーが発生しました。\n詳細: {str(e)}"
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
