@@ -38,8 +38,12 @@ def callback():
 def handle_message(event):
     user_text = event.message.text
     
+    # スマホ用URL(sp.)が送られてきた場合、PC用に自動変換
+    if "race.sp.netkeiba.com" in user_text:
+        user_text = user_text.replace("race.sp.netkeiba.com", "race.netkeiba.com")
+    
     # URLが送られてきたかチェック
-    if "race.netkeiba.com" in user_text:
+    if "netkeiba.com" in user_text:
         reply_text = generate_ai_prediction(user_text)
     else:
         reply_text = "netkeibaの出馬表URLを送信してください！\n例: https://race.netkeiba.com/race/shutuba.html?race_id=..."
@@ -54,7 +58,7 @@ def generate_ai_prediction(url):
         return "エラー：AIモデル（keiba_ai_model.pkl）が読み込めませんでした。"
         
     try:
-        # 1. netkeibaのページ情報を取得
+        # 1. netkeibaのページ情報を取得 (文字化け対策 EUC-JP)
         res = requests.get(url)
         res.encoding = 'EUC-JP'
         soup = BeautifulSoup(res.text, 'html.parser')
@@ -78,8 +82,8 @@ def generate_ai_prediction(url):
             jockey_elem = row.select_one('.Jockey a')
             jockey = jockey_elem.text.strip() if jockey_elem else "不明"
             
-            # 斤量 (HTMLの構造から推測して取得)
-            weight = 55.0 # 取得失敗時の初期値
+            # 斤量
+            weight = 55.0 
             jockey_td = row.select_one('.Jockey')
             if jockey_td:
                 text_parts = jockey_td.get_text(separator='|').split('|')
@@ -91,7 +95,7 @@ def generate_ai_prediction(url):
                         continue
             
             # 単勝オッズ
-            odds = 50.0 # オッズ発表前や取得失敗時の初期値
+            odds = 50.0 
             odds_td = row.select_one('.Txt_R') or row.select_one('.Popular')
             if odds_td:
                 try:
@@ -101,29 +105,23 @@ def generate_ai_prediction(url):
                 except ValueError:
                     pass
             
-            # リストに追加
             horses_data.append({
                 '馬名': horse_name,
                 '騎手': jockey,
                 '単勝オッズ': odds,
                 '斤量': weight,
-                'タイム_秒': 100.0 # 未来のレースなので仮のタイムをセット
+                'タイム_秒': 100.0 
             })
             
         if not horses_data:
             return "出馬表データが見つかりませんでした。正しいURLか確認してください。"
             
-        # 3. AIにデータを渡して予測（本番！）
+        # 3. AIにデータを渡して予測
         df = pd.DataFrame(horses_data)
-        
-        # AIが求める3つの特徴量だけを抽出
         X = df[['単勝オッズ', '斤量', 'タイム_秒']]
         
-        # 予測確率（勝率）の計算
         probabilities = ai_model.predict_proba(X)[:, 1]
         df['AI勝率'] = probabilities * 100
-        
-        # 勝率が高い順に並び替え
         df_sorted = df.sort_values('AI勝率', ascending=False).head(5)
         
         # 4. LINEの返信メッセージを作成
