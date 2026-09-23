@@ -1,4 +1,5 @@
 import os
+import re
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
@@ -36,16 +37,25 @@ def callback():
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
-    user_text = event.message.text
+    user_text = event.message.text.strip()
     
-    # スマホ用URLをPC用に自動変換
-    if "race.sp.netkeiba.com" in user_text:
-        user_text = user_text.replace("race.sp.netkeiba.com", "race.netkeiba.com")
-    
+    # 対策1：スマホ版の「出馬表」「レース結果」URLを、AIが読めるPC版へ完全自動変換
+    if "sp.netkeiba.com" in user_text:
+        m = re.search(r'race_id=(\d+)', user_text)
+        if m:
+            race_id = m.group(1)
+            # レース結果ページの場合
+            if "pid=race_result" in user_text or "race_result" in user_text:
+                user_text = f"https://race.netkeiba.com/race/result.html?race_id={race_id}"
+            else:
+                user_text = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
+        else:
+            user_text = user_text.replace("race.sp.netkeiba.com", "race.netkeiba.com")
+            
     if "netkeiba.com" in user_text:
         reply_text = generate_ai_prediction(user_text)
     else:
-        reply_text = "netkeibaの出馬表URLを送信してください！\n例: https://race.netkeiba.com/race/shutuba.html?race_id=..."
+        reply_text = "netkeibaの出馬表、またはレース結果のURLを送信してください！"
         
     line_bot_api.reply_message(
         event.reply_token,
@@ -57,22 +67,25 @@ def generate_ai_prediction(url):
         return "エラー：AIモデル（keiba_ai_model.pkl）が読み込めませんでした。"
         
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        }
-        
+        # 対策2：アクセスブロック回避
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
         res = requests.get(url, headers=headers)
+        
+        # 対策3：文字化けの完全防止
         res.encoding = res.apparent_encoding
         soup = BeautifulSoup(res.text, 'html.parser')
         
-        race_title_elem = soup.select_one('.RaceName')
+        race_title_elem = soup.select_one('.RaceName, .Race_Name, .race_name, .RaceList_Item02 .DataTitle')
         race_name = race_title_elem.text.strip() if race_title_elem else "対象レース"
         
+        # 対策4：「出馬表」と「結果ページ」両方のテーブルに対応
+        rows = soup.select('tr.HorseList, table.RaceTable01 tr, table.ResultTable tr')
+        if not rows:
+            rows = soup.find_all('tr')
+            
         horses_data = []
-        rows = soup.select('.HorseList')
-        
         for row in rows:
-            horse_name_elem = row.select_one('.HorseName a')
+            horse_name_elem = row.select_one('.HorseName a, .Horse_Name a, .Horse_Info a')
             if not horse_name_elem:
                 continue
             horse_name = horse_name_elem.text.strip()
@@ -80,37 +93,43 @@ def generate_ai_prediction(url):
             jockey_elem = row.select_one('.Jockey a')
             jockey = jockey_elem.text.strip() if jockey_elem else "不明"
             
-            # 斤量の取得
-            weight = 55.0 
-            tds = row.select('td')
-            if len(tds) > 5:
+            tds = row.find_all('td')
+            td_texts = [td.text.strip() for td in tds]
+            
+            weight = 55.0
+            odds = 50.0
+            
+            # 斤量の自動特定（48.0〜65.0kgの数値を自動で探す）
+            for txt in td_texts:
                 try:
-                    weight_text = tds[5].text.strip()
-                    if weight_text:
-                        weight = float(weight_text)
+                    val = float(txt)
+                    if 48.0 <= val <= 65.0 and weight == 55.0:
+                        weight = val
                 except ValueError:
                     pass
             
-            # オッズの取得（馬体重との混同を完全に防ぐロジック）
-            odds = 50.0 
-            if len(tds) > 9:
-                try:
-                    odds_str = tds[9].text.strip()
-                    if odds_str and odds_str != '---':
-                        odds = float(odds_str)
-                except ValueError:
-                    pass
-                    
-            # 予備のオッズ取得（表の形が違う地方競馬などへの対策）
-            if odds == 50.0:
-                for el in row.select('.Txt_R'):
+            # オッズの自動特定（右側から探し、オッズ特有のクラスを検知）
+            odds_found = False
+            for td in reversed(tds):
+                txt = td.text.strip()
+                if not txt or txt == '---':
+                    continue
+                if 'Txt_R' in td.get('class', []):
                     try:
-                        val = float(el.text.strip())
-                        # 馬体重（通常400kg以上）を除外してオッズだけを拾う
-                        if val < 350: 
-                            odds = val
+                        odds = float(txt)
+                        odds_found = True
+                        break
                     except ValueError:
                         pass
+            
+            # クラスで見つからなかった場合のフォールバック
+            if not odds_found:
+                if len(td_texts) >= 13: # 結果ページ用
+                    try: odds = float(td_texts[12])
+                    except ValueError: pass
+                elif len(td_texts) >= 10: # 出馬表ページ用
+                    try: odds = float(td_texts[9])
+                    except ValueError: pass
             
             horses_data.append({
                 '馬名': horse_name,
@@ -121,7 +140,7 @@ def generate_ai_prediction(url):
             })
             
         if not horses_data:
-            return "出馬表データが見つかりませんでした。正しいURLか確認してください。"
+            return "データが見つかりませんでした。正しい出馬表かレース結果のURLか確認してください。"
             
         df = pd.DataFrame(horses_data)
         X = df[['単勝オッズ', '斤量', 'タイム_秒']]
