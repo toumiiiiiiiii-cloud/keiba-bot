@@ -38,11 +38,10 @@ def callback():
 def handle_message(event):
     user_text = event.message.text
     
-    # スマホ用URL(sp.)が送られてきた場合、PC用に自動変換
+    # 対策1：スマホ用URL(sp.)をPC用に自動変換
     if "race.sp.netkeiba.com" in user_text:
         user_text = user_text.replace("race.sp.netkeiba.com", "race.netkeiba.com")
     
-    # URLが送られてきたかチェック
     if "netkeiba.com" in user_text:
         reply_text = generate_ai_prediction(user_text)
     else:
@@ -58,36 +57,33 @@ def generate_ai_prediction(url):
         return "エラー：AIモデル（keiba_ai_model.pkl）が読み込めませんでした。"
         
     try:
-        # ★追加：人間のブラウザからのアクセスに見せかける設定（アクセス拒否対策）
+        # 対策2：アクセス拒否（Bot弾き）を防ぐUser-Agent偽装
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         }
         
-        # 1. netkeibaのページ情報を取得 (文字化け対策 EUC-JP)
         res = requests.get(url, headers=headers)
-        res.encoding = 'EUC-JP'
-        soup = BeautifulSoup(res.text, 'html.parser')
+        
+        # 対策3：完全な文字化け対策（生データからEUC-JPとして強制デコード）
+        html = res.content.decode('euc-jp', 'replace')
+        soup = BeautifulSoup(html, 'html.parser')
         
         # レース名の取得
         race_title_elem = soup.select_one('.RaceName')
         race_name = race_title_elem.text.strip() if race_title_elem else "対象レース"
         
-        # 2. 出走馬のデータを収集
         horses_data = []
         rows = soup.select('.HorseList')
         
         for row in rows:
-            # 馬名
             horse_name_elem = row.select_one('.HorseName a')
             if not horse_name_elem:
                 continue
             horse_name = horse_name_elem.text.strip()
             
-            # 騎手
             jockey_elem = row.select_one('.Jockey a')
             jockey = jockey_elem.text.strip() if jockey_elem else "不明"
             
-            # 斤量
             weight = 55.0 
             jockey_td = row.select_one('.Jockey')
             if jockey_td:
@@ -99,7 +95,6 @@ def generate_ai_prediction(url):
                     except ValueError:
                         continue
             
-            # 単勝オッズ
             odds = 50.0 
             odds_td = row.select_one('.Txt_R') or row.select_one('.Popular')
             if odds_td:
@@ -121,7 +116,6 @@ def generate_ai_prediction(url):
         if not horses_data:
             return "出馬表データが見つかりませんでした。正しいURLか確認してください。"
             
-        # 3. AIにデータを渡して予測
         df = pd.DataFrame(horses_data)
         X = df[['単勝オッズ', '斤量', 'タイム_秒']]
         
@@ -129,7 +123,6 @@ def generate_ai_prediction(url):
         df['AI勝率'] = probabilities * 100
         df_sorted = df.sort_values('AI勝率', ascending=False).head(5)
         
-        # 4. LINEの返信メッセージを作成
         reply = f"🟩 AI適性スコア予想（本番モデル） 🟩\n{race_name}\n\n"
         ranks = ['【ランクS】1位', '【ランクA】2位', '【ランクB】3位', '【ランクB】4位', '【ランクC】5位']
         
