@@ -1,5 +1,7 @@
 Flask
 line-bot-sdk
-requests
 beautifulsoup4
+requests
 gunicorn
+joblib
+scikit-learn
