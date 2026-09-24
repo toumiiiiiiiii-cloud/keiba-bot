@@ -7,3 +7,4 @@ pandas
 lightgbm
 scikit-learn
 gunicorn
+Pillow
