@@ -166,6 +166,9 @@ def parse_past_cell(td):
     name_el = td.select_one('.Data02 a') or td.select_one('.Data02')
     if name_el:
         rname = name_el.get_text(' ', strip=True)
+        # 途中で切れたカッコを閉じる（例：「天皇賞(春 GI」→「天皇賞(春) GI」）
+        if rname.count('(') > rname.count(')'):
+            rname = re.sub(r'\(([^()\s]*)(\s|$)', r'(\1)\2', rname, count=1)
     else:
         a = next((x for x in td.find_all('a') if not HORSE_HREF.search(x.get('href', ''))), None)
         rname = a.get_text(' ', strip=True) if a else ''
@@ -568,9 +571,34 @@ def bets(arr):
     anas = [h for h in arr if h['anaFlag']][:2]
     if anas:
         out.append("穴 ワイド " + ', '.join(f"{n[0]}-{h['n']}" for h in anas))
-    if len(n) >= 3:
-        out.append(f"堅め 複勝 {n[0]} ／ ワイド {n[0]}-{n[1]}, {n[0]}-{n[2]}")
+    t = trifecta_high(arr)
+    if t:
+        out.append(t)
     return out
+
+
+def trifecta_high(arr):
+    """高目狙いの3連単フォーメーション。
+    1着：◎＋期待値が一番高い馬 ／ 2着：○▲＋穴馬・高期待値の馬 ／ 3着：2着の馬＋△△△☆"""
+    if len(arr) < 5:
+        return None
+    top8 = arr[:8]
+    value = sorted([h for h in top8[1:] if h['ev'] and h['ev'] >= 1.3], key=lambda h: -h['ev'])
+    anas = [h for h in arr if h['anaFlag']]
+
+    first = [arr[0]] + value[:1]
+    second = []
+    for h in arr[1:3] + anas + value:
+        if h not in second and len(second) < 4:
+            second.append(h)
+    third = []
+    for h in second + first + arr[1:7]:
+        if h not in third and len(third) < 7:
+            third.append(h)
+
+    pts = sum(1 for a in first for b in second for c in third if len({a['n'], b['n'], c['n']}) == 3)
+    j = lambda hs: ','.join(str(h['n']) for h in hs)
+    return f"高目 3連単 1着{j(first)} → 2着{j(second)} → 3着{j(third)}（{pts}点）"
 
 
 # ═════════════════════════════════════════
@@ -814,7 +842,13 @@ def render_image(race, arr):
     W, PAD = 1080, 36
     row_h = 92
     blist = bets(arr)
-    H = 610 + 64 + row_h * len(arr) + 40 + 90 + 62 * len(blist) + 120
+    tmp = ImageDraw.Draw(Image.new('RGB', (10, 10)))
+    bet_rows = []
+    for line in blist:
+        lab, rest_ = (line.split(' ', 1) + [''])[:2]
+        bet_rows.append((lab, wrap(tmp, rest_, F('sans_b', 28), W - PAD * 2 - 170)))
+    bet_h = sum(22 + 40 * len(ls) for _, ls in bet_rows)
+    H = 610 + 64 + row_h * len(arr) + 40 + 90 + bet_h + 120
 
     img = gradient_bg(W, H)  # 背景グラデーション（夜空のイメージ）
     d = ImageDraw.Draw(img)
@@ -922,18 +956,19 @@ def render_image(race, arr):
     y += row_h * len(arr) + 30
 
     # ── 買い目 ──
-    box_h = 80 + 62 * len(blist)
+    box_h = 80 + bet_h
     d.rounded_rectangle((PAD, y, W - PAD, y + box_h), radius=16, fill=(14, 22, 42))
     gold_frame(d, (PAD, y, W - PAD, y + box_h), r=16)
     ctext(d, W / 2, y + 16, '― おすすめ買い目 ―', F('serif_b', 36), GOLD)
-    LC = {'本線': (200, 160, 70), '妙味': (38, 160, 80), '穴': (214, 60, 60), '堅め': (70, 110, 200)}
+    LC = {'本線': (200, 160, 70), '妙味': (38, 160, 80), '穴': (214, 60, 60), '高目': (150, 80, 200)}
     fl = F('sans_b', 26)
-    for i, line in enumerate(blist):
-        yy = y + 78 + i * 62
-        lab, rest_ = (line.split(' ', 1) + [''])[:2]
+    yy = y + 78
+    for lab, lines in bet_rows:
         d.rounded_rectangle((PAD + 24, yy, PAD + 124, yy + 44), radius=22, fill=LC.get(lab, GOLD_D))
         ctext(d, PAD + 74, yy + 6, lab, fl, (255, 255, 255))
-        d.text((PAD + 144, yy + 5), fit_text(d, rest_, F('sans_b', 28), W - PAD * 2 - 170), font=F('sans_b', 28), fill=SILVER)
+        for k, ln in enumerate(lines):
+            d.text((PAD + 144, yy + 5 + k * 40), ln, font=F('sans_b', 28), fill=SILVER)
+        yy += 22 + 40 * len(lines)
     y += box_h + 24
 
     ctext(d, W / 2, y, 'スコア×1.00基準　S≥1.08 ／ A≥1.03 ／ B≥1.00 ／ C≥0.96 ／ D', F('sans_r', 20), MUTED)
