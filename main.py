@@ -57,8 +57,9 @@ def generate_ai_prediction(url):
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         res = requests.get(url, headers=headers)
         
-        # 【文字化け対策】余計な指定をせず、BeautifulSoupの自動解読に任せる（これで文字化けは直ります）
-        soup = BeautifulSoup(res.content, 'html.parser')
+        # 文字化け対策（正常に動作している自動判定を維持）
+        res.encoding = res.apparent_encoding
+        soup = BeautifulSoup(res.text, 'html.parser')
         
         race_title_elem = soup.select_one('.RaceName, .Race_Name, h1')
         race_name = race_title_elem.text.strip() if race_title_elem else "対象レース"
@@ -67,48 +68,58 @@ def generate_ai_prediction(url):
         rows = soup.find_all('tr')
         
         for row in rows:
-            # 馬名の取得（リンクURLから確実に探す）
-            horse_name = None
-            for a in row.find_all('a'):
-                if 'horse' in a.get('href', ''):
-                    horse_name = a.text.strip()
-                    break
-            
-            if not horse_name:
-                continue
-            horse_name = re.sub(r'取消|除外|\s+', '', horse_name)
-            if not horse_name:
-                continue
-                
-            # 騎手の取得
+            horse_name = ""
             jockey = "不明"
-            for a in row.find_all('a'):
-                if 'jockey' in a.get('href', '') or 'recent' in a.get('href', ''):
-                    jockey = a.text.strip()
-                    break
-            jockey = re.sub(r'\s+', '', jockey)
-            
             weight = 55.0
             odds = 50.0
+
+            # 1. 馬名の取得（URLに "/horse/" を含むリンクだけを「本物の馬」として認識）
+            name_a = row.select_one('a[href*="/horse/"]')
+            if name_a:
+                horse_name = name_a.text.strip()
             
-            for td in row.find_all(['td', 'th']):
+            # 見つからなかったらスキップ（これで「お気に入り馬」等のメニューを完全に弾きます）
+            if not horse_name:
+                continue
+            
+            horse_name = re.sub(r'\s+', '', horse_name)
+            horse_name = re.sub(r'取消|除外', '', horse_name)
+
+            # 2. 騎手の取得（URLに "/jockey/" か "/recent/" を含むリンク）
+            jockey_a = row.select_one('a[href*="/jockey/"], a[href*="/recent/"]')
+            if jockey_a:
+                jockey = jockey_a.text.strip()
+            jockey = re.sub(r'\s+', '', jockey)
+
+            # 3. 斤量とオッズの取得
+            tds = row.find_all(['td', 'th'])
+            td_texts = [td.text.strip() for td in tds]
+            
+            for td in tds:
                 txt = td.text.strip()
-                classes = td.get('class', [])
+                if not txt: continue
                 
-                # 馬体重のカッコや、タイムのコロンは除外
-                if not txt or 'Weight' in classes or ':' in txt or '(' in txt or '---' in txt:
-                    continue
-                    
-                try:
+                # 数字（小数含む）のみのテキストを探す
+                if re.match(r'^\d+(\.\d+)?$', txt):
                     val = float(txt)
-                    # 斤量は48〜65の数値（オッズ特有のTxt_Rクラスには入っていない）
-                    if 48.0 <= val <= 65.0 and weight == 55.0 and 'Txt_R' not in classes:
+                    
+                    # 斤量の判定（48.0〜65.0の範囲）
+                    if 48.0 <= val <= 65.0 and weight == 55.0:
                         weight = val
-                    # オッズは必ず「Txt_R」というクラスに入っている
-                    if 'Txt_R' in classes and 1.0 <= val <= 999.9:
-                        odds = val
-                except ValueError:
-                    pass
+                        
+                    # オッズの判定（Txt_R クラスが付いている数値）
+                    if 'Txt_R' in td.get('class', []) or 'txt_r' in td.get('class', []):
+                        if 1.0 <= val <= 999.9:
+                            odds = val
+            
+            # クラス名が無くオッズが取れなかった場合、後ろの列からオッズらしい数字を探す
+            if odds == 50.0:
+                for txt in reversed(td_texts):
+                    if re.match(r'^\d+(\.\d+)?$', txt):
+                        val = float(txt)
+                        if val != weight and 1.0 <= val <= 999.9:
+                            odds = val
+                            break
             
             horses_data.append({
                 '馬名': horse_name,
