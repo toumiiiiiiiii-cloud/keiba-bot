@@ -9,6 +9,7 @@ import re
 import sys
 import math
 import requests
+from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
@@ -95,8 +96,11 @@ def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
+SESSION = requests.Session()
+
+
 def fetch_soup(url):
-    res = requests.get(url, headers=HEADERS, timeout=15)
+    res = SESSION.get(url, headers=HEADERS, timeout=15)
     res.raise_for_status()
     raw = res.content
     m = re.search(rb'charset=["\']?([\w-]+)', raw[:3000], re.I)
@@ -575,7 +579,11 @@ def analyze(text):
     race_id, base = parse_input(text)
     if not race_id:
         return None, "URLからレースIDを読み取れませんでした。"
-    soup = fetch_soup(f"{base}/race/shutuba_past.html?race_id={race_id}")
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_page = ex.submit(fetch_soup, f"{base}/race/shutuba_past.html?race_id={race_id}")
+        f_odds = ex.submit(fetch_win_odds, race_id, base)
+        soup = f_page.result()
+        odds = f_odds.result()
     race = parse_race_info(soup, race_id, base)
     horses = [h for h in parse_shutuba_past(soup) if not h['cancelled'] and h['n']]
     if not horses:
@@ -590,7 +598,6 @@ def analyze(text):
     race['nige'] = nige
 
     auto_heuristics(race, horses)
-    odds = fetch_win_odds(race_id, base)
     arr = ranked(race, horses, odds)
     return (race, arr), None
 
@@ -659,45 +666,77 @@ def generate_prediction(text):
 # ═════════════════════════════════════════
 IMG_DIR = '/tmp/syh_img'
 FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fonts')
-FONT_URLS = {
-    'sans_b': 'https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/Japanese/NotoSansCJKjp-Bold.otf',
-    'sans_r': 'https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf',
-    'serif_b': 'https://github.com/notofonts/noto-cjk/raw/main/Serif/OTF/Japanese/NotoSerifCJKjp-Bold.otf',
+FONT_FILES = {
+    'sans_b': 'Sans/OTF/Japanese/NotoSansCJKjp-Bold.otf',
+    'sans_r': 'Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf',
+    'serif_b': 'Serif/OTF/Japanese/NotoSerifCJKjp-Bold.otf',
 }
+FONT_MIRRORS = [  # 1つ目がダメなら2つ目から取る
+    'https://cdn.jsdelivr.net/gh/notofonts/noto-cjk@main/{}',
+    'https://github.com/notofonts/noto-cjk/raw/main/{}',
+]
 FONT_LOCAL = {  # サーバーやPCに最初から入っている場合はそれを使う
     'sans_b': ['/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc', '/usr/share/fonts/opentype/noto/NotoSansCJK-Black.ttc'],
     'sans_r': ['/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc'],
     'serif_b': ['/usr/share/fonts/opentype/noto/NotoSerifCJK-Bold.ttc'],
 }
 _font_path_cache = {}
+import threading
+_font_lock = threading.Lock()
 
 
 def font_path(kind):
     """日本語フォントを探す。無ければ初回だけダウンロードして /tmp に置く"""
     if kind in _font_path_cache:
         return _font_path_cache[kind]
-    fname = os.path.basename(FONT_URLS[kind])
+    fname = os.path.basename(FONT_FILES[kind])
     cands = [os.path.join(FONT_DIR, fname)] + FONT_LOCAL.get(kind, []) + [os.path.join('/tmp', fname)]
     for c in cands:
         if os.path.exists(c):
             _font_path_cache[kind] = c
             return c
-    try:
-        r = requests.get(FONT_URLS[kind], timeout=60)
-        r.raise_for_status()
+    with _font_lock:
         dst = os.path.join('/tmp', fname)
-        with open(dst, 'wb') as f:
-            f.write(r.content)
-        _font_path_cache[kind] = dst
-        return dst
-    except Exception:
-        if kind != 'sans_b':
-            return font_path('sans_b')
-        raise
+        if os.path.exists(dst):
+            _font_path_cache[kind] = dst
+            return dst
+        last = None
+        for mirror in FONT_MIRRORS:
+            try:
+                r = requests.get(mirror.format(FONT_FILES[kind]), timeout=60)
+                r.raise_for_status()
+                if len(r.content) < 1_000_000:
+                    raise ValueError('フォントのダウンロードが不完全')
+                tmp = dst + '.part'
+                with open(tmp, 'wb') as f:
+                    f.write(r.content)
+                os.replace(tmp, dst)
+                _font_path_cache[kind] = dst
+                return dst
+            except Exception as e:
+                last = e
+                print(f'[font] {kind} download failed from {mirror}: {e}', flush=True)
+    if kind != 'sans_b':
+        return font_path('sans_b')
+    raise RuntimeError(f'日本語フォントを取得できません（{last}）')
+
+
+_font_obj_cache = {}
 
 
 def F(kind, size):
-    return ImageFont.truetype(font_path(kind), size, index=0)
+    key = (kind, size)
+    if key not in _font_obj_cache:
+        _font_obj_cache[key] = ImageFont.truetype(font_path(kind), size, index=0)
+    return _font_obj_cache[key]
+
+
+def preload_fonts():
+    for k in ('sans_b', 'sans_r', 'serif_b'):
+        try:
+            font_path(k)
+        except Exception as e:
+            print(f'[font] preload failed: {e}', flush=True)
 
 
 GOLD = (221, 183, 98)
@@ -708,6 +747,13 @@ WAKU = {1: ((245, 245, 245), (20, 20, 20)), 2: ((30, 30, 30), (255, 255, 255)), 
         4: ((41, 98, 214), (255, 255, 255)), 5: ((247, 206, 38), (20, 20, 20)), 6: ((38, 160, 80), (255, 255, 255)),
         7: ((245, 142, 38), (20, 20, 20)), 8: ((240, 128, 170), (20, 20, 20))}
 RANK_C = {'S': (235, 90, 90), 'A': (240, 170, 60), 'B': (90, 170, 240), 'C': (140, 150, 170), 'D': (100, 108, 125)}
+
+
+def gradient_bg(W, H, top=(20, 30, 58), bot=(6, 9, 18)):
+    """縦グラデーションを1列だけ作って引き伸ばす（1行ずつ塗るより速い）"""
+    col = Image.new('RGB', (1, 256))
+    col.putdata([tuple(int(top[i] * (1 - t / 255) + bot[i] * t / 255) for i in range(3)) for t in range(256)])
+    return col.resize((W, H), Image.BILINEAR)
 
 
 def tw(d, t, f):
@@ -738,12 +784,7 @@ def render_image(race, arr):
     blist = bets(arr)
     H = 610 + 64 + row_h * len(arr) + 40 + 90 + 62 * len(blist) + 120
 
-    img = Image.new('RGB', (W, H), (8, 12, 24))
-    # 背景グラデーション（夜空のイメージ）
-    top, bot = (20, 30, 58), (6, 9, 18)
-    for y in range(H):
-        t = y / H
-        img.paste(tuple(int(top[i] * (1 - t) + bot[i] * t) for i in range(3)), (0, y, W, y + 1))
+    img = gradient_bg(W, H)  # 背景グラデーション（夜空のイメージ）
     d = ImageDraw.Draw(img)
     gold_frame(d, (14, 14, W - 14, H - 14), r=22, w=3)
 
@@ -937,15 +978,28 @@ SHORT_HEAD = {'総合評価': '総合評価', '過去レースのレベル': '�
               '道悪適性': '道悪', '穴馬チェック': '穴馬', '血統・厩舎': '血統'}
 
 
+_cw_cache = {}
+
+
+def char_w(f, ch):
+    """1文字の幅を覚えておく（毎回測り直さない）"""
+    k = (id(f), ch)
+    if k not in _cw_cache:
+        _cw_cache[k] = f.getlength(ch)
+    return _cw_cache[k]
+
+
 def wrap(d, text, f, maxw):
-    lines, cur = [], ''
+    lines, cur, w = [], '', 0.0
     for ch in text:
+        cw = char_w(f, ch)
         # 行頭に「）」「、」「。」などが来ないよう、前の行にくっつける
-        if tw(d, cur + ch, f) > maxw and ch not in '）)」、。・':
+        if w + cw > maxw and cur and ch not in '）)」、。・':
             lines.append(cur)
-            cur = ch
+            cur, w = ch, cw
         else:
             cur += ch
+            w += cw
     if cur:
         lines.append(cur)
     return lines
@@ -972,11 +1026,7 @@ def render_reasons_image(race, targets, page, pages):
         cards.append((i, h, rows, height))
     H = 200 + sum(c[3] + 20 for c in cards) + 70
 
-    img = Image.new('RGB', (W, H))
-    top, bot = (20, 30, 58), (6, 9, 18)
-    for y in range(H):
-        t = y / H
-        img.paste(tuple(int(top[k] * (1 - t) + bot[k] * t) for k in range(3)), (0, y, W, y + 1))
+    img = gradient_bg(W, H)
     d = ImageDraw.Draw(img)
     gold_frame(d, (14, 14, W - 14, H - 14), r=22, w=3)
     ctext(d, W / 2, 40, f'シェイクユアハート ／ 根拠 {page}/{pages}', F('serif_b', 44), GOLD)
@@ -1022,9 +1072,9 @@ def save_image(img):
         except Exception:
             pass
     key = uuid.uuid4().hex
-    img.save(os.path.join(IMG_DIR, key + '.png'), optimize=True)
+    img.save(os.path.join(IMG_DIR, key + '.png'), compress_level=1)
     pv = img.copy()
-    pv.thumbnail((540, 4000))
+    pv.thumbnail((540, 4000), Image.BILINEAR)
     pv.save(os.path.join(IMG_DIR, key + '_pv.jpg'), quality=80)
     return key
 
@@ -1047,6 +1097,11 @@ def bets_text(race, arr):
 # ═════════════════════════════════════════
 # LINE
 # ═════════════════════════════════════════
+@app.route("/")
+def health():
+    return "ok"
+
+
 @app.route("/callback", methods=['POST'])
 def callback():
     signature = request.headers['X-Line-Signature']
@@ -1081,15 +1136,23 @@ def handle_message(event):
         # 画像で送る ＋ 買い目だけ文字でも送る（馬券を買うときにコピーしやすいように）
         base = public_base_url()
         messages = []
-        for img in [render_image(race, arr)] + render_reasons_images(race, arr):
-            key = save_image(img)
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            imgs = [ex.submit(render_image, race, arr)] + [ex.submit(lambda im=im: im) for im in render_reasons_images(race, arr)]
+            keys = list(ex.map(save_image, [f.result() for f in imgs]))
+        for key in keys:
             messages.append(ImageSendMessage(original_content_url=f"{base}/img/{key}.png",
                                              preview_image_url=f"{base}/img/{key}_pv.jpg"))
         messages.append(TextSendMessage(text=bets_text(race, arr)))
-    except Exception:
-        # 画像づくりに失敗したら、今までどおり文章で送る
-        messages = [TextSendMessage(text=format_reply(race, arr))]
+    except Exception as e:
+        # 画像づくりに失敗したら、今までどおり文章で送る（原因も添える）
+        import traceback
+        traceback.print_exc()
+        messages = [TextSendMessage(text=f"⚠画像を作れませんでした（{type(e).__name__}: {e}）\n\n"
+                                         + format_reply(race, arr))]
     line_bot_api.reply_message(event.reply_token, messages)
+
+
+threading.Thread(target=preload_fonts, daemon=True).start()
 
 
 if __name__ == "__main__":
