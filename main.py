@@ -11,35 +11,26 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 app = Flask(__name__)
 
-# 環境変数からLINEのキーを取得
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
-
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# AIモデルの読み込み
 model_path = 'keiba_ai_model.pkl'
-if os.path.exists(model_path):
-    ai_model = joblib.load(model_path)
-else:
-    ai_model = None
+ai_model = joblib.load(model_path) if os.path.exists(model_path) else None
 
 @app.route("/callback", methods=['POST'])
 def callback():
     signature = request.headers['X-Line-Signature']
     body = request.get_data(as_text=True)
-    try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        abort(400)
+    try: handler.handle(body, signature)
+    except InvalidSignatureError: abort(400)
     return 'OK'
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     user_text = event.message.text.strip()
     
-    # URLの自動変換（スマホ版 -> PC版、出馬表・結果を両方サポート）
     url = user_text
     m = re.search(r'race_id=(\d+)', url)
     if m:
@@ -56,99 +47,68 @@ def handle_message(event):
     else:
         reply_text = "netkeibaの出馬表、またはレース結果のURLを送信してください！"
         
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text=reply_text)
-    )
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
 
 def generate_ai_prediction(url):
     if ai_model is None:
-        return "エラー：AIモデル（keiba_ai_model.pkl）が読み込めませんでした。"
+        return "エラー：AIモデルが読み込めませんでした。"
         
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         res = requests.get(url, headers=headers)
         
-        # 【重要】文字化け防止のためEUC-JPに固定
-        res.encoding = 'euc-jp'
-        soup = BeautifulSoup(res.text, 'html.parser')
+        # 【文字化け対策】余計な指定をせず、BeautifulSoupの自動解読に任せる（これで文字化けは直ります）
+        soup = BeautifulSoup(res.content, 'html.parser')
         
-        race_title_elem = soup.select_one('.RaceName, .Race_Name, .race_name, .RaceList_Item02 .DataTitle, h1')
+        race_title_elem = soup.select_one('.RaceName, .Race_Name, h1')
         race_name = race_title_elem.text.strip() if race_title_elem else "対象レース"
         
-        # 見出しではなく、直接馬のデータ行を探す
-        rows = soup.select('tr.HorseList, table.RaceTable01 tr, table.ResultTable tr')
-        if not rows:
-            rows = soup.find_all('tr')
-            
         horses_data = []
+        rows = soup.find_all('tr')
+        
         for row in rows:
-            horse_name_elem = row.select_one('.HorseName a, .Horse_Name a, .Horse_Info a')
-            if not horse_name_elem:
+            # 馬名の取得（リンクURLから確実に探す）
+            horse_name = None
+            for a in row.find_all('a'):
+                if 'horse' in a.get('href', ''):
+                    horse_name = a.text.strip()
+                    break
+            
+            if not horse_name:
                 continue
-            horse_name = horse_name_elem.text.strip()
-            horse_name = re.sub(r'\s+', '', horse_name)
-            horse_name = re.sub(r'取消|除外', '', horse_name)
+            horse_name = re.sub(r'取消|除外|\s+', '', horse_name)
             if not horse_name:
                 continue
                 
-            jockey_elem = row.select_one('.Jockey a')
-            jockey = jockey_elem.text.strip() if jockey_elem else "不明"
+            # 騎手の取得
+            jockey = "不明"
+            for a in row.find_all('a'):
+                if 'jockey' in a.get('href', '') or 'recent' in a.get('href', ''):
+                    jockey = a.text.strip()
+                    break
             jockey = re.sub(r'\s+', '', jockey)
             
-            tds = row.find_all(['td', 'th'])
-            if not tds:
-                continue
-                
             weight = 55.0
             odds = 50.0
             
-            # --- 斤量の取得 ---
-            # 48.0 〜 65.0 の小数を直接探す
-            for td in tds:
+            for td in row.find_all(['td', 'th']):
                 txt = td.text.strip()
-                if re.match(r'^([4-6]\d\.\d)$', txt):
-                    weight = float(txt)
-                    break
-            
-            # --- オッズの取得 ---
-            odds_found = False
-            # 出馬表ページ用のオッズ取得（Txt_Rクラス）
-            for td in tds:
-                if 'Txt_R' in td.get('class', []):
-                    txt = td.text.strip()
-                    # 括弧（馬体重）やコロン（タイム）を含まない純粋な数値を探す
-                    if txt and txt != '---' and '(' not in txt and ':' not in txt:
-                        try:
-                            val = float(txt)
-                            if 1.0 <= val <= 999.9:
-                                odds = val
-                                odds_found = True
-                                break
-                        except ValueError:
-                            pass
-            
-            # 出馬表で見つからなかった場合（結果ページ用）の取得
-            if not odds_found:
-                if len(tds) >= 15:
-                    try:
-                        txt = tds[12].text.strip()
-                        odds = float(txt)
-                    except Exception:
-                        pass
+                classes = td.get('class', [])
                 
-                # それでも取れない場合のバックアップ
-                if odds == 50.0:
-                    for td in reversed(tds):
-                        txt = td.text.strip()
-                        if '.' in txt and '(' not in txt and ':' not in txt:
-                            try:
-                                val = float(txt)
-                                if val != weight and 1.0 <= val <= 999.9:
-                                    odds = val
-                                    break
-                            except ValueError:
-                                pass
+                # 馬体重のカッコや、タイムのコロンは除外
+                if not txt or 'Weight' in classes or ':' in txt or '(' in txt or '---' in txt:
+                    continue
+                    
+                try:
+                    val = float(txt)
+                    # 斤量は48〜65の数値（オッズ特有のTxt_Rクラスには入っていない）
+                    if 48.0 <= val <= 65.0 and weight == 55.0 and 'Txt_R' not in classes:
+                        weight = val
+                    # オッズは必ず「Txt_R」というクラスに入っている
+                    if 'Txt_R' in classes and 1.0 <= val <= 999.9:
+                        odds = val
+                except ValueError:
+                    pass
             
             horses_data.append({
                 '馬名': horse_name,
@@ -168,7 +128,7 @@ def generate_ai_prediction(url):
         df['AI勝率'] = probabilities * 100
         df_sorted = df.sort_values('AI勝率', ascending=False).head(5)
         
-        reply = f"🟩 AI適性スコア予想（本番モデル） 🟩\n{race_name}\n\n"
+        reply = f"🟩 AI適性スコア予想 🟩\n{race_name}\n\n"
         ranks = ['【ランクS】1位', '【ランクA】2位', '【ランクB】3位', '【ランクB】4位', '【ランクC】5位']
         
         for i, (_, row) in enumerate(df_sorted.iterrows()):
