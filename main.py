@@ -69,71 +69,87 @@ def generate_ai_prediction(url):
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         res = requests.get(url, headers=headers)
         
-        # 【最重要修正】自動推測を廃止し、netkeibaの文字コード（EUC-JP）に完全固定
+        # 【重要】文字化け防止のためEUC-JPに固定
         res.encoding = 'euc-jp'
         soup = BeautifulSoup(res.text, 'html.parser')
         
-        race_title_elem = soup.select_one('.RaceName, .Race_Name, .race_name, h1')
+        race_title_elem = soup.select_one('.RaceName, .Race_Name, .race_name, .RaceList_Item02 .DataTitle, h1')
         race_name = race_title_elem.text.strip() if race_title_elem else "対象レース"
         
-        # 1. どのテーブルにデータがあるか探し、各項目の「列番号」を確実に見つける
-        target_table = None
-        col_name = col_weight = col_odds = col_jockey = -1
-        
-        for tbl in soup.find_all('table'):
-            first_row = tbl.find('tr')
-            if not first_row: 
-                continue
-                
-            header_texts = [h.text.strip() for h in first_row.find_all(['th', 'td'])]
-            
-            if any('馬名' in txt for txt in header_texts):
-                target_table = tbl
-                for i, txt in enumerate(header_texts):
-                    if '馬名' in txt: col_name = i
-                    elif '騎手' in txt: col_jockey = i
-                    elif '斤量' in txt: col_weight = i
-                    elif '単勝' in txt or 'オッズ' in txt: col_odds = i
-                break
-                
-        if not target_table:
-            return "出馬表または結果のデータが見つかりませんでした。"
+        # 見出しではなく、直接馬のデータ行を探す
+        rows = soup.select('tr.HorseList, table.RaceTable01 tr, table.ResultTable tr')
+        if not rows:
+            rows = soup.find_all('tr')
             
         horses_data = []
-        for row in target_table.find_all('tr')[1:]:
-            cells = row.find_all(['td', 'th'])
-            # 必要な列数がない行はスキップ
-            if len(cells) <= max(col_name, col_weight, col_odds):
+        for row in rows:
+            horse_name_elem = row.select_one('.HorseName a, .Horse_Name a, .Horse_Info a')
+            if not horse_name_elem:
                 continue
-                
-            # --- 馬名 ---
-            horse_name = cells[col_name].text.strip()
+            horse_name = horse_name_elem.text.strip()
             horse_name = re.sub(r'\s+', '', horse_name)
             horse_name = re.sub(r'取消|除外', '', horse_name)
-            if not horse_name: 
+            if not horse_name:
                 continue
                 
-            # --- 騎手 ---
-            jockey = cells[col_jockey].text.strip() if col_jockey != -1 else "不明"
+            jockey_elem = row.select_one('.Jockey a')
+            jockey = jockey_elem.text.strip() if jockey_elem else "不明"
             jockey = re.sub(r'\s+', '', jockey)
+            
+            tds = row.find_all(['td', 'th'])
+            if not tds:
+                continue
                 
-            # --- 斤量 ---
             weight = 55.0
-            if col_weight != -1:
-                m_w = re.search(r'(\d+\.\d+|\d+)', cells[col_weight].text.strip())
-                if m_w: weight = float(m_w.group(1))
-                
-            # --- オッズ ---
             odds = 50.0
-            if col_odds != -1:
-                odds_txt = cells[col_odds].text.strip()
-                m_o = re.search(r'(\d+\.\d+|\d+)', odds_txt)
-                if m_o: 
-                    parsed_odds = float(m_o.group(1))
-                    # 馬体重などと間違えないよう制限をかける
-                    if 1.0 <= parsed_odds <= 500.0:
-                        odds = parsed_odds
-                        
+            
+            # --- 斤量の取得 ---
+            # 48.0 〜 65.0 の小数を直接探す
+            for td in tds:
+                txt = td.text.strip()
+                if re.match(r'^([4-6]\d\.\d)$', txt):
+                    weight = float(txt)
+                    break
+            
+            # --- オッズの取得 ---
+            odds_found = False
+            # 出馬表ページ用のオッズ取得（Txt_Rクラス）
+            for td in tds:
+                if 'Txt_R' in td.get('class', []):
+                    txt = td.text.strip()
+                    # 括弧（馬体重）やコロン（タイム）を含まない純粋な数値を探す
+                    if txt and txt != '---' and '(' not in txt and ':' not in txt:
+                        try:
+                            val = float(txt)
+                            if 1.0 <= val <= 999.9:
+                                odds = val
+                                odds_found = True
+                                break
+                        except ValueError:
+                            pass
+            
+            # 出馬表で見つからなかった場合（結果ページ用）の取得
+            if not odds_found:
+                if len(tds) >= 15:
+                    try:
+                        txt = tds[12].text.strip()
+                        odds = float(txt)
+                    except Exception:
+                        pass
+                
+                # それでも取れない場合のバックアップ
+                if odds == 50.0:
+                    for td in reversed(tds):
+                        txt = td.text.strip()
+                        if '.' in txt and '(' not in txt and ':' not in txt:
+                            try:
+                                val = float(txt)
+                                if val != weight and 1.0 <= val <= 999.9:
+                                    odds = val
+                                    break
+                            except ValueError:
+                                pass
+            
             horses_data.append({
                 '馬名': horse_name,
                 '騎手': jockey,
@@ -143,7 +159,7 @@ def generate_ai_prediction(url):
             })
             
         if not horses_data:
-            return "データが正しく取得できませんでした。URLを確認してください。"
+            return "出馬表または結果のデータが見つかりませんでした。"
             
         df = pd.DataFrame(horses_data)
         X = df[['単勝オッズ', '斤量', 'タイム_秒']]
