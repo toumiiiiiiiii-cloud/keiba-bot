@@ -739,6 +739,20 @@ def F(kind, size):
     return _font_obj_cache[key]
 
 
+def fonts_ok(timeout=20):
+    """画像用フォントが使えるか。ファイルが既にあれば即OK、無ければ準備を待つ"""
+    def local():
+        for k in ('sans_b', 'sans_r'):
+            fname = os.path.basename(FONT_FILES[k])
+            if not any(os.path.exists(c) for c in [os.path.join(FONT_DIR, fname), os.path.join('/tmp', fname)] + FONT_LOCAL.get(k, [])):
+                return False
+        return True
+    if fonts_ready.is_set() or local():
+        return True
+    fonts_ready.wait(timeout=timeout)
+    return fonts_ready.is_set() or local()
+
+
 def preload_fonts():
     t = time.time()
     with ThreadPoolExecutor(max_workers=2) as ex:
@@ -1157,7 +1171,7 @@ def build_messages(text, base):
     race, arr = result
     try:
         # 画像で送る ＋ 買い目だけ文字でも送る（馬券を買うときにコピーしやすいように）
-        if not fonts_ready.wait(timeout=20):
+        if not fonts_ok(20):
             raise RuntimeError('サーバー起動直後で画像用の文字データを準備中です。1〜2分後にもう一度送ってください')
         messages = []
         with _render_lock:  # 画像づくりは1件ずつ（フォントの同時使用でサーバーが落ちるのを防ぐ）
@@ -1202,7 +1216,7 @@ def test_page():
             return err, 200, {'Content-Type': 'text/plain; charset=utf-8'}
         if request.args.get('t'):
             return format_reply(*result), 200, {'Content-Type': 'text/plain; charset=utf-8'}
-        if not fonts_ready.wait(timeout=20):
+        if not fonts_ok(20):
             return '文字データを準備中です。1〜2分後に開き直してください', 200, {'Content-Type': 'text/plain; charset=utf-8'}
         with _render_lock:
             key = save_image(render_image(*result))
