@@ -9,6 +9,7 @@ import re
 import sys
 import math
 import requests
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 from flask import Flask, request, abort
@@ -669,7 +670,6 @@ FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fonts')
 FONT_FILES = {
     'sans_b': 'Sans/OTF/Japanese/NotoSansCJKjp-Bold.otf',
     'sans_r': 'Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf',
-    'serif_b': 'Serif/OTF/Japanese/NotoSerifCJKjp-Bold.otf',
 }
 FONT_MIRRORS = [  # 1つ目がダメなら2つ目から取る（jsDelivrは大きいファイルを断ることがあるので後ろ）
     'https://github.com/notofonts/noto-cjk/raw/main/{}',
@@ -682,20 +682,28 @@ FONT_LOCAL = {  # サーバーやPCに最初から入っている場合はそれ
 }
 _font_path_cache = {}
 import threading
-_font_lock = threading.Lock()
+_font_locks = {k: threading.Lock() for k in ('sans_b', 'sans_r')}
+_render_lock = threading.Lock()
+fonts_ready = threading.Event()
 
 
 def font_path(kind):
     """日本語フォントを探す。無ければ初回だけダウンロードして /tmp に置く"""
     if kind in _font_path_cache:
         return _font_path_cache[kind]
+    if kind not in FONT_FILES:  # 明朝体（タイトル用）はPCに入っていれば使い、無ければゴシック太字
+        for c in FONT_LOCAL.get(kind, []):
+            if os.path.exists(c):
+                _font_path_cache[kind] = c
+                return c
+        return font_path('sans_b')
     fname = os.path.basename(FONT_FILES[kind])
     cands = [os.path.join(FONT_DIR, fname)] + FONT_LOCAL.get(kind, []) + [os.path.join('/tmp', fname)]
     for c in cands:
         if os.path.exists(c):
             _font_path_cache[kind] = c
             return c
-    with _font_lock:
+    with _font_locks[kind]:
         dst = os.path.join('/tmp', fname)
         if os.path.exists(dst):
             _font_path_cache[kind] = dst
@@ -732,11 +740,21 @@ def F(kind, size):
 
 
 def preload_fonts():
-    for k in ('sans_b', 'sans_r', 'serif_b'):
-        try:
-            font_path(k)
-        except Exception as e:
-            print(f'[font] preload failed: {e}', flush=True)
+    t = time.time()
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        results = list(ex.map(lambda k: _try_font(k), ('sans_b', 'sans_r')))
+    if all(results):
+        fonts_ready.set()
+    print(f'[font] 準備{"完了" if all(results) else "失敗"}（{time.time() - t:.1f}秒）', flush=True)
+
+
+def _try_font(k):
+    try:
+        font_path(k)
+        return True
+    except Exception as e:
+        print(f'[font] preload failed: {e}', flush=True)
+        return False
 
 
 GOLD = (221, 183, 98)
@@ -1115,41 +1133,82 @@ def callback():
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
+    """LINEにはすぐ「受け取った」と返し、予想づくりは裏で行う"""
     text = event.message.text.strip()
-    if not ("netkeiba.com" in text or re.fullmatch(r'\d{12}', text)):
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(
-            text="netkeibaの出馬表のURL（またはレースID12桁）を送ってください！"))
-        return
+    print(f'[recv] {text[:80]}', flush=True)
+    base = public_base_url()
+    threading.Thread(target=process_message, args=(event.reply_token, text, base), daemon=True).start()
 
+
+def build_messages(text, base):
+    """予想を作って、LINEに送るメッセージのリストを返す"""
+    if not ("netkeiba.com" in text or re.fullmatch(r'\d{12}', text)):
+        return [TextSendMessage(text="netkeibaの出馬表のURL（またはレースID12桁）を送ってください！")]
     try:
         result, err = analyze(text)
     except requests.HTTPError as e:
         result, err = None, f"netkeibaへのアクセスに失敗しました（{e.response.status_code}）。"
     except Exception as e:
+        traceback.print_exc()
         result, err = None, f"予想中にエラーが発生しました。\n詳細: {e}"
     if err:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=err))
-        return
+        return [TextSendMessage(text=err)]
 
     race, arr = result
     try:
         # 画像で送る ＋ 買い目だけ文字でも送る（馬券を買うときにコピーしやすいように）
-        base = public_base_url()
+        if not fonts_ready.wait(timeout=20):
+            raise RuntimeError('サーバー起動直後で画像用の文字データを準備中です。1〜2分後にもう一度送ってください')
         messages = []
-        with ThreadPoolExecutor(max_workers=3) as ex:
-            imgs = [ex.submit(render_image, race, arr)] + [ex.submit(lambda im=im: im) for im in render_reasons_images(race, arr)]
-            keys = list(ex.map(save_image, [f.result() for f in imgs]))
+        with _render_lock:  # 画像づくりは1件ずつ（フォントの同時使用でサーバーが落ちるのを防ぐ）
+            imgs = [render_image(race, arr)] + render_reasons_images(race, arr)
+            keys = [save_image(im) for im in imgs]
         for key in keys:
             messages.append(ImageSendMessage(original_content_url=f"{base}/img/{key}.png",
                                              preview_image_url=f"{base}/img/{key}_pv.jpg"))
         messages.append(TextSendMessage(text=bets_text(race, arr)))
+        return messages
     except Exception as e:
         # 画像づくりに失敗したら、今までどおり文章で送る（原因も添える）
-        import traceback
         traceback.print_exc()
-        messages = [TextSendMessage(text=f"⚠画像を作れませんでした（{type(e).__name__}: {e}）\n\n"
-                                         + format_reply(race, arr))]
-    line_bot_api.reply_message(event.reply_token, messages)
+        return [TextSendMessage(text=f"⚠画像を作れませんでした（{type(e).__name__}: {e}）\n\n"
+                                     + format_reply(race, arr))]
+
+
+def process_message(reply_token, text, base):
+    t0 = time.time()
+    try:
+        messages = build_messages(text, base)
+    except Exception as e:
+        traceback.print_exc()
+        messages = [TextSendMessage(text=f"予想中にエラーが発生しました。\n詳細: {e}")]
+    print(f'[time] 予想づくり {time.time() - t0:.1f}秒', flush=True)
+    try:
+        line_bot_api.reply_message(reply_token, messages)
+        print(f'[reply] 送信OK（{len(messages)}件・{time.time() - t0:.1f}秒）', flush=True)
+    except Exception as e:
+        print(f'[reply] 返信に失敗: {e}', flush=True)
+
+
+@app.route('/test')
+def test_page():
+    """ブラウザで動作確認するためのページ。
+    https://〇〇.onrender.com/test?id=レースID12桁      → 予想画像を表示
+    https://〇〇.onrender.com/test?id=レースID12桁&t=1  → 文章版を表示"""
+    rid = request.args.get('id', '')
+    try:
+        result, err = analyze(rid)
+        if err:
+            return err, 200, {'Content-Type': 'text/plain; charset=utf-8'}
+        if request.args.get('t'):
+            return format_reply(*result), 200, {'Content-Type': 'text/plain; charset=utf-8'}
+        if not fonts_ready.wait(timeout=20):
+            return '文字データを準備中です。1〜2分後に開き直してください', 200, {'Content-Type': 'text/plain; charset=utf-8'}
+        with _render_lock:
+            key = save_image(render_image(*result))
+        return send_from_directory(IMG_DIR, key + '.png')
+    except Exception:
+        return traceback.format_exc(), 500, {'Content-Type': 'text/plain; charset=utf-8'}
 
 
 threading.Thread(target=preload_fonts, daemon=True).start()
