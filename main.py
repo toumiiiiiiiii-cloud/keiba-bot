@@ -671,9 +671,9 @@ FONT_FILES = {
     'sans_r': 'Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf',
     'serif_b': 'Serif/OTF/Japanese/NotoSerifCJKjp-Bold.otf',
 }
-FONT_MIRRORS = [  # 1つ目がダメなら2つ目から取る
-    'https://cdn.jsdelivr.net/gh/notofonts/noto-cjk@main/{}',
+FONT_MIRRORS = [  # 1つ目がダメなら2つ目から取る（jsDelivrは大きいファイルを断ることがあるので後ろ）
     'https://github.com/notofonts/noto-cjk/raw/main/{}',
+    'https://cdn.jsdelivr.net/gh/notofonts/noto-cjk@main/{}',
 ]
 FONT_LOCAL = {  # サーバーやPCに最初から入っている場合はそれを使う
     'sans_b': ['/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc', '/usr/share/fonts/opentype/noto/NotoSansCJK-Black.ttc'],
