@@ -40,6 +40,11 @@ def clean(text):
     return re.sub(r'\s+', '', text or '')
 
 
+def clean_jockey(text):
+    """騎手名の前につく減量記号（▲△☆★◇）を取り除く"""
+    return re.sub(r'^[▲△☆★◇]+', '', clean(text)) or '不明'
+
+
 def to_float(text):
     """'57.0' '3.5' などを数値化。'---.-' や空欄は None"""
     if text is None:
@@ -60,7 +65,6 @@ def fetch_soup(url):
     if 'utf' in enc:
         html = raw.decode('utf-8', errors='replace')
     else:
-        # netkeiba は EUC-JP。まず厳密に、ダメなら拡張漢字（髙など）対応の codec で
         try:
             html = raw.decode('euc_jp')
         except UnicodeDecodeError:
@@ -75,7 +79,6 @@ def parse_input(text):
         return None, None, None
     race_id = m.group(1)
     base = 'https://nar.netkeiba.com' if 'nar.' in text else 'https://race.netkeiba.com'
-    # db.netkeiba.com/race/xxxx は結果ページ扱い
     is_result = ('result' in text) or ('db.netkeiba.com/race/' in text)
     return race_id, ('result' if is_result else 'shutuba'), base
 
@@ -84,8 +87,7 @@ def parse_input(text):
 # 出馬表（shutuba.html）
 # ─────────────────────────────
 def fetch_win_odds(race_id, base):
-    """出馬表のオッズはJavaScriptで後から読み込まれるため、HTMLには入っていない。
-    netkeibaのオッズAPIから直接 {馬番: 単勝オッズ} を取る（JRAのみ）"""
+    """出馬表のオッズはJavaScriptで後から読み込まれるため、APIから直接取る（JRAのみ）"""
     if 'nar.' in base:
         return {}
     url = ('https://race.netkeiba.com/api/api_get_jra_odds.html'
@@ -117,10 +119,11 @@ def parse_shutuba(soup, race_id, base):
             continue
 
         umaban_td = tr.select_one('td[class*="Umaban"]')
-        umaban = int(to_float(umaban_td.get_text())) if umaban_td and to_float(umaban_td.get_text()) else None
+        umaban_val = to_float(umaban_td.get_text()) if umaban_td else None
+        umaban = int(umaban_val) if umaban_val else None
 
         jockey_a = tr.select_one('td.Jockey a') or tr.find('a', href=re.compile(r'/jockey/'))
-        jockey = clean(jockey_a.get_text()) if jockey_a else '不明'
+        jockey = clean_jockey(jockey_a.get_text()) if jockey_a else '不明'
 
         # 斤量は「性齢」セルの次のセル
         weight = None
@@ -137,7 +140,7 @@ def parse_shutuba(soup, race_id, base):
                     weight = to_float(t)
                     break
 
-        # オッズ：API → 無ければHTML内のspan（確定後などに入っている場合がある）
+        # オッズ：API → 無ければHTML内のspan
         odds = api_odds.get(umaban) if umaban else None
         if odds is None:
             span = tr.select_one('span[id^="odds-"]')
@@ -159,7 +162,6 @@ def parse_result(soup):
     if not table:
         return []
 
-    # 結果ページは見出しが文字なので、見出し名から列番号を決める
     header = table.select_one('tr.Header') or table.find('tr')
     cols = [clean(c.get_text()) for c in header.find_all(['th', 'td'])]
 
@@ -184,10 +186,10 @@ def parse_result(soup):
         horses.append({
             '馬番': int(umaban) if umaban else None,
             '馬名': clean(a.get_text()),
-            '騎手': clean(jockey_a.get_text()) if jockey_a else '不明',
+            '騎手': clean_jockey(jockey_a.get_text()) if jockey_a else '不明',
             '斤量': to_float(cell(tds, i_kin)),
             '単勝オッズ': to_float(cell(tds, i_odds)),
-            '取消': not rank_text.isdigit() and rank_text in ('取消', '除外', '中止'),
+            '取消': rank_text in ('取消', '除外', '中止'),
         })
     return horses
 
@@ -210,6 +212,21 @@ def scrape_race(text):
     return race_name, horses, page
 
 
+def calc_win_rate(df):
+    """AIモデルで勝率を出す。モデルが全馬に同じ値を出す（差がつかない）場合は
+    オッズから勝率を推定する。戻り値: (勝率の列, オッズで代用したかどうか)"""
+    X = df[['単勝オッズ', '斤量', 'タイム_秒']]
+    probs = pd.Series(ai_model.predict_proba(X)[:, 1], index=df.index)
+
+    if probs.std() < 1e-6 or probs.sum() == 0:
+        # モデルが差をつけられない → オッズの逆数を合計100%になるよう正規化
+        inv = 1 / df['単勝オッズ']
+        return inv / inv.sum() * 100, True
+
+    # レース内で合計100%になるように正規化
+    return probs / probs.sum() * 100, False
+
+
 def generate_ai_prediction(text):
     if ai_model is None:
         return "エラー：AIモデルが読み込めませんでした。"
@@ -228,9 +245,10 @@ def generate_ai_prediction(text):
         df['斤量'] = df['斤量'].fillna(DEFAULT_WEIGHT)
         df['タイム_秒'] = DUMMY_TIME
 
-        X = df[['単勝オッズ', '斤量', 'タイム_秒']]
-        df['AI勝率'] = ai_model.predict_proba(X)[:, 1] * 100
-        top = df.sort_values('AI勝率', ascending=False).head(5)
+        df['AI勝率'], used_odds = calc_win_rate(df)
+
+        # 勝率が高い順。同じ値なら人気（オッズが低い）順
+        top = df.sort_values(['AI勝率', '単勝オッズ'], ascending=[False, True]).head(5)
 
         reply = f"🟩 AI適性スコア予想 🟩\n{race_name}\n\n"
         ranks = ['【ランクS】1位', '【ランクA】2位', '【ランクB】3位', '【ランクB】4位', '【ランクC】5位']
@@ -244,8 +262,11 @@ def generate_ai_prediction(text):
 
         if no_odds:
             reply += "⚠ オッズ未発表のため仮オッズ(50.0倍)で計算しています。\n"
-        reply += "※実際のオッズと斤量データを元にAIが算出しています。\n（走破タイムは仮数値を代入して計算）"
-        return reply
+        if used_odds:
+            reply += "⚠ 今回はAIモデルで差がつかなかったため、オッズから勝率を算出しています。\n"
+        else:
+            reply += "※実際のオッズと斤量データを元にAIが算出しています。\n"
+        return reply.rstrip()
 
     except requests.HTTPError as e:
         return f"netkeibaへのアクセスに失敗しました（{e.response.status_code}）。"
@@ -275,12 +296,9 @@ def handle_message(event):
 
 
 if __name__ == "__main__":
-    # 動作確認用： python main.py <netkeibaのURL> でスクレイピング結果だけ表示
+    # 動作確認用： python main.py <netkeibaのURL> で予想結果をそのまま表示
     if len(sys.argv) > 1:
-        name, rows, page = scrape_race(sys.argv[1])
-        print(name, page)
-        for h in rows:
-            print(h)
+        print(generate_ai_prediction(sys.argv[1]))
     else:
         port = int(os.environ.get("PORT", 5000))
         app.run(host="0.0.0.0", port=port)
