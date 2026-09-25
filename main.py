@@ -9,6 +9,7 @@ import re
 import sys
 import math
 import requests
+import json
 import datetime
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -257,6 +258,8 @@ def parse_shutuba_past(soup):
         if not a:
             continue
         name = clean(a.get_text())
+        hm_ = re.search(r'/horse/(\d{10})', a.get('href', ''))
+        hid = hm_.group(1) if hm_ else None
 
         tds = tr.find_all('td')
         nums = [int(t) for t in (clean(td.get_text()) for td in tds[:3]) if t.isdigit()]
@@ -310,7 +313,7 @@ def parse_shutuba_past(soup):
         cancelled = 'Cancel' in tr.get('class', []) or bool(re.search(r'取消|除外', tr.get_text()[:200]))
         horses.append({'w': waku, 'n': umaban, 'name': name, 'sire': clean(sire),
                        'dam': f'{clean(dam)}({damsire})' if damsire else clean(dam),
-                       'damsire': damsire, 'st': st, 'jockey': jockey, 'wt': wt, 'jid': jid,
+                       'damsire': damsire, 'st': st, 'jockey': jockey, 'wt': wt, 'jid': jid, 'hid': hid,
                        'weeks': weeks, 'bwNow': bw_now, 'bwDiff': bw_diff,
                        'lines': lines, 'cancelled': cancelled})
     return horses
@@ -381,13 +384,16 @@ def auto_heuristics(race, horses):
             avg = sum(wl[i] * mv(l) for i, l in enumerate(use)) / tw
             form = 5 if avg <= 0.3 else 4 if avg <= 0.7 else 3 if avg <= 1.2 else 2 if avg <= 2.0 else 1
 
-        same = [l for l in ls if l['dist'][:1] == race['surf'] and abs(dist_num(l['dist']) - race['dist']) <= 100]
+        # 適性は全成績で見る（古いレースほど軽く）
+        cs = [l for l in h.get('career', h['lines']) if l['pos'] > 0 and is_flat(l)]
+        same = [l for l in cs if l['dist'][:1] == race['surf'] and abs(dist_num(l['dist']) - race['dist']) <= 100]
         fit = 2
         if same:
-            t3 = sum(1 for l in same if l['pos'] <= 3)
-            avg = sum(mv(l) for l in same) / len(same)
-            fit = (5 if t3 >= 2 else 4) if (t3 >= 1 and avg <= 1.0) else 3 if avg <= 1.5 else 2
-        elif ls and all(l['dist'][:1] != race['surf'] for l in ls):
+            ws = [age_w(l, race) for l in same]
+            t3w = sum(w_ for w_, l in zip(ws, same) if l['pos'] <= 3)
+            avg = sum(w_ * mv(l) for w_, l in zip(ws, same)) / sum(ws)
+            fit = (5 if t3w >= 1.5 else 4) if (t3w >= 0.6 and avg <= 1.0) else 3 if avg <= 1.5 else 2
+        elif cs and all(l['dist'][:1] != race['surf'] for l in cs):
             fit = 1
 
         dw = med - h['wt']
@@ -401,7 +407,7 @@ def auto_heuristics(race, horses):
             l0 = ls[0]
             res = (f"{abs(l0['m']):.1f}秒差で勝ち" if l0['pos'] == 1 else f"{l0['m']:.1f}秒差")
             why.append(f"前走{l0['r']}{l0['pos']}着（{res}）")
-            why.append(f"同条件{len(same)}走で3着内{t3}回" if same else "同条件の経験なし")
+            why.append(f"同条件は全{len(same)}走で3着内{t3}回" if same else "同条件の経験なし")
 
         wl_ = SETTINGS['wl']
         rest = 1 - wl_
@@ -433,7 +439,7 @@ def mud_parts(h):
         bw = int(re.match(r'^\d+', bw_line['bw']).group())
         d = 0.5 if bw >= 500 else 0.25 if bw >= 480 else -0.5 if bw < 440 else 0
         m += d; known = True
-    wet = [l for l in h['lines'] if l['pos'] > 0 and l['dist'].startswith('芝') and re.search(r'[稍重不]', l['cond'])]
+    wet = [l for l in h.get('career', h['lines']) if l['pos'] > 0 and l['dist'].startswith('芝') and re.search(r'[稍重不]', l['cond'])]
     if wet:
         g = sum(1 for l in wet if l['pos'] <= 3 or l['m'] <= 0.5)
         b = sum(1 for l in wet if l['pos'] > 3 and l['m'] > 1.0)
@@ -448,9 +454,9 @@ def mud_parts(h):
 
 def dist_record(h, race):
     tol = 200 if race['dist'] >= 2000 else 100
-    wts = [1, .9, .8, .7, .6]
-    rows = [l for l in h['lines'] if l['pos'] > 0 and is_flat(l) and l['dist'][:1] == race['surf']
-            and abs(dist_num(l['dist']) - race['dist']) <= tol]
+    wts = [1, .9, .8, .7, .6, .5, .45, .4]
+    rows = [l for l in h.get('career', h['lines']) if l['pos'] > 0 and is_flat(l) and l['dist'][:1] == race['surf']
+            and abs(dist_num(l['dist']) - race['dist']) <= tol][:8]
     s = 0
     for i, l in enumerate(rows):
         near = 1 if abs(dist_num(l['dist']) - race['dist']) <= tol / 2 else 0.7
@@ -477,13 +483,13 @@ def makuri_score(h):
 def rival_level(h, keys):
     """対戦相手がその後、格上のレースで2着以内 → そのレースは見た目より強かった"""
     bonus, notes, seen = 0, [], set()
-    for l in [x for x in h['lines'] if x['pos'] > 0]:
+    for l in [x for x in h.get('career', h['lines']) if x['pos'] > 0][:15]:
         shared = class_of_text(l['r'], l['p'])
         for o in keys.get(line_key(l), []):
             if o['name'] == h['name'] or o['pos'] <= 0 or o['name'] in seen:
                 continue
             best = None
-            for f in o['horse']['lines']:
+            for f in o['horse'].get('career', o['horse']['lines']):
                 if f['pos'] > 0 and f['d'] > l['d'] and f['pos'] <= 2:
                     fc = class_of_text(f['r'], f['p'])
                     if fc != 8 and fc > shared and (not best or fc > best[0]):
@@ -500,7 +506,8 @@ def rival_level(h, keys):
 
 
 def line_key(l):
-    return '|'.join(str(l.get(k)) for k in ('d', 'p', 'dist', 'r', 'f'))
+    # 同じレースかどうかの目印（日付・競馬場・距離・頭数）。出馬表と馬のページで書き方が違っても一致するように
+    return f"{l.get('d')}|{l.get('p')}|{dist_num(l.get('dist'))}|{l.get('f')}"
 
 
 def ranked(race, horses, odds):
@@ -509,7 +516,7 @@ def ranked(race, horses, odds):
     adj = PACE.get(pace, {})
     keys = {}
     for h in horses:
-        for l in h['lines']:
+        for l in h.get('career', h['lines']):
             keys.setdefault(line_key(l), []).append({'name': h['name'], 'pos': l['pos'], 'horse': h})
 
     for h in horses:
@@ -576,25 +583,35 @@ def verdict(arr):
     return '買い' if score >= 3 else '少額で買い' if score >= 1 else '見送り推奨'
 
 
-def bets(arr):
+def bet_plan(arr):
+    """おすすめ買い目。各要素は {'label','text','parts':[(券種, [組み合わせ,...]), ...]}"""
     n = [h['n'] for h in arr]
-    out = []
+    plan = []
     if len(n) >= 3:
-        out.append(f"本線 馬連 {n[0]}-{n[1]}, {n[0]}-{n[2]}")
-        out.append(f"本線 ワイド {n[0]}-{n[1]}")
+        plan.append({'label': '本線', 'text': f"馬連 {n[0]}-{n[1]}, {n[0]}-{n[2]}",
+                     'parts': [('馬連', [(n[0], n[1]), (n[0], n[2])])]})
+        plan.append({'label': '本線', 'text': f"ワイド {n[0]}-{n[1]}", 'parts': [('ワイド', [(n[0], n[1])])]})
     if len(n) >= 6:
-        out.append(f"本線 3連複 {n[0]} - {n[1]},{n[2]} - {','.join(map(str, n[1:6]))}")
-    evs = [h for h in arr[:8] if h['ev'] and h['ev'] >= 1.15]
+        combos = sorted({tuple(sorted((n[0], b, c))) for b in n[1:3] for c in n[1:6] if b != c})
+        plan.append({'label': '本線', 'text': f"3連複 {n[0]} - {n[1]},{n[2]} - {','.join(map(str, n[1:6]))}（{len(combos)}点）",
+                     'parts': [('3連複', combos)]})
+    evs = [h for h in arr[:8] if h.get('ev') and h['ev'] >= 1.15]
     if evs:
         b = max(evs, key=lambda h: h['ev'])
-        out.append(f"妙味 単複 {b['n']}（期待値{b['ev']:.2f}）")
+        plan.append({'label': '妙味', 'text': f"単複 {b['n']}（期待値{b['ev']:.2f}）",
+                     'parts': [('単勝', [(b['n'],)]), ('複勝', [(b['n'],)])]})
     anas = [h for h in arr if h['anaFlag']][:2]
     if anas:
-        out.append("穴 ワイド " + ', '.join(f"{n[0]}-{h['n']}" for h in anas))
+        plan.append({'label': '穴', 'text': "ワイド " + ', '.join(f"{n[0]}-{h['n']}" for h in anas),
+                     'parts': [('ワイド', [(n[0], h['n']) for h in anas])]})
     t = trifecta_high(arr)
     if t:
-        out.append(t)
-    return out
+        plan.append(t)
+    return plan
+
+
+def bets(arr):
+    return [f"{b['label']} {b['text']}" for b in bet_plan(arr)]
 
 
 def trifecta_high(arr):
@@ -603,7 +620,7 @@ def trifecta_high(arr):
     if len(arr) < 5:
         return None
     top8 = arr[:8]
-    value = sorted([h for h in top8[1:] if h['ev'] and h['ev'] >= 1.3], key=lambda h: -h['ev'])
+    value = sorted([h for h in top8[1:] if h.get('ev') and h['ev'] >= 1.3], key=lambda h: -h['ev'])
     anas = [h for h in arr if h['anaFlag']]
 
     first = [arr[0]] + value[:1]
@@ -617,10 +634,11 @@ def trifecta_high(arr):
         if h not in third and len(third) < 7:
             third.append(h)
 
-    pts = sum(1 for a in first for b in second for c in third if len({a['n'], b['n'], c['n']}) == 3)
+    combos = [(a['n'], b['n'], c['n']) for a in first for b in second for c in third
+              if len({a['n'], b['n'], c['n']}) == 3]
     j = lambda hs: ','.join(str(h['n']) for h in hs)
-    return f"高目 3連単 1着{j(first)} → 2着{j(second)} → 3着{j(third)}（{pts}点）"
-
+    return {'label': '高目', 'text': f"3連単 1着{j(first)} → 2着{j(second)} → 3着{j(third)}（{len(combos)}点）",
+            'parts': [('3連単', combos)]}
 
 
 # ═════════════════════════════════════════
@@ -923,7 +941,7 @@ def condition_factors(race, horses):
 
 def extra_factors(race, horses, soup, race_id):
     """③④⑤をまとめて計算し、各馬の xBonus に入れる"""
-    race['date'] = parse_race_date(soup)
+    race['date'] = race.get('date') or parse_race_date(soup)
     jids = {h['jid'] for h in horses if h.get('jid')}
     with ThreadPoolExecutor(max_workers=8) as ex:
         f_tb = ex.submit(_safe, track_bias, race, race_id, race['date'])
@@ -937,8 +955,183 @@ def extra_factors(race, horses, soup, race_id):
     bias_factors(race, horses)
     jockey_factors(race, horses)
     condition_factors(race, horses)
+    career_factors(race, horses)
     for h in horses:
-        h['xBonus'] = h['bTime'] + h['bAgari'] + h['bDraw'] + h['bTrack'] + h['bJockey'] + h['bCond']
+        h['xBonus'] = h['bTime'] + h['bAgari'] + h['bDraw'] + h['bTrack'] + h['bJockey'] + h['bCond'] + h['bCareer']
+
+
+# ═════════════════════════════════════════
+# 全成績（馬ごとのページから）
+# ═════════════════════════════════════════
+LEFT_TURN = {'東京', '中京', '新潟', '川崎', '船橋', '浦和', '盛岡'}   # 左回りの競馬場
+KNOWN_DIR = LEFT_TURN | {'札幌', '函館', '福島', '中山', '京都', '阪神', '小倉', '大井', '門別', '水沢',
+                         '金沢', '笠松', '名古屋', '園田', '姫路', '高知', '佐賀'}
+
+
+def age_w(l, race):
+    """古いレースほど軽く扱う重み（2年で半分）"""
+    try:
+        ld = datetime.date(*map(int, l['d'].split('.')))
+        ref = race.get('date') or jst_today()
+        return 0.5 ** (max(0, (ref - ld).days) / 730)
+    except Exception:
+        return 0.5
+
+
+def fetch_career(hid):
+    """netkeibaの馬のページから全成績を読む。読めなければ None"""
+    def load():
+        for url in (f"https://db.netkeiba.com/horse/result/{hid}/", f"https://db.netkeiba.com/horse/{hid}/"):
+            try:
+                soup = fetch_soup(url)
+            except Exception:
+                continue
+            lines = parse_career_table(soup)
+            if lines:
+                return lines
+        return None
+    return cached(('career', hid), 43200, load)
+
+
+def parse_career_table(soup):
+    for table in soup.find_all('table'):
+        head = table.find('tr')
+        if not head:
+            continue
+        cols = [clean(c.get_text()) for c in head.find_all(['th', 'td'])]
+        if not (any(c == '日付' for c in cols) and any('着順' in c for c in cols) and any('距離' in c for c in cols)):
+            continue
+        col = lambda *ks: next((i for i, c in enumerate(cols) if any(c == k or c.startswith(k) for k in ks)), None)
+        I = {'d': col('日付'), 'p': col('開催'), 'r': col('レース名'), 'f': col('頭数'), 'n': col('馬番'),
+             'pop': col('人気'), 'pos': col('着順'), 'j': col('騎手'), 'w': col('斤量'), 'dist': col('距離'),
+             'cond': col('馬場'), 't': col('タイム'), 'm': col('着差'), 'ps': col('通過'), 'l3': col('上り'),
+             'bw': col('馬体重'), 'win': col('勝ち馬')}
+        out = []
+        for tr in table.find_all('tr')[1:]:
+            tds = tr.find_all('td')
+            g = lambda k: (clean(tds[I[k]].get_text()) if I.get(k) is not None and I[k] < len(tds) else '')
+            dm = re.match(r'(\d{4})/(\d{1,2})/(\d{1,2})', g('d'))
+            dist_m = re.match(r'(芝|ダ|障)\D*(\d{3,4})', g('dist'))
+            if not dm or not dist_m:
+                continue
+            pos_t = g('pos')
+            pos = int(pos_t) if pos_t.isdigit() else 0
+            m = to_float(g('m'))
+            if m is not None and g('m').startswith('-'):
+                m = -m
+            if m is None:
+                if pos == 1:
+                    m = 0.0
+                elif pos > 0:
+                    continue
+                else:
+                    m = 9.9
+            tt = re.match(r'(\d):(\d{2}\.\d)', g('t'))
+            cond = (g('cond') or '良')[:1]
+            out.append({
+                'd': f"{dm.group(1)}.{int(dm.group(2)):02d}.{int(dm.group(3)):02d}",
+                'p': re.sub(r'\d', '', g('p')) or '?', 'pos': pos, 'r': g('r'),
+                'dist': dist_m.group(1) + dist_m.group(2), 'cond': cond if cond in '良稍重不' else '良',
+                't': int(tt.group(1)) * 60 + float(tt.group(2)) if tt else 0,
+                'f': int(to_float(g('f')) or 0) or 16, 'n': int(to_float(g('n')) or 0),
+                'pop': int(to_float(g('pop')) or 0), 'j': g('j'), 'w': to_float(g('w')) or 0,
+                'ps': g('ps'), 'l3': to_float(g('l3')) or 0, 'bw': g('bw'), 'win': g('win'), 'm': m,
+            })
+        if out:
+            return out
+    return None
+
+
+def load_careers(race, horses):
+    """全頭の全成績を同時に取りに行く。取れなかった馬は出馬表の5走で代用"""
+    hids = [h['hid'] for h in horses if h.get('hid')]
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        got = dict(zip(hids, ex.map(lambda i: _safe(fetch_career, i), hids)))
+    cutoff = race['date'].strftime('%Y.%m.%d') if race.get('date') else None
+    n_ok = 0
+    for h in horses:
+        c = got.get(h.get('hid'))
+        if c:
+            h['career'] = [l for l in c if not cutoff or l['d'] < cutoff]  # 当日以降の成績は使わない
+            h['careerOk'] = True
+            n_ok += 1
+        else:
+            h['career'] = h['lines']
+            h['careerOk'] = False
+    race['careerOk'] = n_ok
+    print(f"[career] 全成績 {n_ok}/{len(horses)}頭", flush=True)
+
+
+def rec_str(ls):
+    t3 = sum(1 for l in ls if 0 < l['pos'] <= 3)
+    return f"{len(ls)}戦{sum(1 for l in ls if l['pos'] == 1)}勝・3着内{t3}回", t3
+
+
+def career_factors(race, horses):
+    """全成績から：回り、季節、休み明けの実績、力の上限"""
+    rcv = CLS[race['clsIdx']][1]
+    left_today = race['venue'] in LEFT_TURN
+    month = race['date'].month if race.get('date') else None
+    for h in horses:
+        cs = [l for l in h.get('career', []) if l['pos'] > 0 and is_flat(l)]
+        b, notes = 0.0, []
+        if h.get('careerOk') and len(cs) >= 4:
+            # 回り
+            known = [l for l in cs if l['p'] in KNOWN_DIR]
+            same_dir = [l for l in known if (l['p'] in LEFT_TURN) == left_today]
+            other = [l for l in known if (l['p'] in LEFT_TURN) != left_today]
+            if len(same_dir) >= 2 and len(other) >= 2:
+                r1 = sum(1 for l in same_dir if l['pos'] <= 3) / len(same_dir)
+                r2 = sum(1 for l in other if l['pos'] <= 3) / len(other)
+                if r1 - r2 >= 0.25:
+                    b += 0.006; notes.append(f"{'左' if left_today else '右'}回りが得意（{rec_str(same_dir)[0]}）")
+                elif r2 - r1 >= 0.25:
+                    b -= 0.006; notes.append(f"{'左' if left_today else '右'}回りは苦手（{rec_str(same_dir)[0]}）")
+            # 季節（前後1か月）
+            if month:
+                def near_m(l):
+                    mm = int(l['d'][5:7]); dd = min(abs(mm - month), 12 - abs(mm - month))
+                    return dd <= 1
+                sea = [l for l in cs if near_m(l)]
+                if len(sea) >= 3:
+                    r1 = sum(1 for l in sea if l['pos'] <= 3) / len(sea)
+                    r0 = sum(1 for l in cs if l['pos'] <= 3) / len(cs)
+                    if r1 - r0 >= 0.25:
+                        b += 0.005; notes.append(f"この時期に好走が多い（{rec_str(sea)[0]}）")
+                    elif r0 - r1 >= 0.25:
+                        b -= 0.005; notes.append(f"この時期は成績が落ちる（{rec_str(sea)[0]}）")
+            # 力の上限：今回より上のクラスで3着以内（古いほど軽く）
+            best = None
+            for l in cs:
+                ci = class_of_text(l['r'], l['p'])
+                if ci != 8 and l['pos'] <= 3 and CLS[ci][1] > rcv:
+                    v = (CLS[ci][1] - rcv) * age_w(l, race)
+                    if not best or v > best[0]:
+                        best = (v, l)
+            if best:
+                b += min(best[0], 2) / 2 * 0.01
+                l = best[1]
+                notes.append(f"格上の{l['r']}で{l['pos']}着の実績（{l['d'][:4]}年）")
+        # 休み明けの実績（今回が中10週以上のとき）
+        w = h.get('weeksCalc')
+        if w is not None and w >= 10 and len(cs) >= 2:
+            fresh = []
+            sorted_cs = sorted(cs, key=lambda l: l['d'])
+            for prev, cur in zip(sorted_cs, sorted_cs[1:]):
+                try:
+                    gap = (datetime.date(*map(int, cur['d'].split('.'))) - datetime.date(*map(int, prev['d'].split('.')))).days
+                except Exception:
+                    continue
+                if gap >= 70:
+                    fresh.append(cur)
+            if len(fresh) >= 2:
+                txt, t3 = rec_str(fresh)
+                if t3 / len(fresh) >= 0.5:
+                    b += 0.01; notes.append(f"休み明けは得意（{txt}）")
+                elif t3 == 0:
+                    b -= 0.005; notes.append(f"休み明けは苦手（{txt}）")
+        h['bCareer'] = clamp(b, -0.015, 0.02)
+        h['careerNotes'] = notes
 
 
 # ═════════════════════════════════════════
@@ -966,6 +1159,9 @@ def analyze(text):
         race['pace_from'] = '逃げ馬の数から推定'
     race['nige'] = nige
     race['base'] = base
+    race['id'] = race_id
+    race['date'] = parse_race_date(soup)
+    load_careers(race, horses)
 
     auto_heuristics(race, horses)
     extra_factors(race, horses, soup, race_id)
@@ -1356,7 +1552,8 @@ def make_reasons(race, h):
         R.append(('近走', rs))
 
     if h['sameN']:
-        fit_t = f"今回と同じ{race['surf']}{race['dist']}m前後で{h['sameN']}走して3着以内{h['sameT3']}回"
+        fit_t = (f"全成績のうち今回と同じ{race['surf']}{race['dist']}m前後は{h['sameN']}走で3着以内{h['sameT3']}回"
+                 "（新しいレースほど重視）")
     else:
         fit_t = "同じ距離・コースの経験は直近5走になし"
     if h['distSum'] > 0:
@@ -1412,6 +1609,8 @@ def make_reasons(race, h):
         R.append(('騎手データ', '。'.join(jt) + sgn(h.get('bJockey', 0))))
     if h.get('condNotes'):
         R.append(('状態', '、'.join(h['condNotes']) + sgn(h.get('bCond', 0))))
+    if h.get('careerNotes'):
+        R.append(('全成績から', '、'.join(h['careerNotes']) + sgn(h.get('bCareer', 0))))
 
     R.append(('血統・厩舎', f"父{h['sire'] or '不明'}" + (f"・母父{h['damsire']}" if h.get('damsire') else '')))
     return R
@@ -1424,7 +1623,7 @@ def sgn(v):
 SHORT_HEAD = {'総合評価': '総合評価', '過去レースのレベル': 'レース格', '対戦相手のその後': '対戦相手',
               '近走': '近走', 'コース・距離適性': '適性', '脚質・展開': '展開', '騎手・条件': '騎手・斤量',
               '道悪適性': '道悪', '穴馬チェック': '穴馬', '血統・厩舎': '血統', 'タイム': 'タイム',
-              '上がり': '上がり', '枠順': '枠順', '当日の馬場': '当日馬場', '騎手データ': '騎手成績', '状態': '状態'}
+              '上がり': '上がり', '枠順': '枠順', '当日の馬場': '当日馬場', '騎手データ': '騎手成績', '状態': '状態', '全成績から': '全成績'}
 
 
 _cw_cache = {}
@@ -1543,6 +1742,207 @@ def bets_text(race, arr):
     return "\n".join(out)
 
 
+
+# ═════════════════════════════════════════
+# 成績の記録（Googleスプレッドシート）
+# ═════════════════════════════════════════
+SHEET_URL = os.environ.get('SHEET_URL', '').strip()
+SHEET_TOKEN = os.environ.get('SHEET_TOKEN', '').strip()
+PAYOUT_KINDS = {'単勝': 1, '複勝': 1, '枠連': 2, '馬連': 2, 'ワイド': 2, '馬単': 2, '3連複': 3, '3連単': 3}
+ORDERED = {'単勝', '複勝', '馬単', '3連単'}   # 着順どおりに判定する券種
+_settle_lock = threading.Lock()
+
+
+def sheet_call(action, **payload):
+    """スプレッドシート（Apps Script）に命令を送って、返事を受け取る"""
+    if not SHEET_URL:
+        return None
+    body = json.dumps({'token': SHEET_TOKEN, 'action': action, **payload}, ensure_ascii=False)
+    r = requests.post(SHEET_URL, data=body.encode('utf-8'), headers={'Content-Type': 'application/json'},
+                      timeout=30, allow_redirects=False)
+    if r.status_code in (301, 302, 303) and r.headers.get('Location'):
+        r = requests.get(r.headers['Location'], timeout=30)
+    r.raise_for_status()
+    res = r.json()
+    if not res.get('ok'):
+        raise RuntimeError(f"スプレッドシートがエラーを返しました: {res.get('error')}")
+    return res
+
+
+def start_dt(race):
+    if not race.get('date') or not re.match(r'\d{1,2}:\d{2}$', race.get('time') or ''):
+        return None
+    hh, mm = map(int, race['time'].split(':'))
+    return datetime.datetime(race['date'].year, race['date'].month, race['date'].day, hh, mm)
+
+
+def jst_now():
+    return datetime.datetime.utcnow() + datetime.timedelta(hours=9)
+
+
+def record_prediction(race, arr):
+    """発走前の予想だけを記録する（発走後に出した予想は成績に入れない）"""
+    if not SHEET_URL:
+        return
+    st = start_dt(race)
+    if st and jst_now() >= st:
+        print(f"[sheet] 発走後のため記録しません {race['id']}", flush=True)
+        return
+    plan = bet_plan(arr)
+    marks = ' '.join(f"{MARKS[i]}{h['n']}" for i, h in enumerate(arr[:7]))
+    row = {
+        'recorded': jst_now().strftime('%Y/%m/%d %H:%M'),
+        'race_id': race['id'],
+        'start': st.strftime('%Y/%m/%d %H:%M') if st else '',
+        'race': f"{race['venue']}{race['R']}R {race['name']}",
+        'honmei': f"{arr[0]['n']} {arr[0]['name']}",
+        'marks': marks,
+        'odds': arr[0]['o'] or '',
+        'bets': '\n'.join(f"{b['label']} {b['text']}" for b in plan),
+        'plan': json.dumps([{'label': b['label'], 'parts': b['parts']} for b in plan], ensure_ascii=False),
+        'site': race.get('base', ''),
+    }
+    try:
+        sheet_call('record', row=row)
+        print(f"[sheet] 記録しました {race['id']}", flush=True)
+    except Exception as e:
+        print(f"[sheet] 記録に失敗: {e}", flush=True)
+
+
+def parse_result_order(soup):
+    """結果ページから {馬番: 着順}。取消・除外は入れない。競走中止は99"""
+    table = soup.select_one('table#All_Result_Table') or soup.select_one('table.RaceTable01')
+    if not table:
+        return {}
+    header = table.select_one('tr.Header') or table.find('tr')
+    cols = [clean(c.get_text()) for c in header.find_all(['th', 'td'])]
+    i_n = next((i for i, c in enumerate(cols) if '馬番' in c), None)
+    out = {}
+    for tr in table.select('tr.HorseList') or table.find_all('tr')[1:]:
+        tds = tr.find_all('td')
+        if not tds or i_n is None or i_n >= len(tds):
+            continue
+        n = to_float(tds[i_n].get_text())
+        rk = clean(tds[0].get_text())
+        if n and rk not in ('取消', '除外', ''):
+            out[int(n)] = int(rk) if rk.isdigit() else 99
+    return out
+
+
+def parse_payouts(soup):
+    """払戻金 {券種: {組み合わせ: 円}}"""
+    pays = {}
+    for tr in soup.select('table[class*="Payout"] tr'):
+        th = tr.find('th')
+        if not th:
+            continue
+        kind = norm_digits(clean(th.get_text())).replace('三連', '3連')
+        res_td, pay_td = tr.select_one('td.Result'), tr.select_one('td.Payout')
+        if kind not in PAYOUT_KINDS or not res_td or not pay_td:
+            continue
+        nums = [int(x) for x in re.findall(r'\d+', res_td.get_text(' '))]
+        yen = [int(x.replace(',', '')) for x in re.findall(r'([\d,]+)円', pay_td.get_text(' '))]
+        k = PAYOUT_KINDS[kind]
+        if not yen or len(nums) != k * len(yen):
+            continue
+        d = pays.setdefault(kind, {})
+        for i, y in enumerate(yen):
+            c = tuple(nums[i * k:(i + 1) * k])
+            d[c if kind in ORDERED else tuple(sorted(c))] = y
+    return pays
+
+
+def settle_one(row):
+    """1レース分の答え合わせ。結果がまだなら None"""
+    site = row.get('site') or 'https://race.netkeiba.com'
+    soup = fetch_soup(f"{site}/race/result.html?race_id={row['race_id']}")
+    order = parse_result_order(soup)
+    if not any(v == 1 for v in order.values()):
+        return None
+    pays = parse_payouts(soup)
+    top3 = [n for n, _ in sorted(((n, r) for n, r in order.items() if r <= 3), key=lambda x: x[1])]
+    hm = int(re.match(r'\d+', str(row.get('honmei', '0'))).group()) if re.match(r'\d+', str(row.get('honmei', ''))) else 0
+    cost = ret = 0
+    detail = {}
+    for b in json.loads(row.get('plan') or '[]'):
+        for kind, combos in b['parts']:
+            if kind not in pays:
+                continue
+            c = 100 * len(combos)
+            got = sum(pays[kind].get(tuple(cb) if kind in ORDERED else tuple(sorted(cb)), 0) for cb in combos)
+            key = f"{b['label']} {kind}"
+            dc, dr = detail.get(key, [0, 0])
+            detail[key] = [dc + c, dr + got]
+            cost += c
+            ret += got
+    return {'race_id': row['race_id'], 'result': '-'.join(map(str, top3)), 'honmei_pos': order.get(hm, ''),
+            'cost': cost, 'ret': ret, 'detail': json.dumps(detail, ensure_ascii=False)}
+
+
+def settle_pending(limit=15):
+    """まだ結果が入っていない予想の答え合わせをして、スプレッドシートに書き込む"""
+    if not SHEET_URL or not _settle_lock.acquire(blocking=False):
+        return 0
+    try:
+        rows = sheet_call('pending').get('rows', [])
+        now = jst_now()
+        done = []
+        for row in rows:
+            try:
+                st = datetime.datetime.strptime(row['start'], '%Y/%m/%d %H:%M') if row.get('start') else None
+            except ValueError:
+                st = None
+            if st and now < st + datetime.timedelta(minutes=15):
+                continue   # まだ結果が出ていない
+            res = _safe(settle_one, row)
+            if res:
+                done.append(res)
+            if len(done) >= limit:
+                break
+        if done:
+            sheet_call('settle', results=done)
+        print(f"[sheet] 答え合わせ {len(done)}件", flush=True)
+        return len(done)
+    except Exception as e:
+        print(f"[sheet] 答え合わせに失敗: {e}", flush=True)
+        return 0
+    finally:
+        _settle_lock.release()
+
+
+def stats_text():
+    """「成績」と送ったときの返事"""
+    if not SHEET_URL:
+        return "成績の記録はまだ設定されていません（SHEET_URLが未設定です）。"
+    settle_pending(limit=30)
+    rows = [r for r in sheet_call('all').get('rows', []) if r.get('status') == '確定']
+    if not rows:
+        return "📈 まだ結果の出た予想がありません。発走前に予想を出すと、レース後に自動で記録されます。"
+    n = len(rows)
+    pos = [int(r['honmei_pos']) for r in rows if str(r.get('honmei_pos', '')).isdigit()]
+    cost = sum(float(r.get('cost') or 0) for r in rows)
+    ret = sum(float(r.get('ret') or 0) for r in rows)
+    by = {}
+    for r in rows:
+        try:
+            for k, (c, g) in json.loads(r.get('detail') or '{}').items():
+                b = by.setdefault(k, [0, 0, 0, 0])
+                b[0] += 1; b[1] += g > 0; b[2] += c; b[3] += g
+        except Exception:
+            pass
+    pc = lambda a, b: f"{a / b * 100:.0f}%" if b else '―'
+    lines = [f"📈 シェイクユアハート 成績（{n}レース）", "",
+             f"◎の勝率 {pc(sum(1 for p in pos if p == 1), n)} ／ 複勝率 {pc(sum(1 for p in pos if p <= 3), n)}",
+             f"買い目すべて（各100円）", f"　投資 {cost:,.0f}円 → 払戻 {ret:,.0f}円（回収率 {pc(ret, cost)}）", "",
+             "【買い目別】"]
+    for k, (races, hit, c, g) in by.items():
+        lines.append(f"{k}：的中 {pc(hit, races)} ／ 回収 {pc(g, c)}")
+    lines += ["", "直近の結果"]
+    for r in rows[-5:][::-1]:
+        lines.append(f"{r['race']}　◎{r.get('honmei_pos', '?')}着　{float(r.get('ret') or 0) - float(r.get('cost') or 0):+,.0f}円")
+    return "\n".join(lines)
+
+
 # ═════════════════════════════════════════
 # LINE
 # ═════════════════════════════════════════
@@ -1572,9 +1972,22 @@ def handle_message(event):
 
 
 def build_messages(text, base):
-    """予想を作って、LINEに送るメッセージのリストを返す"""
+    """予想を作って、LINEに送るメッセージのリストと、返信後にやる処理を返す"""
+    if text in ('成績', '成績確認'):
+        return [TextSendMessage(text=stats_text())], None
+    msgs, race_arr = _build_prediction(text, base)
+    after = None
+    if race_arr:
+        def after():
+            record_prediction(*race_arr)
+            settle_pending(limit=10)
+    return msgs, after
+
+
+def _build_prediction(text, base):
     if not ("netkeiba.com" in text or re.fullmatch(r'\d{12}', text)):
-        return [TextSendMessage(text="netkeibaの出馬表のURL（またはレースID12桁）を送ってください！")]
+        return [TextSendMessage(text="netkeibaの出馬表のURL（またはレースID12桁）を送ってください！\n"
+                                     "「成績」と送ると、これまでの予想の成績を確認できます。")], None
     try:
         result, err = analyze(text)
     except requests.HTTPError as e:
@@ -1583,7 +1996,7 @@ def build_messages(text, base):
         traceback.print_exc()
         result, err = None, f"予想中にエラーが発生しました。\n詳細: {e}"
     if err:
-        return [TextSendMessage(text=err)]
+        return [TextSendMessage(text=err)], None
 
     race, arr = result
     try:
@@ -1598,18 +2011,19 @@ def build_messages(text, base):
             messages.append(ImageSendMessage(original_content_url=f"{base}/img/{key}.png",
                                              preview_image_url=f"{base}/img/{key}_pv.jpg"))
         messages.append(TextSendMessage(text=bets_text(race, arr)))
-        return messages
+        return messages, (race, arr)
     except Exception as e:
         # 画像づくりに失敗したら、今までどおり文章で送る（原因も添える）
         traceback.print_exc()
         return [TextSendMessage(text=f"⚠画像を作れませんでした（{type(e).__name__}: {e}）\n\n"
-                                     + format_reply(race, arr))]
+                                     + format_reply(race, arr))], (race, arr)
 
 
 def process_message(reply_token, text, base):
     t0 = time.time()
+    after = None
     try:
-        messages = build_messages(text, base)
+        messages, after = build_messages(text, base)
     except Exception as e:
         traceback.print_exc()
         messages = [TextSendMessage(text=f"予想中にエラーが発生しました。\n詳細: {e}")]
@@ -1619,6 +2033,8 @@ def process_message(reply_token, text, base):
         print(f'[reply] 送信OK（{len(messages)}件・{time.time() - t0:.1f}秒）', flush=True)
     except Exception as e:
         print(f'[reply] 返信に失敗: {e}', flush=True)
+    if after:   # 返信を送ったあとで、成績の記録と答え合わせ（予想の速さには影響しない）
+        _safe(after)
 
 
 @app.route('/test')
