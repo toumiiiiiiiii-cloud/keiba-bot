@@ -579,7 +579,7 @@ def bets(arr):
 
 def trifecta_high(arr):
     """高目狙いの3連単フォーメーション。
-    1着：◎＋期待値が一番高い馬 ／ 2着：○▲＋穴馬・高期待値の馬 ／ 3着：2着の馬＋△△△☆"""
+    1着：◎＋期待値が一番高い馬 ／ 2着：1着候補＋○▲＋穴馬・高期待値の馬 ／ 3着：2着の馬＋△△△☆"""
     if len(arr) < 5:
         return None
     top8 = arr[:8]
@@ -587,9 +587,10 @@ def trifecta_high(arr):
     anas = [h for h in arr if h['anaFlag']]
 
     first = [arr[0]] + value[:1]
-    second = []
+    # 2着：1着候補同士の入れ替わり（例：穴馬が勝って◎が2着）も拾えるよう、1着候補も必ず入れる
+    second = list(first)
     for h in arr[1:3] + anas + value:
-        if h not in second and len(second) < 4:
+        if h not in second and len(second) < len(first) + 3:
             second.append(h)
     third = []
     for h in second + first + arr[1:7]:
