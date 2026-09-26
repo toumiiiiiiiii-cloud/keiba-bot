@@ -53,7 +53,7 @@ CLS = [("未勝利・新馬", 1), ("1勝クラス", 2), ("2勝クラス", 3), ("
 # 地方競馬のクラス（中央の格に合わせた目安の値）。番号9以降
 CLS += [("地方C3", 1.2), ("地方C2", 1.4), ("地方C1", 1.7), ("地方B3", 2.0), ("地方B2", 2.2), ("地方B1", 2.4),
         ("地方A2", 2.7), ("地方A1", 3.0), ("地方OP", 3.2), ("地方重賞", 3.6), ("地方S2", 4.0), ("地方S1", 4.4),
-        ("地方2歳", 1.1)]
+        ("地方2歳", 1.1), ("地方A3", 2.6), ("地方A4", 2.5), ("地方B4", 1.9), ("地方C4", 1.1), ("地方D", 1.0)]
 NAR_CLS = {k: i for i, (k, _) in enumerate(CLS) if k.startswith('地方') and k != '地方・その他'}
 
 
@@ -64,9 +64,10 @@ def nar_class(t):
     if re.search(r'S(?:2|Ⅱ|II)(?![IⅠ0-9])', t): return NAR_CLS['地方S2']
     if re.search(r'S(?:3|Ⅲ|III)|重賞', t): return NAR_CLS['地方重賞']
     if re.search(r'オープン|OP|特別選抜', t): return NAR_CLS['地方OP']
-    for k in ('A1', 'A2', 'B1', 'B2', 'B3', 'C1', 'C2', 'C3'):
-        if re.search(k[0] + r'\s*[-－]?\s*' + k[1], t):
+    for k in ('A1', 'A2', 'A3', 'A4', 'B1', 'B2', 'B3', 'B4', 'C1', 'C2', 'C3', 'C4'):
+        if re.search(k[0] + r'\s*[-－]?\s*' + k[1] + r'(?!\d)', t):
             return NAR_CLS['地方' + k]
+    if re.search(r'(^|[^A-Z])D(?![A-Z])', t): return NAR_CLS['地方D']
     for k in ('A', 'B', 'C'):
         if re.search(r'(^|[^A-Z])' + k + r'(?![A-Z])', t):
             return NAR_CLS['地方' + k + '2']
@@ -168,7 +169,7 @@ def class_of_text(t, place=''):
     if re.search(r'GII|G2|GⅡ', t): return 6
     if re.search(r'GI|G1|GⅠ', t): return 7
     if '重賞' in t: return 4
-    if (place or '') in NAR_VENUES: return nar_class(t)
+    if (place or '') in NAR_VENUES: return nar_class_tiered(t, place)
     if '3勝' in t: return 3
     if '2勝' in t: return 2
     if '1勝' in t: return 1
@@ -437,6 +438,8 @@ def auto_heuristics(race, horses):
             tw = sum(wl[:len(use)])
             avg = sum(wl[i] * mv(l) for i, l in enumerate(use)) / tw
             form = 5 if avg <= 0.3 else 4 if avg <= 0.7 else 3 if avg <= 1.2 else 2 if avg <= 2.0 else 1
+            if h.get('flowLastStrong'):   # 前走が流れに逆らった好走なら、近走は「やや好調」以上とみる
+                form = max(form, 4)
 
         # 適性は全成績で見る（古いレースほど軽く）
         cs = [l for l in h.get('career', h['lines']) if l['pos'] > 0 and is_flat(l)]
@@ -588,7 +591,8 @@ def ranked(race, horses, odds):
                   'distRows': drows, 'rivalNotes': rnotes})
 
     arr = sorted(horses, key=lambda x: (-x['a'], x['n'] or 99))
-    ex = [math.exp(SETTINGS['T'] * (h['a'] - 1)) for h in arr]
+    T = SETTINGS['T'] * (1 + 0.15 * race.get('chalk', 0))
+    ex = [math.exp(T * (h['a'] - 1)) for h in arr]
     tot = sum(ex)
     for i, h in enumerate(arr):
         a = h['a']
@@ -751,13 +755,64 @@ def std_time(surf, dist, venue, cond):
     return base + (VENUE_ADJ[surf][venue] + COND_ADJ[surf].get(cond, 0)) * k
 
 
+# 実データの基準タイム（GitHub Actions が作る data/std_times.json）
+STD_REAL = {}
+try:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'std_times.json'), encoding='utf-8') as _f:
+        STD_REAL = json.load(_f)
+    print(f"[std] 実データの基準タイムを読み込み：{STD_REAL.get('n_races')}レース（{STD_REAL.get('first')}〜{STD_REAL.get('last')}）", flush=True)
+except Exception as _e:
+    print(f"[std] 実データの基準タイムなし（目安の値を使います）: {_e}", flush=True)
+
+
+def jra_cls_group(l):
+    """中央のクラスを基準タイム表の区分に（0=新馬未勝利 1〜3=1〜3勝 4=OP 5=重賞）。地方は None"""
+    ci = class_of_text(l['r'], l['p'])
+    return {0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 5, 7: 5}.get(ci)
+
+
+def std_time_real(l):
+    """実データから、そのレースの条件（競馬場・芝ダ・距離・馬場・クラス）の基準勝ちタイムと、
+    その日の馬場の速さを考えた基準タイムを返す。無ければ None"""
+    if not STD_REAL or l['p'] not in JRA_PLACE.values():
+        return None
+    surf, dist, cond = l['dist'][:1], dist_num(l['dist']), (l.get('cond') or '良')[:1]
+    cg = jra_cls_group(l)
+    km = dist / 1000
+    ex, base = STD_REAL.get('exact', {}), STD_REAL.get('base', {})
+    cls_off = STD_REAL.get('cls_off', {}).get(surf, {})
+    cond_off = STD_REAL.get('cond_off', {}).get(surf, {})
+    st_ = None
+    e = ex.get(f"{l['p']}|{surf}|{dist}|{cond}|{cg}")
+    if e and e[1] >= 5:
+        st_ = e[0]
+    else:
+        b = base.get(f"{l['p']}|{surf}|{dist}|{cond}")
+        if b and b[1] >= 5:
+            st_ = b[0] + cls_off.get(str(cg), 0) * km
+        else:
+            b = base.get(f"{l['p']}|{surf}|{dist}|良")
+            if b and b[1] >= 5:
+                st_ = b[0] + (cond_off.get(cond, 0) if cond != '良' else 0) * km + cls_off.get(str(cg), 0) * km
+    if st_ is None:
+        return None
+    v = STD_REAL.get('variant', {}).get(f"{l['d']}|{l['p']}|{surf}")
+    if v:
+        st_ += v[0] * km   # 時計のかかる日は基準を遅く、速い日は速く
+    return st_
+
+
 def speed_index(l, fstd=None):
     """1走分の簡易タイム指数（目安タイムより1000mあたり1秒速いと＋10）。
     地方など目安タイムが無い競馬場は、出走馬の過去走から作った目安（fstd）を使う"""
     surf, dist = l['dist'][:1], dist_num(l['dist'])
     if not l.get('t') or not dist:
         return None
-    st_ = std_time(surf, dist, l['p'], l['cond']) if surf in STD_TIME else None
+    st_ = std_time_real(l)
+    if st_ is not None:
+        l['_stdReal'] = True
+    else:
+        st_ = std_time(surf, dist, l['p'], l['cond']) if surf in STD_TIME else None
     if not st_ and fstd:
         st_ = fstd.get((l['p'], surf, dist))
     if not st_:
@@ -801,7 +856,9 @@ def time_factors(race, horses):
         else:
             h['agRate'], h['agRank'] = 3, None
         closer = 1.3 if h['st'] in ('差', '追') else 1.0
-        h['bTime'] = (h['siRate'] - 3) / 2 * 0.02
+        real = sum(1 for l in h['lines'][:4] if l.get('_stdReal'))
+        h['siReal'] = real
+        h['bTime'] = (h['siRate'] - 3) / 2 * (0.03 if real >= 2 else 0.02)
         h['bAgari'] = (h['agRate'] - 3) / 2 * 0.012 * closer * pace_k
 
 
@@ -813,7 +870,7 @@ def draw_factors(race, horses):
     """④-1 コースの枠順の有利不利"""
     N = len(horses)
     key = (race['venue'], race['surf'], race['dist'])
-    bias = 0 if race.get('banei') else COURSE_DRAW.get(key)
+    bias = 0 if (race.get('banei') or 'nar.' in race.get('base', '')) else COURSE_DRAW.get(key)
     if bias is None:
         bias = 0.3 if (race['surf'] == '芝' and race['dist'] <= 1400 and race['venue'] in VENUE_ADJ['芝']) else 0
     race['drawBias'] = bias
@@ -1027,8 +1084,13 @@ def extra_factors(race, horses, soup, race_id):
     jockey_factors(race, horses)
     condition_factors(race, horses)
     career_factors(race, horses)
+    course_factors(race, horses)
+    class_move_factors(race, horses)
+    if race.get('course'):   # 騎手の腕が出やすい競馬場は、騎手データの効きを強く
+        for h in horses:
+            h['bJockey'] *= race['course']['jockey']
     for h in horses:
-        h['xBonus'] = h['bTime'] + h['bAgari'] + h['bDraw'] + h['bTrack'] + h['bJockey'] + h['bCond'] + h['bCareer'] + h.get('bPos', 0) + h.get('bFlow', 0)
+        h['xBonus'] = h['bTime'] + h['bAgari'] + h['bDraw'] + h['bTrack'] + h['bJockey'] + h['bCond'] + h['bCareer'] + h.get('bPos', 0) + h.get('bFlow', 0) + h.get('bCourse', 0) + h.get('bMove', 0)
 
 
 # ═════════════════════════════════════════
@@ -1220,6 +1282,210 @@ def career_factors(race, horses):
 
 
 # ═════════════════════════════════════════
+# 地方競馬の格付け（競馬口コミダービー「地方競馬会場の格付け表」を参考に整理）
+#   ・競馬場のレベル：S＝南関東、A＝門別・兵庫・高知、B＝名古屋・岩手、C＝金沢・笠松・佐賀
+#   ・地区ごとのクラスを共通の物差し（Tier）にそろえる。中央競馬 ＞ 地方競馬 になるよう値を置く
+#     （中央：未勝利1・1勝2・2勝3・3勝4・OP4.5・G3以上5〜7）
+# ═════════════════════════════════════════
+CIRCUIT = {'大井': '南関東', '船橋': '南関東', '川崎': '南関東', '浦和': '南関東', '門別': '北海道',
+           '園田': '兵庫', '姫路': '兵庫', '高知': '高知', '名古屋': '名古屋', '笠松': '笠松',
+           '盛岡': '岩手', '水沢': '岩手', '金沢': '金沢', '佐賀': '佐賀', '帯広': 'ばんえい'}
+VENUE_RANK = {'大井': 'S', '船橋': 'S', '川崎': 'S', '浦和': 'S', '門別': 'A', '園田': 'A', '姫路': 'A',
+              '高知': 'A', '名古屋': 'B', '盛岡': 'B', '水沢': 'B', '金沢': 'C', '笠松': 'C', '佐賀': 'C'}
+RANK_NUM = {'S': 4, 'A': 3, 'B': 2, 'C': 1}
+# Tier（S＝交流重賞でも通用〜7＝最下級）→ 物差しの値。いちばん上でも中央の3勝クラス(4)未満
+TIER_VAL = {0: 3.8, 1: 3.3, 2: 2.9, 3: 2.5, 4: 2.1, 5: 1.7, 6: 1.35, 7: 1.1}
+# 地区ごとの「クラス → Tier」対応（記事の対応表をもとに。中間は .5）
+CIRCUIT_TIER = {
+    '南関東': {'A1': 0, 'A2': 1, 'B1': 2, 'B2': 3, 'B3': 4, 'C1': 5, 'C2': 6, 'C3': 7},
+    '北海道': {'A1': 0, 'A2': 1, 'A3': 2, 'A4': 2, 'B1': 3, 'B2': 4, 'B3': 4, 'B4': 4.5, 'C1': 5, 'C2': 5.5, 'C3': 6, 'C4': 6},
+    '兵庫':   {'A1': 0, 'A2': 1, 'B1': 2, 'B2': 3, 'C1': 4, 'C2': 5, 'C3': 6},
+    '高知':   {'A': 1, 'B': 2, 'C1': 3.5, 'C2': 5, 'C3': 6.5},
+    '名古屋': {'A': 2, 'B': 4, 'C': 5.5},
+    '笠松':   {'A': 3.5, 'B': 5, 'C': 6.5},
+    '岩手':   {'A': 2.5, 'B1': 4, 'B2': 5, 'C1': 6, 'C2': 7},
+    '金沢':   {'A1': 2, 'A2': 3, 'B1': 4, 'B2': 5, 'C1': 6, 'C2': 7},
+    '佐賀':   {'A1': 2, 'A2': 3, 'B': 4.5, 'B1': 4.5, 'C1': 6, 'C2': 7},
+}
+# 地区の重賞・オープンの目安（Tier）
+CIRCUIT_TOP = {'南関東': (0, 0.5), '北海道': (0.5, 1), '兵庫': (0.5, 1), '高知': (1, 1.5), '名古屋': (1.5, 2),
+               '岩手': (1.5, 2), '笠松': (2.5, 3), '金沢': (2, 2.5), '佐賀': (2, 2.5)}
+_CLS_IDX = {}
+
+
+def tier_value(tier):
+    lo = int(tier)
+    hi = min(7, lo + 1)
+    return TIER_VAL[lo] + (TIER_VAL[hi] - TIER_VAL[lo]) * (tier - lo)
+
+
+def cls_index(label, val):
+    """地区つきのクラス（例：大井B1）を CLS に登録して番号を返す"""
+    key = (label, round(val, 2))
+    if key not in _CLS_IDX:
+        CLS.append((label, round(val, 2)))
+        _CLS_IDX[key] = len(CLS) - 1
+    return _CLS_IDX[key]
+
+
+def nar_class_tiered(t, venue):
+    """地方のレース名・条件から、地区ごとのクラスを共通の物差しの値にする"""
+    circuit = CIRCUIT.get(venue)
+    if circuit in (None, 'ばんえい'):
+        return nar_class(t)
+    t = norm_digits(t).translate(str.maketrans('ＡＢＣＤＳＩＯＰ', 'ABCDSIOP'))
+    top, op = CIRCUIT_TOP.get(circuit, (2, 2.5))
+    if re.search(r'S(?:1|Ⅰ|I)(?![IⅠ0-9])', t):
+        return cls_index(f'{venue}重賞SI', tier_value(max(0, top - 0.5)) + 0.2)
+    if re.search(r'S(?:2|Ⅱ|II)(?![IⅠ0-9])|S(?:3|Ⅲ|III)|重賞', t):
+        return cls_index(f'{venue}重賞', tier_value(top))
+    if re.search(r'オープン|OP|特別選抜', t):
+        return cls_index(f'{venue}OP', tier_value(op))
+    if re.search(r'2歳|新馬|未勝利|認定|能力', t) and not re.search(r'[ABC]\s*\d', t):
+        return cls_index(f'{venue}2歳', 1.5 if circuit == '北海道' else 1.4 if circuit == '南関東' else 1.1)
+    table = CIRCUIT_TIER.get(circuit, {})
+    for k in ('A1', 'A2', 'A3', 'A4', 'B1', 'B2', 'B3', 'B4', 'C1', 'C2', 'C3', 'C4'):
+        if re.search(k[0] + r'\s*[-－]?\s*' + k[1] + r'(?!\d)', t):
+            tier = table.get(k)
+            if tier is None:   # その地区に無い細分（例：名古屋のB1）は、同じ文字の段で代用
+                tier = table.get(k[0], next((v for kk, v in table.items() if kk[0] == k[0]), 4))
+            return cls_index(f'{venue}{k}', tier_value(tier))
+    for k in ('A', 'B', 'C'):
+        if re.search(r'(^|[^A-Z])' + k + r'(?![A-Z0-9])', t):
+            tier = table.get(k)
+            if tier is None:
+                vals = [v for kk, v in table.items() if kk[0] == k]
+                tier = sum(vals) / len(vals) if vals else 4
+            return cls_index(f'{venue}{k}', tier_value(tier))
+    if re.search(r'(^|[^A-Z])D(?![A-Z])', t):
+        return cls_index(f'{venue}D', 1.0)
+    # 読めないときは、競馬場のレベルに合わせた中くらいの値
+    return cls_index(f'{venue}一般', tier_value({'S': 4, 'A': 4.5, 'B': 5, 'C': 5.5}.get(VENUE_RANK.get(venue), 5)))
+
+
+def is_jra_venue(p):
+    return p in JRA_PLACE.values()
+
+
+def class_move_factors(race, horses):
+    """降級・昇級・転入（地区のレベル差、中央からの転入）を評価する（地方のレースのみ）"""
+    for h in horses:
+        h['bMove'], h['moveNotes'] = 0.0, []
+    if 'nar.' not in race.get('base', '') or race.get('banei'):
+        return
+    today_v = CLS[race['clsIdx']][1]
+    venue = race['venue']
+    for h in horses:
+        ls = [l for l in h['lines'] if l['pos'] > 0 or l.get('pos') == 0]
+        if not ls:
+            continue
+        l0 = ls[0]
+        last_v = CLS[class_of_text(l0['r'], l0['p'])][1]
+        b, notes = 0.0, []
+        if is_jra_venue(l0['p']):
+            b += 0.01
+            notes.append(f"中央からの転入（前走{l0['p']}{l0['r']}）。中央＞地方の力関係で上位")
+        elif CIRCUIT.get(l0['p']) and CIRCUIT.get(l0['p']) != CIRCUIT.get(venue):
+            r0, r1 = RANK_NUM.get(VENUE_RANK.get(l0['p']), 2), RANK_NUM.get(VENUE_RANK.get(venue), 2)
+            if r0 > r1:
+                b += 0.006 * (r0 - r1)
+                notes.append(f"レベルの高い{l0['p']}からの転入（{VENUE_RANK.get(l0['p'])}→{VENUE_RANK.get(venue)}ランク）")
+            elif r0 < r1:
+                b -= 0.006 * (r1 - r0)
+                notes.append(f"{l0['p']}からの転入で、相手が強くなる（{VENUE_RANK.get(l0['p'])}→{VENUE_RANK.get(venue)}ランク）")
+        else:
+            if last_v > today_v + 0.15:
+                b += 0.008
+                notes.append(f"降級初戦（前走{CLS[class_of_text(l0['r'], l0['p'])][0]}→今回{CLS[race['clsIdx']][0]}）。メンバー上位の可能性")
+            elif l0['pos'] == 1 and last_v < today_v - 0.15:
+                b -= 0.006
+                notes.append(f"昇級初戦（前走{CLS[class_of_text(l0['r'], l0['p'])][0]}を勝ち上がり）。クラスの壁に注意")
+        h['bMove'] = clamp(b, -0.015, 0.02)
+        h['moveNotes'] = notes
+
+
+# ═════════════════════════════════════════
+# 地方競馬場ごとのコース特性（馬券名人養成プログラム「地方競馬場の特徴と攻略法」を参考に整理）
+#   style：脚質ごとの有利不利（＋有利／－不利）、draw：＋内枠有利／－外枠有利、
+#   chalk：＋堅い決着が多い／－荒れやすい、jockey：騎手の腕が結果に出やすいほど大きく
+# ═════════════════════════════════════════
+FRONT = {'逃': 0.9, '先': 0.7, '差': -0.4, '追': -0.8}      # 逃げ・先行がはっきり有利
+FRONT_MID = {'逃': 0.5, '先': 0.6, '差': -0.1, '追': -0.6}  # 前有利だが好位も届く
+NEUTRAL = {'逃': 0, '先': 0, '差': 0, '追': 0}
+
+
+def nar_course(race):
+    v, d = race['venue'], race['dist']
+    P = {
+        '大井': dict(style={'逃': 0.4, '先': 0.2, '差': 0, '追': -0.1} if d <= 1400 else NEUTRAL, draw=-0.2, chalk=-0.5,
+                   note='外回りは大きく脚質の有利不利は小さめ。短距離は逃げ馬が強く、多頭数で荒れやすい'),
+        '船橋': dict(style={'逃': 0.3, '先': 0.3, '差': 0, '追': -0.3}, draw=-0.5, chalk=0.3,
+                   note='スパイラルカーブで能力通りの決着が多く、内枠はやや不利で外枠がやや有利'),
+        '川崎': dict(style=FRONT_MID, draw=0.9, chalk=-0.2, jockey=1.3,
+                   note='コーナーが特にきつく内枠が有利。最初のコーナーまでの位置取りで展開が決まる'),
+        '浦和': dict(style={'逃': 0.1, '先': 0.6, '差': 0.3, '追': -0.7}, draw=0.3, chalk=0.0,
+                   note='1周1200mの小回り。3〜4角から叩き合いになり、好位から運べる自在型が有利'),
+        '門別': dict(style={'逃': 0, '先': 0, '差': 0.3, '追': 0.4}, draw=0, chalk=-0.3 if race.get('N', 0) >= 12 else 0,
+                   note='外回りは直線が長く差し・追込も届く。枠の有利不利は小さく、多頭数は荒れやすい',
+                   sire={'サウスヴィグラス': 0.006} if d <= 1400 else {}),
+        '盛岡': dict(style=({'逃': 0, '先': 0, '差': 0.3, '追': 0.2} if d >= 2000 else NEUTRAL), draw=0, chalk=0.3,
+                   note='コーナーがゆったりで坂があり、能力通りの決着が多い。地方で唯一芝コースがある'),
+        '水沢': dict(style=FRONT, draw=0, chalk=0.1, jockey=1.2,
+                   note='平坦な小回りで逃げ・先行が有利。長い距離も3角で前にいる馬が勝ちやすい'),
+        '金沢': dict(style=(FRONT if d <= 1500 else FRONT_MID), draw=0, chalk=0.2 if d <= 1500 else 0.4,
+                   note='楕円形の小回りで先行有利。距離が延びるほど粘れる馬が減り、実績の比較が大事'),
+        '笠松': dict(style={'逃': 0.4, '先': 0.8, '差': -0.2, '追': -0.7},
+                   draw=(0 if d in (1400,) or d >= 1900 else 0.3), chalk=0.1,
+                   note='直線が短く、好位から抜け出す形が有利。1400mや1900m以上は最内枠が有利とは限らない'),
+        '名古屋': dict(style=FRONT, draw=0, chalk=0.6,
+                    note='直線が短く逃げ・先行が大きく有利。人気馬が堅く決まりやすい（2022年に弥富の新コースへ移転済み）'),
+        '園田': dict(style=({'逃': 0.2, '先': 0.3, '差': 0.2, '追': -0.1} if d == 1400 else FRONT_MID), draw=0.2, chalk=0.0,
+                   note='小回りで内枠の逃げ・先行が有利。1400mは捲りや差しにも注意'),
+        '姫路': dict(style=FRONT, draw=0, chalk=0.4,
+                   note='スパイラルカーブがなく、先行型が圧倒的に有利'),
+        '高知': dict(style=(FRONT if d <= 1400 else {'逃': 0.3, '先': 0.3, '差': 0.2, '追': 0}),
+                   draw=(-0.4 if d <= 1400 else 0.3), chalk=0.3, jockey=1.3,
+                   note='内側の砂が深く各馬が外を回る。短距離は先行・やや外枠、1600m以上は内〜中枠が有利'),
+        '佐賀': dict(style={'逃': 0.9, '先': 0.5, '差': -0.3, '追': -0.8}, draw=-0.5, chalk=0.1, jockey=1.2,
+                   note='直線が短い下り坂で逃げ有利・追込不利。内側の砂が深く、外枠がやや有利',
+                   sire={'サウスヴィグラス': 0.006} if d <= 1400 else {}),
+        '帯広': dict(style=NEUTRAL, draw=0, chalk=-0.3,
+                   note='ばんえい。障害を越える力勝負で、負担重量に対する実績を重視'),
+    }.get(v)
+    if P:
+        P.setdefault('jockey', 1.0)
+        P.setdefault('sire', {})
+    return P
+
+
+def course_factors(race, horses):
+    """地方競馬場のコース特性を、脚質・枠・血統に反映する"""
+    race['N'] = len(horses)
+    P = nar_course(race) if 'nar.' in race.get('base', '') else None
+    race['course'] = P
+    race['chalk'] = P['chalk'] if P else 0
+    if P and race['venue'] == '高知' and 'ファイナル' in race.get('name', ''):
+        race['chalk'] = -0.8   # 不振馬どうしの敗者復活戦。着順が入れ替わりやすい
+        P = dict(P, note=P['note'] + '。一発逆転ファイナルは不振馬どうしで荒れやすく、調子と展開を重視')
+        race['course'] = P
+    for h in horses:
+        b = 0.0
+        if P:
+            b += P['style'].get(h['st'], 0) * 0.012
+            if not race.get('banei'):
+                b += P['draw'] * 0.008 * (0.5 - draw_pos(h, len(horses))) * 2
+            b += P['sire'].get(h.get('sire'), 0)
+            # 水沢：盛岡で先行して失速した馬は、平坦な水沢で巻き返しやすい
+            if race['venue'] == '水沢' and h['lines']:
+                l0 = h['lines'][0]
+                ps_ = [int(x) for x in re.findall(r'\d+', l0.get('ps') or '')]
+                if l0['p'] == '盛岡' and l0['pos'] >= 4 and ps_ and (ps_[0] - 1) / max(1, (l0.get('f') or 12) - 1) <= 0.35:
+                    b += 0.006
+                    h['courseNote'] = '前走は盛岡で先行して失速。平坦な水沢での巻き返しに期待'
+        h['bCourse'] = b
+
+
+# ═════════════════════════════════════════
 # 近走の中身（展開に逆らった好走を見抜く）
 # ═════════════════════════════════════════
 FLOW_W = [1.0, 0.7, 0.5]          # 前走・2走前・3走前の重み
@@ -1241,7 +1507,7 @@ def flow_analysis(race, horses):
     """前走から3走分、「ハイペースや差し決着を先行して粘った」「スローや前残りを後ろから追い込んだ」など、
     流れに逆らった好走を見つけて評価する"""
     for h in horses:
-        h['bFlow'], h['flowNotes'], h['flowKeys'] = 0.0, [], set()
+        h['bFlow'], h['flowNotes'], h['flowRelief'], h['flowLastStrong'] = 0.0, [], {}, False
     if race.get('banei'):
         return
     targets = {}
@@ -1274,9 +1540,10 @@ def flow_analysis(race, horses):
             sashi = len(top3) >= 3 and sum(1 for r in top3 if (r['c4'] - 1) / (N - 1) > 0.35) >= 2
             zenzan = len(top3) >= 3 and sum(1 for r in top3 if (r['c4'] - 1) / (N - 1) <= 0.25) >= 2
             good_pos = l['pos'] <= max(5, round(N * 0.35))
-            q, why = 0.0, ''
+            q, why, harsh = 0.0, '', ''
             # ① 前に厳しい流れを先行して粘った
             if (pace == 'H' or sashi) and e1 <= 0.35:
+                harsh = 'ハイペースや差し決着を先行'
                 front = [r for r in rows if r.get('c1') and (r['c1'] - 1) / (N - 1) <= 0.35]
                 best_front = bool(front) and l['pos'] <= min(r['pos'] for r in front)
                 q = 1.0 if l['pos'] <= 3 else 0.85 if (best_front and good_pos) else 0.6 if good_pos else 0.5 if best_front else 0
@@ -1285,6 +1552,7 @@ def flow_analysis(race, horses):
                 q *= 1.2 if (pace == 'H' and sashi) else 1.0
             # ② 後ろに厳しい流れを追い込んだ
             elif (pace == 'S' or zenzan) and e4 >= 0.5:
+                harsh = 'スローや前残りを後方から'
                 back = [r for r in rows if r.get('c4') and (r['c4'] - 1) / (N - 1) >= 0.5]
                 best_back = bool(back) and l['pos'] <= min(r['pos'] for r in back)
                 q = 1.0 if l['pos'] <= 3 else 0.7 if good_pos else 0.5 if (best_back and l['m'] <= 0.6) else 0
@@ -1296,22 +1564,27 @@ def flow_analysis(race, horses):
                 l3s = sorted(r['l3'] for r in rows if r.get('l3'))
                 if l3s and l3s.index(me['l3']) <= 1:
                     q, why = 0.5, f"上がり{me['l3']}（メンバー{l3s.index(me['l3']) + 1}位）で{l['pos']}着"
+            ago = ['前走', '2走前', '3走前'][i]
             if q <= 0:
+                # 流れが向かなかった負けは「展開負け」として着差を少し割り引く（度外視）
+                if harsh:
+                    h['flowRelief'][line_key(l)] = 0.7
+                    h['flowNotes'].append(f"{ago}{short_date(l['d'])}{l['p']}{l['dist']}：{harsh}で{l['pos']}着の展開負け（着差を割り引き）")
                 continue
             cf = clamp(CLS[class_of_text(l['r'], l['p'])][1] / max(rcv, 1), 0.8, 1.25)
             score += q * cf * FLOW_W[i]
-            ago = ['前走', '2走前', '3走前'][i]
             h['flowNotes'].append(f"{ago}{short_date(l['d'])}{l['p']}{l['dist']}：{why}")
             if q >= 0.5:
-                h['flowKeys'].add(line_key(l))
-        h['bFlow'] = min(score, 1.6) / 1.6 * 0.045
+                h['flowRelief'][line_key(l)] = 0.4
+            if i == 0 and q >= 0.85:
+                h['flowLastStrong'] = True   # 前走が特に中身の濃い内容
+        h['bFlow'] = min(score, 1.6) / 1.6 * 0.06
         h.pop('_flowLines', None)
 
 
 def eff_m(h, l):
     """着差の評価用の値。流れに逆らって好走したレースは、負けた着差を軽く見る"""
-    m = max(0, l['m'])
-    return m * 0.4 if line_key(l) in h.get('flowKeys', ()) else m
+    return max(0, l['m']) * h.get('flowRelief', {}).get(line_key(l), 1.0)
 
 
 # ═════════════════════════════════════════
@@ -1450,6 +1723,8 @@ def format_reply(race, arr):
         out.append("　".join(f"{g}:{','.join(str(h['n']) for h in race['lineup'][g]) or 'ー'}" for g in GROUPS))
     if race['going'] != '良':
         out.append("道悪のため、道悪適性（血統・馬格・実績）を加点し、実力差を少し縮めて評価")
+    if race.get('course'):
+        out.append(f"【{race['venue']}の特徴】{race['course']['note']}")
     if race.get('trackBias'):
         tb = race['trackBias']
         out.append(f"【今日の馬場】{tb['text']}（{race['surf']}・終わった{tb['races']}レースから）")
@@ -1703,6 +1978,8 @@ def render_image(race, arr):
     tb = race.get('trackBias')
     if tb:
         note2 = f"今日の{race['surf']}の傾向：{tb['text']}（終わった{tb['races']}レースから）"
+    elif race.get('course'):
+        note2 = f"{race['venue']}の特徴：{race['course']['note']}"
     elif race['going'] != '良':
         note2 = '道悪：血統・馬格・実績から道悪適性を加点'
     else:
@@ -1750,7 +2027,8 @@ def render_image(race, arr):
         tx = 180 + tw(d, nm, fn) + 10
         for tag, col in (('穴', (235, 90, 90)) if h['anaFlag'] else (None, None),
                          ('騎', (90, 170, 240)) if h['jb'] else (None, None),
-                         ('初', (38, 160, 80)) if h['isNew'] else (None, None)):
+                         ('初', (38, 160, 80)) if h['isNew'] else (None, None),
+                         ('注', (210, 140, 30)) if h.get('bFlow', 0) >= 0.02 else (None, None)):
             if tag and tx < 540:
                 d.rounded_rectangle((tx, y0 + 16, tx + 34, y0 + 48), radius=6, fill=col)
                 ctext(d, tx + 17, y0 + 17, tag, F('sans_b', 22), (255, 255, 255))
@@ -1862,7 +2140,8 @@ def make_reasons(race, h):
 
     # ③ タイム・上がり
     if h.get('si') is not None:
-        R.append(('タイム', f"近走の簡易タイム指数{h['si']:+.0f}（メンバー内の評価「{['低い','やや低い','標準','やや高い','高い'][h['siRate'] - 1]}」）"
+        kind = '実データの基準タイムで測った' if h.get('siReal', 0) >= 2 else '簡易'
+        R.append(('タイム', f"近走の{kind}タイム指数{h['si']:+.0f}（メンバー内の評価「{['低い','やや低い','標準','やや高い','高い'][h['siRate'] - 1]}」）"
                   f"{sgn(h['bTime'])}"))
     if h.get('agRank'):
         R.append(('上がり', f"近走の上がり3F（距離補正）はメンバー中{h['agRank']}番目の速さ{sgn(h['bAgari'])}"))
@@ -1885,6 +2164,14 @@ def make_reasons(race, h):
         R.append(('騎手データ', '。'.join(jt) + sgn(h.get('bJockey', 0))))
     if h.get('condNotes'):
         R.append(('状態', '、'.join(h['condNotes']) + sgn(h.get('bCond', 0))))
+    if h.get('moveNotes'):
+        R.append(('格付け', '。'.join(h['moveNotes']) + sgn(h.get('bMove', 0))))
+    P = race.get('course')
+    if P and abs(h.get('bCourse', 0)) >= 0.002:
+        st_ = h['st'] if h['st'] != '?' else '不明'
+        R.append(('コース特性', f"{race['venue']}：{P['note']}。脚質{st_}・{h['n']}番の条件で"
+                  f"{'有利' if h['bCourse'] > 0 else '不利'}"
+                  + (f"。{h['courseNote']}" if h.get('courseNote') else '') + sgn(h['bCourse'])))
     if h.get('flowNotes'):
         R.append(('近走の中身', '。'.join(h['flowNotes']) + sgn(h.get('bFlow', 0))))
     if h.get('careerNotes'):
@@ -1901,7 +2188,7 @@ def sgn(v):
 SHORT_HEAD = {'総合評価': '総合評価', '過去レースのレベル': 'レース格', '対戦相手のその後': '対戦相手',
               '近走': '近走', 'コース・距離適性': '適性', '脚質・展開': '展開', '騎手・条件': '騎手・斤量',
               '道悪適性': '道悪', '穴馬チェック': '穴馬', '血統・厩舎': '血統', 'タイム': 'タイム',
-              '上がり': '上がり', '枠順': '枠順', '当日の馬場': '当日馬場', '騎手データ': '騎手成績', '状態': '状態', '全成績から': '全成績', '近走の中身': '近走の中身'}
+              '上がり': '上がり', '枠順': '枠順', '当日の馬場': '当日馬場', '騎手データ': '騎手成績', '状態': '状態', '全成績から': '全成績', '近走の中身': '近走の中身', 'コース特性': 'コース', '格付け': '格付け'}
 
 
 _cw_cache = {}
@@ -1933,7 +2220,8 @@ def wrap(d, text, f, maxw):
 
 def render_reasons_images(race, arr):
     """根拠の画像。長くなりすぎないよう ◎○▲△ と それ以降 の2枚に分ける"""
-    targets = [(i, h) for i, h in enumerate(arr[:7])] + [(99, h) for h in arr[7:] if h['anaFlag']]
+    targets = [(i, h) for i, h in enumerate(arr[:7])] + \
+              [(99, h) for h in arr[7:] if h['anaFlag'] or h.get('bFlow', 0) >= 0.02]
     parts = [targets[:4], targets[4:]]
     return [render_reasons_image(race, p, k + 1, len([x for x in parts if x])) for k, p in enumerate(parts) if p]
 
@@ -1964,7 +2252,7 @@ def render_reasons_image(race, targets, page, pages):
     for i, h, rows, height in cards:
         d.rounded_rectangle((PAD, y, W - PAD, y + height), radius=16, fill=(14, 22, 42))
         gold_frame(d, (PAD, y, W - PAD, y + height), r=16)
-        mark = MARKS[i] if i < len(MARKS) else '穴'
+        mark = MARKS[i] if i < len(MARKS) else ('穴' if h['anaFlag'] else '注')
         d.text((PAD + 22, y + 16), mark, font=F('sans_b', 40), fill=GOLD)
         bg, fg = WAKU.get(h.get('w') or 0, ((245, 245, 245), (20, 20, 20)))
         d.ellipse((PAD + 80, y + 18, PAD + 128, y + 66), fill=bg, outline=GOLD_D, width=2)
@@ -2360,6 +2648,16 @@ def test_page():
         result, err = analyze(rid)
         if err:
             return err, 200, {'Content-Type': 'text/plain; charset=utf-8'}
+        if request.args.get('n'):   # 例：&n=16 → 16番の根拠をすべて表示
+            race, arr = result
+            n = int(request.args['n'])
+            h = next((x for x in arr if x['n'] == n), None)
+            if not h:
+                return f'{n}番の馬が見つかりません', 200, {'Content-Type': 'text/plain; charset=utf-8'}
+            lines = [f"{n}番 {h['name']}：{h['rk']}位／{len(arr)}頭 ランク{h['rank']} スコア{h['a']:.3f}",
+                     f"全成績の読み取り：{'OK' if h.get('careerOk') else '失敗（出馬表の5走で代用）'}", '']
+            lines += [f"【{k}】{v}" for k, v in make_reasons(race, h)]
+            return '\n'.join(lines), 200, {'Content-Type': 'text/plain; charset=utf-8'}
         if request.args.get('t'):
             return format_reply(*result), 200, {'Content-Type': 'text/plain; charset=utf-8'}
         if not fonts_ok(20):
