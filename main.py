@@ -957,7 +957,7 @@ def extra_factors(race, horses, soup, race_id):
     condition_factors(race, horses)
     career_factors(race, horses)
     for h in horses:
-        h['xBonus'] = h['bTime'] + h['bAgari'] + h['bDraw'] + h['bTrack'] + h['bJockey'] + h['bCond'] + h['bCareer']
+        h['xBonus'] = h['bTime'] + h['bAgari'] + h['bDraw'] + h['bTrack'] + h['bJockey'] + h['bCond'] + h['bCareer'] + h.get('bPos', 0)
 
 
 # ═════════════════════════════════════════
@@ -1135,6 +1135,76 @@ def career_factors(race, horses):
 
 
 # ═════════════════════════════════════════
+# 展開予想（誰が逃げるか・隊列）
+# ═════════════════════════════════════════
+GROUPS = ['逃げ', '先行', '中団', '後方']
+STYLE_RATIO = {'逃': 0.03, '先': 0.22, '差': 0.6, '追': 0.85}
+
+
+def predict_positions(race, horses):
+    """近走の「最初のコーナーの位置」から、各馬の位置取りと隊列、ペースを予想する"""
+    N = len(horses)
+    wts = [1, .8, .6, .5, .4]
+    for h in horses:
+        src = [l for l in h['lines'] if l['pos'] > 0 and is_flat(l) and l.get('ps')] \
+            or [l for l in h.get('career', []) if l['pos'] > 0 and is_flat(l) and l.get('ps')]
+        rs, ws, leads = [], [], 0
+        for i, l in enumerate(src[:5]):
+            first = re.match(r'(\d+)', l['ps'])
+            if not first:
+                continue
+            p1, f = int(first.group(1)), max(2, l.get('f') or 16)
+            rs.append((p1 - 1) / (f - 1))
+            ws.append(wts[i])
+            leads += p1 == 1
+        if rs:
+            ratio = sum(r * w for r, w in zip(rs, ws)) / sum(ws)
+            h['leadRate'] = leads / len(rs)
+            h['posFrom'] = f"近{len(rs)}走の最初のコーナー平均{ratio * (N - 1) + 1:.1f}番手相当"
+        else:
+            ratio = STYLE_RATIO.get(h['st'], 0.5)
+            h['leadRate'] = 1.0 if h['st'] == '逃' else 0.0
+            h['posFrom'] = 'netkeibaの脚質から推定' if h['st'] in STYLE_RATIO else '情報なし'
+        # 内枠の方が前に行きやすい
+        ratio += 0.06 * (draw_pos(h, N) - 0.5)
+        h['earlyRatio'] = clamp(ratio, 0, 1)
+
+    order = sorted(horses, key=lambda h: (h['earlyRatio'], -h['leadRate']))
+    strong = [h for h in order if h['leadRate'] >= 0.4 or h['earlyRatio'] <= 0.08]
+    n_front, n_mid = max(2, round(N * 0.33)), max(3, round(N * 0.7))
+    for i, h in enumerate(order):
+        h['posGroup'] = '逃げ' if i == 0 else '先行' if i < n_front else '中団' if i < n_mid else '後方'
+        if h['st'] == '?':   # 脚質の表示が無い馬は予想位置から補う
+            h['st'] = {'逃げ': '逃', '先行': '先', '中団': '差', '後方': '追'}[h['posGroup']]
+    race['lineup'] = {g: [h for h in order if h['posGroup'] == g] for g in GROUPS}
+    race['leader'] = order[0] if order else None
+
+    # ハナ争いか、単騎逃げか
+    if len(strong) >= 2:
+        race['hana'] = f"ハナ争い：{'・'.join(str(h['n']) for h in strong[:3])}番"
+        est = 'fast' if len(strong) >= 3 or len(race['lineup']['先行']) >= N * 0.4 else 'base'
+    elif len(strong) == 1:
+        race['hana'] = f"{strong[0]['n']}番の単騎逃げ濃厚"
+        est = 'slow'
+    else:
+        race['hana'] = f"決め手を欠く先手争い（{order[0]['n']}番が押し出される形）" if order else ''
+        est = 'slow'
+    race['strongLeaders'] = len(strong)
+    if race.get('pace_from') != 'netkeiba展開予想':
+        race['pace'] = est
+        race['pace_from'] = '近走の位置取りから予想'
+
+    # 単騎逃げは残りやすく、ハナ争いは前の馬が共倒れしやすい
+    for h in horses:
+        b = 0
+        if len(strong) == 1 and h is strong[0]:
+            b += 0.01
+        elif len(strong) >= 2 and h in strong[:3]:
+            b -= 0.006
+        h['bPos'] = b
+
+
+# ═════════════════════════════════════════
 # まとめ：LINEに返す文章を作る
 # ═════════════════════════════════════════
 def analyze(text):
@@ -1162,6 +1232,8 @@ def analyze(text):
     race['id'] = race_id
     race['date'] = parse_race_date(soup)
     load_careers(race, horses)
+    predict_positions(race, horses)
+    race['nige'] = sum(1 for h in horses if h['st'] == '逃')
 
     auto_heuristics(race, horses)
     extra_factors(race, horses, soup, race_id)
@@ -1183,8 +1255,11 @@ def format_reply(race, arr):
     tenkai = {'fast': '逃げ馬が多くペースが上がりやすい→差し・追込有利',
               'slow': '逃げ馬が少なくスローになりやすい→前に行く馬が有利',
               'base': '平均ペース想定→脚質の有利不利は小さめ'}[pace]
-    out.append(f"【展開】{PACE_LABEL[pace]}（{race['pace_from']}・逃げ{race['nige']}頭）")
+    out.append(f"【展開】{PACE_LABEL[pace]}（{race['pace_from']}）")
     out.append(tenkai)
+    if race.get('lineup'):
+        out.append(race.get('hana', ''))
+        out.append("　".join(f"{g}:{','.join(str(h['n']) for h in race['lineup'][g]) or 'ー'}" for g in GROUPS))
     if race['going'] != '良':
         out.append("道悪のため、道悪適性（血統・馬格・実績）を加点し、実力差を少し縮めて評価")
     if race.get('trackBias'):
@@ -1389,7 +1464,8 @@ def render_image(race, arr):
         lab, rest_ = (line.split(' ', 1) + [''])[:2]
         bet_rows.append((lab, wrap(tmp, rest_, F('sans_b', 28), W - PAD * 2 - 170)))
     bet_h = sum(22 + 40 * len(ls) for _, ls in bet_rows)
-    H = 610 + 64 + row_h * len(arr) + 40 + 90 + bet_h + 120
+    LU_H = lineup_height(race)
+    H = 610 + LU_H + 64 + row_h * len(arr) + 40 + 90 + bet_h + 120
 
     img = gradient_bg(W, H)  # 背景グラデーション（夜空のイメージ）
     d = ImageDraw.Draw(img)
@@ -1445,8 +1521,14 @@ def render_image(race, arr):
         note2 = f"ペース根拠：{race['pace_from']}"
     ctext(d, W / 2, 546, fit_text(d, note2, F('sans_r', 22), W - PAD * 2), F('sans_r', 22), MUTED)
 
+    # ── 展開予想 ──
+    y = 590
+    if LU_H:
+        draw_lineup(d, race, PAD, y, W - PAD)
+        y += LU_H
+
     # ── 表 ──
-    y = 600
+    y += 10
     d.rectangle((PAD, y, W - PAD, y + 56), fill=(24, 34, 62))
     fh = F('sans_b', 24)
     COLS = {'印': 74, '馬番': 130, '馬名': 330, '評価': 590, 'スコア': 680, '勝率': 800, 'オッズ': 905, '期待値': 1000}
@@ -1563,7 +1645,13 @@ def make_reasons(race, h):
     st = h['st'] if h['st'] != '?' else '不明'
     pa = h['paceAdj']
     eff = f"有利（+{pa:.3f}）" if pa > 0 else f"不利（{pa:.3f}）" if pa < 0 else "影響なし"
-    R.append(('脚質・展開', f"脚質は{st}。{PACE_LABEL[race['pace']]}ペース想定で{eff}"))
+    pos_t = f"予想位置は{h.get('posGroup', '?')}（{h.get('posFrom', '')}）。" if h.get('posGroup') else ''
+    lead_t = ''
+    if h.get('bPos', 0) > 0:
+        lead_t = f"単騎で逃げられそうで加点（+{h['bPos']:.3f}）。"
+    elif h.get('bPos', 0) < 0:
+        lead_t = f"ハナ争いで共倒れの心配（{h['bPos']:.3f}）。"
+    R.append(('脚質・展開', f"{pos_t}{lead_t}脚質は{st}。{PACE_LABEL[race['pace']]}ペース想定で{eff}"))
 
     jt = f"{h['jockey']}騎乗・斤量{h['wt']}kg"
     if h['dw'] >= 2:
@@ -1708,6 +1796,41 @@ def render_reasons_image(race, targets, page, pages):
         y += height + 20
     ctext(d, W / 2, y + 10, '※根拠は過去5走とnetkeibaの出馬表から自動で作成しています', F('sans_r', 20), MUTED)
     return img
+
+
+def lineup_rows(race):
+    per_row = 5
+    return {g: max(1, math.ceil(len(race['lineup'][g]) / per_row)) for g in GROUPS}
+
+
+def lineup_height(race):
+    if not race.get('lineup'):
+        return 0
+    return 70 + 56 * max(lineup_rows(race).values()) + 26
+
+
+def draw_lineup(d, race, x0, y0, x1):
+    """展開予想の隊列（逃げ｜先行｜中団｜後方）を枠色の丸で描く"""
+    h_ = lineup_height(race)
+    d.rounded_rectangle((x0, y0, x1, y0 + h_ - 10), radius=14, fill=(14, 22, 42))
+    gold_frame(d, (x0, y0, x1, y0 + h_ - 10), r=14)
+    d.text((x0 + 20, y0 + 12), '展開予想', font=F('sans_b', 26), fill=GOLD)
+    sub = race.get('hana', '')
+    d.text((x0 + 150, y0 + 16), fit_text(d, sub, F('sans_r', 22), x1 - x0 - 170), font=F('sans_r', 22), fill=SILVER)
+    cw = (x1 - x0 - 40) / 4
+    cols = [(200, 60, 60), (220, 150, 40), (60, 140, 220), (120, 110, 190)]
+    for gi, g in enumerate(GROUPS):
+        cx = x0 + 20 + gi * cw
+        d.rounded_rectangle((cx + 4, y0 + 52, cx + 70, y0 + 80), radius=12, fill=cols[gi])
+        ctext(d, cx + 37, y0 + 53, g, F('sans_b', 18), (255, 255, 255))
+        if gi < 3:
+            d.text((cx + cw - 22, y0 + 50), '◀', font=F('sans_r', 18), fill=MUTED)
+        for k, h in enumerate(race['lineup'][g]):
+            rx = cx + 22 + (k % 5) * 46
+            ry = y0 + 108 + (k // 5) * 56
+            bg, fg = WAKU.get(h.get('w') or 0, ((245, 245, 245), (20, 20, 20)))
+            d.ellipse((rx - 20, ry - 20, rx + 20, ry + 20), fill=bg, outline=GOLD_D, width=2)
+            ctext(d, rx, ry - 15, str(h['n']), F('sans_b', 22), fg)
 
 
 def save_image(img):
