@@ -1,0 +1,42 @@
+name: 基準タイムを作る
+
+on:
+  workflow_dispatch:          # 「Run workflow」ボタンで手動実行
+  schedule:
+    - cron: '0 18 * * *'      # 毎日 日本時間の午前3時に自動実行
+
+permissions:
+  contents: write             # 作ったデータをリポジトリに保存するため
+
+concurrency:
+  group: std-times
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 必要な部品を入れる
+        run: pip install requests beautifulsoup4
+
+      - name: レース結果を集めて基準タイムを作る
+        run: python tools/build_std_times.py
+
+      - name: できたデータを保存する
+        run: |
+          git config user.name "std-times-bot"
+          git config user.email "std-times-bot@users.noreply.github.com"
+          git add data/
+          if git diff --cached --quiet; then
+            echo "変更なし"
+          else
+            git commit -m "基準タイムを更新 $(date +'%Y-%m-%d')"
+            git push
+          fi
