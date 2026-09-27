@@ -641,10 +641,26 @@ def verdict(arr):
     return '買い' if score >= 3 else '少額で買い' if score >= 1 else '見送り推奨'
 
 
+def win_pick(arr):
+    """単勝の推奨馬。基本は◎。ただし◎のオッズが安すぎて割に合わず（期待値0.7未満）、
+    ○▲に期待値1.0以上の馬がいれば、そちらを推す"""
+    top = arr[0]
+    if top.get('ev') is not None and top['ev'] < 0.7:
+        alt = [h for h in arr[1:3] if h.get('ev') and h['ev'] >= 1.0]
+        if alt:
+            return max(alt, key=lambda h: h['ev']), '期待値で◎より上'
+    return top, '◎'
+
+
 def bet_plan(arr):
     """おすすめ買い目。各要素は {'label','text','parts':[(券種, [組み合わせ,...]), ...]}"""
     n = [h['n'] for h in arr]
     plan = []
+    if not n:
+        return plan
+    w, why = win_pick(arr)
+    ev_t = f"・期待値{w['ev']:.2f}" if w.get('ev') else ''
+    plan.append({'label': '推奨', 'text': f"単勝 {w['n']}（{why}{ev_t}）", 'parts': [('単勝', [(w['n'],)])]})
     if len(n) >= 3:
         plan.append({'label': '本線', 'text': f"馬連 {n[0]}-{n[1]}, {n[0]}-{n[2]}",
                      'parts': [('馬連', [(n[0], n[1]), (n[0], n[2])])]})
@@ -653,6 +669,10 @@ def bet_plan(arr):
         combos = sorted({tuple(sorted((n[0], b, c))) for b in n[1:3] for c in n[1:6] if b != c})
         plan.append({'label': '本線', 'text': f"3連複 {n[0]} - {n[1]},{n[2]} - {','.join(map(str, n[1:6]))}（{len(combos)}点）",
                      'parts': [('3連複', combos)]})
+        # 本線の3連単：◎1着固定 → ○▲ → ○▲△△△
+        tan = [(n[0], b, c) for b in n[1:3] for c in n[1:6] if b != c]
+        plan.append({'label': '本線', 'text': f"3連単 1着{n[0]} → 2着{n[1]},{n[2]} → 3着{','.join(map(str, n[1:6]))}（{len(tan)}点）",
+                     'parts': [('3連単', tan)]})
     evs = [h for h in arr[:8] if h.get('ev') and h['ev'] >= 1.15]
     if evs:
         b = max(evs, key=lambda h: h['ev'])
@@ -662,9 +682,7 @@ def bet_plan(arr):
     if anas:
         plan.append({'label': '穴', 'text': "ワイド " + ', '.join(f"{n[0]}-{h['n']}" for h in anas),
                      'parts': [('ワイド', [(n[0], h['n']) for h in anas])]})
-    t = trifecta_high(arr)
-    if t:
-        plan.append(t)
+    plan += high_bets(arr)
     return plan
 
 
@@ -672,17 +690,14 @@ def bets(arr):
     return [f"{b['label']} {b['text']}" for b in bet_plan(arr)]
 
 
-def trifecta_high(arr):
-    """高目狙いの3連単フォーメーション。
-    1着：◎＋期待値が一番高い馬 ／ 2着：1着候補＋○▲＋穴馬・高期待値の馬 ／ 3着：2着の馬＋△△△☆"""
-    if len(arr) < 5:
-        return None
+def high_sets(arr):
+    """高目狙いの3つの馬のグループ。
+    1頭目：◎＋期待値が一番高い馬 ／ 2頭目：1頭目の馬＋○▲＋穴馬・高期待値の馬 ／ 3頭目：2頭目の馬＋△△△☆"""
     top8 = arr[:8]
     value = sorted([h for h in top8[1:] if h.get('ev') and h['ev'] >= 1.3], key=lambda h: -h['ev'])
     anas = [h for h in arr if h['anaFlag']]
-
     first = [arr[0]] + value[:1]
-    # 2着：1着候補同士の入れ替わり（例：穴馬が勝って◎が2着）も拾えるよう、1着候補も必ず入れる
+    # 1着候補同士の入れ替わり（例：穴馬が勝って◎が2着）も拾えるよう、1頭目の馬も2頭目に必ず入れる
     second = list(first)
     for h in arr[1:3] + anas + value:
         if h not in second and len(second) < len(first) + 3:
@@ -691,12 +706,27 @@ def trifecta_high(arr):
     for h in second + first + arr[1:7]:
         if h not in third and len(third) < 7:
             third.append(h)
+    return first, second, third
 
-    combos = [(a['n'], b['n'], c['n']) for a in first for b in second for c in third
-              if len({a['n'], b['n'], c['n']}) == 3]
+
+def high_bets(arr):
+    """高目狙いの3連単と3連複（同じ馬の組み立てで）"""
+    if len(arr) < 5:
+        return []
+    first, second, third = high_sets(arr)
     j = lambda hs: ','.join(str(h['n']) for h in hs)
-    return {'label': '高目', 'text': f"3連単 1着{j(first)} → 2着{j(second)} → 3着{j(third)}（{len(combos)}点）",
-            'parts': [('3連単', combos)]}
+    tan = [(a['n'], b['n'], c['n']) for a in first for b in second for c in third
+           if len({a['n'], b['n'], c['n']}) == 3]
+    fuku = sorted({tuple(sorted(t)) for t in tan})
+    return [{'label': '高目', 'text': f"3連単 1着{j(first)} → 2着{j(second)} → 3着{j(third)}（{len(tan)}点）",
+             'parts': [('3連単', tan)]},
+            {'label': '高目', 'text': f"3連複 {j(first)} - {j(second)} - {j(third)}（{len(fuku)}点）",
+             'parts': [('3連複', fuku)]}]
+
+
+def trifecta_high(arr):
+    b = high_bets(arr)
+    return b[0] if b else None
 
 
 # ═════════════════════════════════════════
@@ -1749,7 +1779,9 @@ def format_reply(race, arr):
     out.append("")
 
     out.append("【おすすめ買い目】")
-    out.extend(bets(arr))
+    out.append("")
+    for b in bets(arr):
+        out += [b, ""]
     out.append("")
     out.append("※スコア×1.00が基準。S≥1.08／A≥1.03／B≥1.00／C≥0.96／D")
     msg = "\n".join(out)
@@ -2055,7 +2087,7 @@ def render_image(race, arr):
     d.rounded_rectangle((PAD, y, W - PAD, y + box_h), radius=16, fill=(14, 22, 42))
     gold_frame(d, (PAD, y, W - PAD, y + box_h), r=16)
     ctext(d, W / 2, y + 16, '― おすすめ買い目 ―', F('serif_b', 36), GOLD)
-    LC = {'本線': (200, 160, 70), '妙味': (38, 160, 80), '穴': (214, 60, 60), '高目': (150, 80, 200)}
+    LC = {'推奨': (220, 110, 40), '本線': (200, 160, 70), '妙味': (38, 160, 80), '穴': (214, 60, 60), '高目': (150, 80, 200)}
     fl = F('sans_b', 26)
     yy = y + 78
     for lab, lines in bet_rows:
@@ -2339,8 +2371,10 @@ def public_base_url():
 
 
 def bets_text(race, arr):
-    out = [f"{race['venue']}{race['R']}R {race['name']}", "【おすすめ買い目】"] + bets(arr)
-    return "\n".join(out)
+    out = [f"{race['venue']}{race['R']}R {race['name']}", "【おすすめ買い目】", ""]
+    for b in bets(arr):
+        out += [b, ""]   # 見やすいように1行ずつ空ける
+    return "\n".join(out).rstrip()
 
 
 
