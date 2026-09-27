@@ -30,6 +30,7 @@ jobs:
         run: python tools/build_std_times.py
 
       - name: できたデータを保存する
+        if: always()          # 途中でエラーになっても、集めた分は保存する
         run: |
           git config user.name "std-times-bot"
           git config user.email "std-times-bot@users.noreply.github.com"
@@ -38,5 +39,9 @@ jobs:
             echo "変更なし"
           else
             git commit -m "基準タイムを更新 $(date +'%Y-%m-%d')"
-            git push
+            # 実行中に main.py などが更新されていても保存できるよう、最新を取り込んでから保存（最大3回）
+            for i in 1 2 3; do
+              git pull --rebase -X theirs origin main && git push && break
+              sleep 5
+            done
           fi
