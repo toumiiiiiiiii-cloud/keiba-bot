@@ -216,6 +216,10 @@ def main():
     added = 0
     time_left = lambda: (time.time() - T0) / 60 < MAX_MINUTES
 
+    def save_all():
+        save_races(races)
+        json.dump({'dates_done': sorted(done_dates), 'pending': pending}, open(PROGRESS, 'w'))
+
     def collect():
         nonlocal added
         while pending and added < MAX_RACES_PER_RUN and time_left():
@@ -227,15 +231,29 @@ def main():
                     added += 1
                     if added % 100 == 0:
                         log(f'{added}レース追加（合計{len(races)}）')
+                    if added % 300 == 0:   # 途中で止まっても集めた分が残るように、こまめに保存
+                        save_all()
                 pending.pop(0)
             except Exception as e:
                 log('結果の取得に失敗', rid, e)
                 pending.append(pending.pop(0))
                 return
 
+    try:
+        run_dates(collect, done_dates, pending, queued, races, recheck_from, today, time_left, lambda: added)
+    finally:
+        # 途中で何が起きても、それまでに集めた分は必ず保存する
+        save_all()
+        table = build_table(list(races.values()))
+        json.dump(table, open(OUT, 'w'), ensure_ascii=False, separators=(',', ':'))
+        log(f'完了：今回{added}レース追加、合計{len(races)}レース、残り{len(pending)}レース、'
+            f'基準タイム{len(table["exact"])}件（{table["first"]}〜{table["last"]}）')
+
+
+def run_dates(collect, done_dates, pending, queued, races, recheck_from, today, time_left, added):
     collect()   # 前回の残りから
     d = START
-    while d < today and added < MAX_RACES_PER_RUN and time_left():
+    while d < today and added() < MAX_RACES_PER_RUN and time_left():
         key = f"{d:%Y%m%d}"
         if key not in done_dates or d >= recheck_from:
             try:
@@ -249,13 +267,6 @@ def main():
                 log('一覧の取得に失敗', key, e)
             collect()
         d += datetime.timedelta(days=1)
-
-    save_races(races)
-    json.dump({'dates_done': sorted(done_dates), 'pending': pending}, open(PROGRESS, 'w'))
-    table = build_table(list(races.values()))
-    json.dump(table, open(OUT, 'w'), ensure_ascii=False, separators=(',', ':'))
-    log(f'完了：今回{added}レース追加、合計{len(races)}レース、残り{len(pending)}レース、'
-        f'基準タイム{len(table["exact"])}件（{table["first"]}〜{table["last"]}）')
 
 
 if __name__ == '__main__':
