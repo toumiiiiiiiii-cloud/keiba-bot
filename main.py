@@ -2618,6 +2618,12 @@ def health():
     return "ok"
 
 
+@app.route("/health", methods=["GET", "HEAD"])
+def health_check():
+    """見張りサービス（UptimeRobot など）用。予想処理は動かさず、すぐ OK を返す"""
+    return "OK", 200
+
+
 @app.route("/callback", methods=['POST'])
 def callback():
     signature = request.headers['X-Line-Signature']
