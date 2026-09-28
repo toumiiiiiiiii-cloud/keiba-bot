@@ -12,7 +12,7 @@ import requests
 import json
 import datetime
 import traceback
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from bs4 import BeautifulSoup
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
@@ -142,10 +142,11 @@ def clamp(v, lo, hi):
 
 
 SESSION = requests.Session()
+BG = ThreadPoolExecutor(max_workers=8)   # 予想と同時に進める補助の取得用
 
 
-def fetch_soup(url):
-    res = SESSION.get(url, headers=HEADERS, timeout=15)
+def fetch_soup(url, timeout=15):
+    res = SESSION.get(url, headers=HEADERS, timeout=timeout)
     res.raise_for_status()
     raw = res.content
     m = re.search(rb'charset=["\']?([\w-]+)', raw[:3000], re.I)
@@ -786,12 +787,18 @@ COURSE_DRAW = {('中山', '芝', 1200): 1.0, ('中山', '芝', 1600): 1.5, ('東
 _cache = {}          # 取得結果の一時保存 {キー: (保存時刻, 値)}
 
 
-def cached(key, ttl, fn):
+def cached(key, ttl, fn, fail_ttl=1800):
+    """取得結果を ttl 秒覚えておく。取れなかった（None・エラー）ときは fail_ttl 秒だけ覚えて、
+    同じ遅いページを何度も待たないようにする"""
     now = time.time()
     hit = _cache.get(key)
-    if hit and now - hit[0] < ttl:
+    if hit and now - hit[0] < (ttl if hit[1] is not None else fail_ttl):
         return hit[1]
-    val = fn()
+    try:
+        val = fn()
+    except Exception:
+        _cache[key] = (now, None)
+        raise
     _cache[key] = (now, val)
     return val
 
@@ -954,7 +961,7 @@ def race_ids_on(date):
 def parse_result_full(race_id):
     """終わったレースの結果：ペース(H/M/S)・頭数・芝ダ・全馬の(着順,馬番,最初と最後のコーナー位置,上がり,着差)"""
     def load():
-        soup = fetch_soup(f"{site_of(race_id)}/race/result.html?race_id={race_id}")
+        soup = fetch_soup(f"{site_of(race_id)}/race/result.html?race_id={race_id}", timeout=8)
         d1 = soup.select_one('.RaceData01')
         sm = re.search(r'(芝|ダ)', d1.get_text()) if d1 else None
         table = soup.select_one('table#All_Result_Table') or soup.select_one('table.RaceTable01')
@@ -1039,33 +1046,62 @@ def bias_factors(race, horses):
         h['bTrack'] = b
 
 
+def parse_jockey_tables(soup):
+    """騎手ページの「年度別成績」の表（上から中央・地方）を読む。
+    見出しは「年度・順位・1着・2着・3着・4着〜・騎乗回数…・勝率・連対率・複勝率」"""
+    year = str(jst_today().year)
+    out = []
+    for table in soup.find_all('table'):
+        head = table.find('tr')
+        if not head:
+            continue
+        cols = [clean(c.get_text()) for c in head.find_all(['th', 'td'])]
+        if '1着' not in cols or not any('複勝率' in c for c in cols):
+            continue
+        i1, i2, i3 = cols.index('1着'), cols.index('2着'), cols.index('3着')
+        i4 = next((i for i, c in enumerate(cols) if c.startswith('4着') or c == '着外'), None)
+        if i4 is None:
+            continue
+        rows = {}
+        for tr in table.find_all('tr')[1:]:
+            cells = [clean(c.get_text()) for c in tr.find_all(['th', 'td'])]
+            if not cells or len(cells) <= i4:
+                continue
+            v = [int((to_float(cells[i].replace(',', '')) or 0)) for i in (i1, i2, i3, i4)]
+            rides = sum(v)
+            if rides:
+                rows[cells[0]] = {'rides': rides, 'win': v[0] / rides, 'fuku': sum(v[:3]) / rides}
+        pick = None
+        for want, span in ((year, '今年'), ('累計', '通算')):
+            r = rows.get(want)
+            if r and r['rides'] >= 30:
+                pick = dict(r, span=span)
+                break
+        out.append(pick)
+    return out
+
+
 def fetch_jockey_stats(jid):
-    """騎手の今年の成績（騎乗数・複勝率）。取れなければ None"""
+    """騎手の成績（騎乗数・勝率・複勝率）を中央・地方それぞれ。取れなければ None"""
     def load():
-        soup = fetch_soup(f"https://db.netkeiba.com/jockey/{jid}/")
-        year = str(jst_today().year)
-        for table in soup.find_all('table'):
-            head = table.find('tr')
-            if not head:
-                continue
-            cols = [clean(c.get_text()) for c in head.find_all(['th', 'td'])]
-            if not any('複勝率' in c for c in cols) or '1着' not in cols:
-                continue
-            idx = {k: cols.index(k) for k in ('1着', '2着', '3着', '着外') if k in cols}
-            if len(idx) < 4:
-                continue
-            for want in (year, '本年', '累計'):
-                for tr in table.find_all('tr')[1:]:
-                    cells = [clean(c.get_text()) for c in tr.find_all(['th', 'td'])]
-                    if cells and want in cells[0] and len(cells) > max(idx.values()):
-                        v = {k: int(to_float(cells[i]) or 0) for k, i in idx.items()}
-                        rides = sum(v.values())
-                        if rides >= 30:
-                            return {'rides': rides, 'win': v['1着'] / rides,
-                                    'fuku': (v['1着'] + v['2着'] + v['3着']) / rides,
-                                    'span': '今年' if want != '累計' else '通算'}
-        return None
+        soup = fetch_soup(f"https://db.netkeiba.com/jockey/{jid}/", timeout=8)
+        tables = parse_jockey_tables(soup)
+        if not tables or not any(tables):
+            return None
+        return {'jra': tables[0] if len(tables) > 0 else None,
+                'nar': tables[1] if len(tables) > 1 else None}
     return cached(('jk', jid), 86400, load)
+
+
+def pick_jockey_stats(both, is_nar):
+    """レースに合わせて中央・地方の成績を選ぶ（少なければもう一方を使う）"""
+    if not both:
+        return None
+    first, second = (both.get('nar'), both.get('jra')) if is_nar else (both.get('jra'), both.get('nar'))
+    s = first or second
+    if s and s is second:
+        s = dict(s, span=s['span'] + ('・中央' if is_nar else '・地方'))
+    return s
 
 
 def jst_today():
@@ -1128,14 +1164,22 @@ def condition_factors(race, horses):
 def extra_factors(race, horses, soup, race_id):
     """③④⑤をまとめて計算し、各馬の xBonus に入れる"""
     race['date'] = race.get('date') or parse_race_date(soup)
-    jids = {h['jid'] for h in horses if h.get('jid')}
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        f_tb = ex.submit(_safe, track_bias, race, race_id, race['date'])
-        f_js = {j: ex.submit(_safe, fetch_jockey_stats, j) for j in jids}
-        race['trackBias'] = f_tb.result()
-        stats = {j: f.result() for j, f in f_js.items()}
+    early = race.pop('_early', None)
+    if early is None:
+        early = {'tb': BG.submit(_safe, track_bias, race, race_id, race['date']),
+                 'jk': {j: BG.submit(_safe, fetch_jockey_stats, j) for j in {h['jid'] for h in horses if h.get('jid')}}}
+    # 待つのは最大10秒まで。間に合わなかった分は使わずに先へ進む（予想全体を遅らせない）
+    t0 = time.time()
+    futs = [early['tb']] + list(early['jk'].values())
+    wait(futs, timeout=10)
+    late = sum(1 for f in futs if not f.done())
+    if late:
+        print(f"[extra] {late}件の取得が間に合わず省略（{time.time() - t0:.1f}秒待機）", flush=True)
+    race['trackBias'] = early['tb'].result() if early['tb'].done() else None
+    stats = {j: (f.result() if f.done() else None) for j, f in early['jk'].items()}
+    is_nar = 'nar.' in race.get('base', '')
     for h in horses:
-        h['jkStats'] = stats.get(h.get('jid'))
+        h['jkStats'] = pick_jockey_stats(stats.get(h.get('jid')), is_nar)
     time_factors(race, horses)
     draw_factors(race, horses)
     bias_factors(race, horses)
@@ -1174,7 +1218,7 @@ def fetch_career(hid):
     def load():
         for url in (f"https://db.netkeiba.com/horse/result/{hid}/", f"https://db.netkeiba.com/horse/{hid}/"):
             try:
-                soup = fetch_soup(url)
+                soup = fetch_soup(url, timeout=10)
             except Exception:
                 continue
             lines = parse_career_table(soup)
@@ -1753,7 +1797,12 @@ def analyze(text):
     race['base'] = base
     race['id'] = race_id
     race['date'] = parse_race_date(soup)
+    t_start = time.time()
+    early = {'tb': BG.submit(_safe, track_bias, race, race_id, race['date']),
+             'jk': {j: BG.submit(_safe, fetch_jockey_stats, j) for j in {h['jid'] for h in horses if h.get('jid')}}}
+    race['_early'] = early
     load_careers(race, horses)
+    print(f"[time] 全成績 {time.time() - t_start:.1f}秒", flush=True)
     flow_analysis(race, horses)
     predict_positions(race, horses)
     race['nige'] = sum(1 for h in horses if h['st'] == '逃')
