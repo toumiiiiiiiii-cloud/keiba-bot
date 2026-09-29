@@ -320,6 +320,8 @@ def parse_shutuba_past(soup):
         dam = txt('.Horse03')
         damsire = txt('.Horse04').strip('()（） ')
         info_text = info.get_text(' ', strip=True)
+        tm_ = re.search(r'(美浦|栗東|[^\s・()（）]{2,3})・\S+', txt('.Horse05') or info_text)
+        trainer_area = tm_.group(1) if tm_ else ''
         stm = re.search(r'([逃先差追大])\s*(?:中\s*\d+\s*週|連闘)', info_text)
         st = stm.group(1) if stm else '?'
         if st == '大':
@@ -375,7 +377,7 @@ def parse_shutuba_past(soup):
         cancelled = 'Cancel' in tr.get('class', []) or bool(re.search(r'取消|除外', tr.get_text()[:200]))
         horses.append({'w': waku, 'n': umaban, 'name': name, 'sire': clean(sire),
                        'dam': f'{clean(dam)}({damsire})' if damsire else clean(dam),
-                       'damsire': damsire, 'st': st, 'jockey': jockey, 'wt': wt, 'jid': jid, 'hid': hid,
+                       'damsire': damsire, 'st': st, 'jockey': jockey, 'wt': wt, 'jid': jid, 'hid': hid, 'area': trainer_area,
                        'weeks': weeks, 'bwNow': bw_now, 'bwDiff': bw_diff, 'oddsPage': odds_pg,
                        'lines': lines, 'cancelled': cancelled})
     return horses
@@ -1180,6 +1182,11 @@ def extra_factors(race, horses, soup, race_id):
     is_nar = 'nar.' in race.get('base', '')
     for h in horses:
         h['jkStats'] = pick_jockey_stats(stats.get(h.get('jid')), is_nar)
+        f = early['jk'].get(h.get('jid'))
+        h['jkStatus'] = ('OK' if h['jkStats'] else
+                         '騎手のIDが取れず' if not h.get('jid') else
+                         '時間切れ（10秒で打ち切り）' if f is not None and not f.done() else
+                         '騎手のページを読めず')
     time_factors(race, horses)
     draw_factors(race, horses)
     bias_factors(race, horses)
@@ -1485,7 +1492,9 @@ def class_move_factors(race, horses):
         l0 = ls[0]
         last_v = CLS[class_of_text(l0['r'], l0['p'])][1]
         b, notes = 0.0, []
-        if is_jra_venue(l0['p']):
+        if h.get('area') in ('美浦', '栗東'):
+            pass   # 中央所属の馬の遠征（交流重賞など）。転入ではないので加点しない
+        elif is_jra_venue(l0['p']):
             b += 0.01
             notes.append(f"中央からの転入（前走{l0['p']}{l0['r']}）。中央＞地方の力関係で上位")
         elif CIRCUIT.get(l0['p']) and CIRCUIT.get(l0['p']) != CIRCUIT.get(venue):
@@ -2776,7 +2785,9 @@ def test_page():
             if not h:
                 return f'{n}番の馬が見つかりません', 200, {'Content-Type': 'text/plain; charset=utf-8'}
             lines = [f"{n}番 {h['name']}：{h['rk']}位／{len(arr)}頭 ランク{h['rank']} スコア{h['a']:.3f}",
-                     f"全成績の読み取り：{'OK' if h.get('careerOk') else '失敗（出馬表の5走で代用）'}", '']
+                     f"全成績の読み取り：{'OK' if h.get('careerOk') else '失敗（出馬表の5走で代用）'}",
+                     f"騎手成績の読み取り：{h.get('jkStatus', '―')}（騎手ID {h.get('jid') or 'なし'}）",
+                     f"所属：{h.get('area') or '不明'}", '']
             lines += [f"【{k}】{v}" for k, v in make_reasons(race, h)]
             return '\n'.join(lines), 200, {'Content-Type': 'text/plain; charset=utf-8'}
         if request.args.get('t'):
