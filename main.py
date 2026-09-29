@@ -192,12 +192,28 @@ def is_flat(l):
 # ═════════════════════════════════════════
 # netkeiba 出馬表（5走表示）の読み取り
 # ═════════════════════════════════════════
+def is_abroad_id(rid):
+    """海外レースのIDは5桁目が英字（例：2026C8010105＝パリロンシャン）"""
+    return len(str(rid)) == 12 and str(rid)[4].isalpha()
+
+
 def parse_input(text):
-    m = re.search(r'race_id=(\d{12})', text) or re.search(r'/race/(\d{12})', text) or re.search(r'\b(\d{12})\b', text)
+    m = (re.search(r'race_id=([0-9A-Za-z]{12})', text) or re.search(r'/race/([0-9A-Za-z]{12})', text)
+         or re.search(r'\b(\d{12})\b', text) or re.search(r'\b(\d{4}[A-Z][0-9A-Za-z]{7})\b', text))
     if not m:
         return None, None
-    base = 'https://nar.netkeiba.com' if ('nar.' in text or is_nar_id(m.group(1))) else 'https://race.netkeiba.com'
-    return m.group(1), base
+    rid = m.group(1)
+    if is_abroad_id(rid):
+        return rid, 'https://race.netkeiba.com'
+    base = 'https://nar.netkeiba.com' if ('nar.' in text or is_nar_id(rid)) else 'https://race.netkeiba.com'
+    return rid, base
+
+
+def going_override(text):
+    """URLの後ろに「重」などと書いたら、その馬場で計算する（海外の馬場を自分で指定したいとき用）"""
+    rest = re.sub(r'https?://\S+', ' ', text)
+    m = re.search(r'(?:^|\s)(良|稍重|稍|重|不良|不)(?:\s|$)', rest)
+    return {'稍': '稍重', '不': '不良'}.get(m.group(1), m.group(1)) if m else None
 
 
 def parse_past_cell(td):
@@ -232,8 +248,11 @@ def parse_past_cell(td):
     fm = re.search(r'(\d+)頭\s*(\d+)番\s*(\d*)人?\s*(\S+)\s+(\d{2}(?:\.\d)?)', txt)
     pm = re.search(r'([\d]+(?:-[\d]+)+|\d+)\s*\(([\d.]+)\)\s*(\d{3})\s*\(([+\-]?\d+)\)', txt)
     mm = re.findall(r'\(([+\-]?\d+\.\d)\)', txt)
+    m_est = False
     if not mm:
-        return None
+        # 海外のレースは着差が載っていない。着順から大まかに見積もる（1着0秒、以下1着ごとに0.2秒）
+        mm = ['0.0' if pos == 1 else (f'{min(1.6, 0.2 * (pos - 1)):.1f}' if pos > 0 else '9.9')]
+        m_est = True
     win_a = [x for x in td.find_all('a') if HORSE_HREF.search(x.get('href', ''))]
     return {
         'd': f'{m.group(1)}.{m.group(2)}.{m.group(3)}', 'p': m.group(4), 'pos': pos, 'r': rname,
@@ -244,7 +263,7 @@ def parse_past_cell(td):
         'ps': pm.group(1) if pm else '', 'l3': float(pm.group(2)) if pm else 0,
         'bw': f'{pm.group(3)}({pm.group(4)})' if pm else '',
         'win': clean(win_a[-1].get_text()) if win_a else '',
-        'm': float(mm[-1]),
+        'm': float(mm[-1]), 'mEst': m_est,
     }
 
 
@@ -282,6 +301,10 @@ def parse_race_info(soup, race_id, base):
         r['venue'] = NAR_PLACE.get(race_id[4:6]) or (re.search(r'\d+回\s*(\S+?)\s*\d+日目', r['condText']) or [None, ''])[1] or ''
         r['clsIdx'] = class_of_text(r['titleName'] + ' ' + r['name'] + ' ' + r['condText'], r['venue'])
         r['banei'] = r['venue'] == '帯広'
+    elif is_abroad_id(race_id):
+        vm = re.search(r'\d+日\s*(\S+?)\d+R', title_t)
+        r['venue'] = vm.group(1) if vm else '海外'
+        r['abroad'] = True
     else:
         r['venue'] = JRA_PLACE.get(race_id[4:6], '')
     r['R'] = int(race_id[-2:])
@@ -293,7 +316,8 @@ def parse_race_info(soup, race_id, base):
 
 def parse_shutuba_past(soup):
     horses = []
-    rows = soup.select('table.Shutuba_Past5_Table tr.HorseList') or soup.select('tr.HorseList')
+    rows = soup.select('table.Shutuba_Past5_Table tr.HorseList') or soup.select('tr.HorseList') or \
+        [tr for tr in soup.find_all('tr') if tr.find('a', href=HORSE_HREF) and re.search(r'\d{4}\.\d{2}\.\d{2}', tr.get_text())]
     for tr in rows:
         info = tr.select_one('td.Horse_Info')
         if info is None:
@@ -320,7 +344,13 @@ def parse_shutuba_past(soup):
         dam = txt('.Horse03')
         damsire = txt('.Horse04').strip('()（） ')
         info_text = info.get_text(' ', strip=True)
-        tm_ = re.search(r'(美浦|栗東|[^\s・()（）]{2,3})・\S+', txt('.Horse05') or info_text)
+        if not sire:   # 海外の出馬表などで欄の目印が無いとき：「父 馬名 母 (母父)」の並びから読む
+            before, _, after = info_text.partition(a.get_text(' ', strip=True))
+            sire = before.strip().split('  ')[-1].strip() if before.strip() else ''
+            dm_ = re.match(r'\s*(.+?)\s*[(（]([^)）]*)[)）]', after)
+            if dm_:
+                dam, damsire = dm_.group(1).strip(), dm_.group(2).strip()
+        tm_ = re.search(r'(美浦|栗東|[^\s・()（）\d]{2,6})・\S+', txt('.Horse05') or info_text)
         trainer_area = tm_.group(1) if tm_ else ''
         stm = re.search(r'([逃先差追大])\s*(?:中\s*\d+\s*週|連闘)', info_text)
         st = stm.group(1) if stm else '?'
@@ -352,6 +382,16 @@ def parse_shutuba_past(soup):
         jockey = re.sub(r'^[▲△☆★◇]+', '', jockey) or '不明'
 
         past_tds = tr.select('td.Past') or [td for td in tds if re.search(r'\d{4}\.\d{2}\.\d{2}', td.get_text())]
+        if not wt:   # 斤量の欄に目印が無いとき：「牡3鹿 … 56.5」の形の欄から読む
+            for td in tds:
+                if td in past_tds:
+                    continue
+                wm = re.search(r'(?:牡|牝|セ)\d+\S*.*?(\d{2}\.\d)', td.get_text(' '))
+                if wm:
+                    wt = float(wm.group(1))
+                    if jk_td is None:
+                        jk_td = td
+                    break
         lines = [x for x in (parse_past_cell(td) for td in past_tds) if x]
 
         # ページに出ている単勝オッズ（地方で多い）
@@ -375,9 +415,9 @@ def parse_shutuba_past(soup):
                 break
 
         cancelled = 'Cancel' in tr.get('class', []) or bool(re.search(r'取消|除外', tr.get_text()[:200]))
-        horses.append({'w': waku, 'n': umaban, 'name': name, 'sire': clean(sire),
+        horses.append({'w': waku, 'n': umaban, 'name': name, 'sire': re.sub(r'\s+', ' ', sire).strip(),
                        'dam': f'{clean(dam)}({damsire})' if damsire else clean(dam),
-                       'damsire': damsire, 'st': st, 'jockey': jockey, 'wt': wt, 'jid': jid, 'hid': hid, 'area': trainer_area,
+                       'damsire': re.sub(r'\s+', ' ', damsire).strip(), 'st': st, 'jockey': jockey, 'wt': wt, 'jid': jid, 'hid': hid, 'area': trainer_area,
                        'weeks': weeks, 'bwNow': bw_now, 'bwDiff': bw_diff, 'oddsPage': odds_pg,
                        'lines': lines, 'cancelled': cancelled})
     return horses
@@ -493,7 +533,10 @@ def auto_heuristics(race, horses):
             why.append(f"新馬。父{h['sire'] or '不明'}の産駒レベルで評価")
         elif ls:
             l0 = ls[0]
-            res = (f"{abs(l0['m']):.1f}秒差で勝ち" if l0['pos'] == 1 else f"{l0['m']:.1f}秒差")
+            if l0.get('mEst'):   # 海外のレースは着差が載っていない
+                res = '勝ち' if l0['pos'] == 1 else '着差の記載なし'
+            else:
+                res = (f"{abs(l0['m']):.1f}秒差で勝ち" if l0['pos'] == 1 else f"{l0['m']:.1f}秒差")
             why.append(f"前走{l0['r']}{l0['pos']}着（{res}）")
             why.append(f"同条件は全{len(same)}走で3着内{t3}回" if same else "同条件の経験なし")
 
@@ -938,6 +981,9 @@ def draw_factors(race, horses):
     N = len(horses)
     key = (race['venue'], race['surf'], race['dist'])
     bias = 0 if (race.get('banei') or 'nar.' in race.get('base', '')) else COURSE_DRAW.get(key)
+    if race.get('abroad'):
+        # 多頭数の海外G1（凱旋門賞など）は外枠が大きく不利。枠順確定前（仮番号）は使わない
+        bias = 0 if race.get('provisional') else (0.8 if len(horses) >= 14 else 0.3)
     if bias is None:
         bias = 0.3 if (race['surf'] == '芝' and race['dist'] <= 1400 and race['venue'] in VENUE_ADJ['芝']) else 0
     race['drawBias'] = bias
@@ -1001,7 +1047,7 @@ def parse_result_brief(race_id):
 
 def track_bias(race, race_id, date):
     """④-2 当日の同じ競馬場・同じ芝ダの、終わったレースの上位馬から馬場の傾向を読む"""
-    if race.get('banei'):
+    if race.get('banei') or race.get('abroad'):
         return None
     # 同じ日・同じ競馬場のレースIDは、最後の2桁（R）だけが違う
     ids = [race_id[:10] + f"{r_:02d}" for r_ in range(1, int(race_id[-2:]))]
@@ -1119,7 +1165,7 @@ def jockey_factors(race, horses):
             b += clamp((js['fuku'] - 0.22) * 0.08, -0.012, 0.024)
         prev = next((l['j'] for l in h['lines'] if l.get('j')), '')
         norm = lambda x: re.sub(r'[▲△☆★◇\s]', '', x or '')[:2]
-        h['change'] = bool(prev) and norm(prev) != norm(h['jockey'])
+        h['change'] = bool(prev) and h['jockey'] not in ('', '不明') and norm(prev) != norm(h['jockey'])
         h['prevJockey'] = prev
         if h['change'] and js and js['fuku'] >= 0.35:
             b += 0.008   # 上位騎手への乗り替わり
@@ -1195,11 +1241,12 @@ def extra_factors(race, horses, soup, race_id):
     career_factors(race, horses)
     course_factors(race, horses)
     class_move_factors(race, horses)
+    abroad_factors(race, horses)
     if race.get('course'):   # 騎手の腕が出やすい競馬場は、騎手データの効きを強く
         for h in horses:
             h['bJockey'] *= race['course']['jockey']
     for h in horses:
-        h['xBonus'] = h['bTime'] + h['bAgari'] + h['bDraw'] + h['bTrack'] + h['bJockey'] + h['bCond'] + h['bCareer'] + h.get('bPos', 0) + h.get('bFlow', 0) + h.get('bCourse', 0) + h.get('bMove', 0)
+        h['xBonus'] = h['bTime'] + h['bAgari'] + h['bDraw'] + h['bTrack'] + h['bJockey'] + h['bCond'] + h['bCareer'] + h.get('bPos', 0) + h.get('bFlow', 0) + h.get('bCourse', 0) + h.get('bMove', 0) + h.get('bAbroad', 0)
 
 
 # ═════════════════════════════════════════
@@ -1273,13 +1320,8 @@ def parse_career_table(soup):
             m = to_float(g('m'))
             if m is not None and g('m').startswith('-'):
                 m = -m
-            if m is None:
-                if pos == 1:
-                    m = 0.0
-                elif pos > 0:
-                    continue
-                else:
-                    m = 9.9
+            if m is None:   # 着差なし（海外のレースなど）は着順から見積もる
+                m = 0.0 if pos == 1 else (min(1.6, 0.2 * (pos - 1)) if pos > 0 else 9.9)
             tt = re.match(r'(\d):(\d{2}\.\d)', g('t'))
             cond = (g('cond') or '良')[:1]
             out.append({
@@ -1388,6 +1430,51 @@ def career_factors(race, horses):
                     b -= 0.005; notes.append(f"休み明けは苦手（{txt}）")
         h['bCareer'] = clamp(b, -0.015, 0.02)
         h['careerNotes'] = notes
+
+
+# ═════════════════════════════════════════
+# 海外モード（凱旋門賞など）
+# ═════════════════════════════════════════
+# 凱旋門賞と同じパリロンシャン芝2400mで行われる前哨戦（netkeibaでは名前が途中で切れていることがある）
+ARC_TRIALS = ('ニエル', 'ヴェルメイ', 'フォワ', 'パリ大賞')
+# 凱旋門賞につながる主要G1（欧州の2000〜2400mと日本の大レース）
+MAJOR_G1 = ('キングジョ', 'アイリッシ', 'インターナ', 'ヨークシャ', '英ダービ', '愛ダービ', '仏ダービ',
+            '英オークス', '愛オークス', '仏オークス', 'ジャンロマ', 'サンクルー', 'バーデン大', 'ベルリン大',
+            'プリンスオ', 'エクリプス', 'コロネーシ', '宝塚記念', '天皇賞', 'ジャパンC', '有馬記念', 'ドバイシー')
+
+
+def abroad_factors(race, horses):
+    """海外モード：前哨戦の内容、同じコースの実績、日本馬と重い馬場の相性"""
+    for h in horses:
+        h['bAbroad'], h['abroadNotes'] = 0.0, []
+    if not race.get('abroad'):
+        return
+    heavy = race['going'] in ('重', '不良')
+    for h in horses:
+        b, notes = 0.0, []
+        ls = [l for l in h['lines'] if l['pos'] > 0]
+        for i, l in enumerate(ls[:2]):
+            w = 1.0 if i == 0 else 0.6
+            ago = '前走' if i == 0 else '2走前'
+            if any(k in l['r'] for k in ARC_TRIALS):
+                add = {1: 0.02, 2: 0.012, 3: 0.006}.get(l['pos'], 0) * w
+                if add:
+                    b += add
+                    notes.append(f"{ago}の同舞台の前哨戦{l['r']}で{l['pos']}着")
+            elif any(k in l['r'] for k in MAJOR_G1):
+                add = (0.012 if l['pos'] == 1 else 0.006 if l['pos'] <= 3 else 0) * w
+                if add:
+                    b += add
+                    notes.append(f"{ago}の主要G1{l['r']}で{l['pos']}着")
+        cs = h.get('career', h['lines'])
+        if any(l['p'] == race['venue'] and abs(dist_num(l['dist']) - race['dist']) <= 100 and 0 < l['pos'] <= 3 for l in cs):
+            b += 0.005
+            notes.append(f"{race['venue']}の{race['dist']}m前後で3着以内の実績あり")
+        if heavy and h.get('area') in ('日本', '美浦', '栗東'):
+            b -= 0.01
+            notes.append('日本馬は重い欧州の馬場で苦戦してきた歴史がある')
+        h['bAbroad'] = clamp(b, -0.015, 0.035)
+        h['abroadNotes'] = notes
 
 
 # ═════════════════════════════════════════
@@ -1628,7 +1715,7 @@ def flow_analysis(race, horses):
             continue
         h['_flowLines'] = [l for l in h['career'] if l['pos'] > 0 and is_flat(l)][:3]
         for l in h['_flowLines']:
-            if l.get('rid'):
+            if l.get('rid') and not is_abroad_id(l['rid']):   # 海外のレースは結果ページが無い
                 targets[l['rid']] = None
     with ThreadPoolExecutor(max_workers=8) as ex:
         for rid, res in zip(list(targets), ex.map(lambda r: _safe(parse_result_full, r), list(targets))):
@@ -1710,7 +1797,7 @@ STYLE_RATIO = {'逃': 0.03, '先': 0.22, '差': 0.6, '追': 0.85}
 def predict_positions(race, horses):
     """近走の「最初のコーナーの位置」から、各馬の位置取りと隊列、ペースを予想する"""
     N = len(horses)
-    if race.get('banei'):   # ばんえいは直線で位置取りの概念が違うので出さない
+    if race.get('banei') or race.get('abroad'):   # ばんえい・海外は通過順の情報が無いので隊列は出さない
         race.update({'lineup': None, 'leader': None, 'hana': '', 'strongLeaders': 0, 'pace': 'base'})
         for h in horses:
             h['bPos'], h['posGroup'] = 0, None
@@ -1782,13 +1869,24 @@ def analyze(text):
     race_id, base = parse_input(text)
     if not race_id:
         return None, "URLからレースIDを読み取れませんでした。"
+    abroad = is_abroad_id(race_id)
+    page = 'shutuba_past_abroad.html' if abroad else 'shutuba_past.html'
     with ThreadPoolExecutor(max_workers=2) as ex:
-        f_page = ex.submit(fetch_soup, f"{base}/race/shutuba_past.html?race_id={race_id}")
-        f_odds = ex.submit(fetch_win_odds, race_id, base)
+        f_page = ex.submit(fetch_soup, f"{base}/race/{page}?race_id={race_id}")
+        f_odds = ex.submit(lambda: {} if abroad else fetch_win_odds(race_id, base))
         soup = f_page.result()
         odds = f_odds.result()
     race = parse_race_info(soup, race_id, base)
-    horses = [h for h in parse_shutuba_past(soup) if not h['cancelled'] and h['n']]
+    all_h = [h for h in parse_shutuba_past(soup) if not h['cancelled']]
+    if abroad and all_h and not any(h['n'] for h in all_h):
+        # 出馬投票・枠順の確定前は馬番が空欄。仮の番号（並び順）を振る
+        for i, h in enumerate(all_h, 1):
+            h['n'] = i
+        race['provisional'] = True
+    horses = [h for h in all_h if h['n']]
+    ov = going_override(text)
+    if ov:
+        race['going'], race['going_known'], race['going_manual'] = ov, True, True
     if not horses:
         return None, "出走馬を読み取れませんでした。ページの形式が変わった可能性があります。"
     if 'nar.' in base and any(not h.get('jid') for h in horses):
@@ -1829,6 +1927,7 @@ def format_reply(race, arr):
            f"{race['venue']}{race['R']}R {race['name']}" + ("" if CLS[race['clsIdx']][0] in race['name'] else f"（{CLS[race['clsIdx']][0]}）"),
            f"{race['surf']}{race['dist']}m／{race['going']}{'' if race['going_known'] else '（未発表→良で計算）'}／{N}頭",
            f"波乱度 {pct}%（{label}）",
+           *(["※枠順の確定前のため、馬番は仮の番号（出馬表の並び順）です"] if race.get('provisional') else []),
            f"判定：{verdict(arr)}", ""]
 
     # 展開・相手関係
@@ -2098,7 +2197,9 @@ def render_image(race, arr):
     fs = F('sans_r', 26)
     ctext(d, W / 2, 508, fit_text(d, tenkai, fs, W - PAD * 2), fs, SILVER)
     tb = race.get('trackBias')
-    if tb:
+    if race.get('provisional'):
+        note2 = '※枠順の確定前のため、馬番は仮の番号（出馬表の並び順）です'
+    elif tb:
         note2 = f"今日の{race['surf']}の傾向：{tb['text']}（終わった{tb['races']}レースから）"
     elif race.get('course'):
         note2 = f"{race['venue']}の特徴：{race['course']['note']}"
@@ -2216,7 +2317,7 @@ def make_reasons(race, h):
 
     if h['recent']:
         def one(l):
-            res = '勝ち' if l['pos'] == 1 else f"{l['m']:.1f}秒差"
+            res = '勝ち' if l['pos'] == 1 else ('着差の記載なし' if l.get('mEst') else f"{l['m']:.1f}秒差")
             return f"{short_date(l['d'])}{l['p']}{l['r']}{l['pos']}着({res})"
         rs = '、'.join(one(l) for l in h['recent'])
         R.append(('近走', rs))
@@ -2286,6 +2387,8 @@ def make_reasons(race, h):
         R.append(('騎手データ', '。'.join(jt) + sgn(h.get('bJockey', 0))))
     if h.get('condNotes'):
         R.append(('状態', '、'.join(h['condNotes']) + sgn(h.get('bCond', 0))))
+    if h.get('abroadNotes'):
+        R.append(('海外レース', '。'.join(h['abroadNotes']) + sgn(h.get('bAbroad', 0))))
     if h.get('moveNotes'):
         R.append(('格付け', '。'.join(h['moveNotes']) + sgn(h.get('bMove', 0))))
     P = race.get('course')
@@ -2310,7 +2413,7 @@ def sgn(v):
 SHORT_HEAD = {'総合評価': '総合評価', '過去レースのレベル': 'レース格', '対戦相手のその後': '対戦相手',
               '近走': '近走', 'コース・距離適性': '適性', '脚質・展開': '展開', '騎手・条件': '騎手・斤量',
               '道悪適性': '道悪', '穴馬チェック': '穴馬', '血統・厩舎': '血統', 'タイム': 'タイム',
-              '上がり': '上がり', '枠順': '枠順', '当日の馬場': '当日馬場', '騎手データ': '騎手成績', '状態': '状態', '全成績から': '全成績', '近走の中身': '近走の中身', 'コース特性': 'コース', '格付け': '格付け'}
+              '上がり': '上がり', '枠順': '枠順', '当日の馬場': '当日馬場', '騎手データ': '騎手成績', '状態': '状態', '全成績から': '全成績', '近走の中身': '近走の中身', 'コース特性': 'コース', '格付け': '格付け', '海外レース': '海外'}
 
 
 _cw_cache = {}
