@@ -336,6 +336,8 @@ def parse_shutuba_past(soup):
         nums = [int(t) for t in (clean(td.get_text()) for td in tds[:3]) if t.isdigit()]
         waku = nums[0] if len(nums) >= 2 else None
         umaban = nums[1] if len(nums) >= 2 else (nums[0] if nums else None)
+        sa_m = re.search(r'(牡|牝|セ|騸)\s*(\d+)', tr.get_text(' '))
+        sex, age = (sa_m.group(1), int(sa_m.group(2))) if sa_m else (None, None)
 
         def txt(sel):
             el = info.select_one(sel)
@@ -419,6 +421,7 @@ def parse_shutuba_past(soup):
                        'dam': f'{clean(dam)}({damsire})' if damsire else clean(dam),
                        'damsire': re.sub(r'\s+', ' ', damsire).strip(), 'st': st, 'jockey': jockey, 'wt': wt, 'jid': jid, 'hid': hid, 'area': trainer_area,
                        'weeks': weeks, 'bwNow': bw_now, 'bwDiff': bw_diff, 'oddsPage': odds_pg,
+                       'sex': sex, 'age': age, 'gate': waku,
                        'lines': lines, 'cancelled': cancelled})
     return horses
 
@@ -526,6 +529,8 @@ def auto_heuristics(race, horses):
 
         dw = med - h['wt']
         jk = clamp(3 + (1 if dw >= 2 else 0) + (1 if dw >= 4 else 0) - (1 if dw <= -2 else 0), 1, 5)
+        if race.get('abroad'):   # 海外の定量戦は斤量差を年齢・性別の評価（海外モード）で別に扱う
+            jk = 3
 
         t3 = sum(1 for l in same if l['pos'] <= 3)
         why = []
@@ -982,8 +987,8 @@ def draw_factors(race, horses):
     key = (race['venue'], race['surf'], race['dist'])
     bias = 0 if (race.get('banei') or 'nar.' in race.get('base', '')) else COURSE_DRAW.get(key)
     if race.get('abroad'):
-        # 多頭数の海外G1（凱旋門賞など）は外枠が大きく不利。枠順確定前（仮番号）は使わない
-        bias = 0 if race.get('provisional') else (0.8 if len(horses) >= 14 else 0.3)
+        # 海外はゲート番で別に評価する（海外モード）。ここでは使わない
+        bias = 0
     if bias is None:
         bias = 0.3 if (race['surf'] == '芝' and race['dist'] <= 1400 and race['venue'] in VENUE_ADJ['芝']) else 0
     race['drawBias'] = bias
@@ -1246,7 +1251,7 @@ def extra_factors(race, horses, soup, race_id):
         for h in horses:
             h['bJockey'] *= race['course']['jockey']
     for h in horses:
-        h['xBonus'] = h['bTime'] + h['bAgari'] + h['bDraw'] + h['bTrack'] + h['bJockey'] + h['bCond'] + h['bCareer'] + h.get('bPos', 0) + h.get('bFlow', 0) + h.get('bCourse', 0) + h.get('bMove', 0) + h.get('bAbroad', 0)
+        h['xBonus'] = h['bTime'] + h['bAgari'] + h['bDraw'] + h['bTrack'] + h['bJockey'] + h['bCond'] + h['bCareer'] + h.get('bPos', 0) + h.get('bFlow', 0) + h.get('bCourse', 0) + h.get('bMove', 0) + h.get('bAbroad', 0) + h.get('bHL', 0)
 
 
 # ═════════════════════════════════════════
@@ -1433,6 +1438,57 @@ def career_factors(race, horses):
 
 
 # ═════════════════════════════════════════
+# ハイレベル戦（出世レース）の見極め
+#   ・名前で分かる出世レース ・勝ち時計が基準より大幅に速いレース ・対戦相手がその後に重賞で好走したレース
+#   ハイレベル戦で4〜8着に負けたのは「相手が強かった」として着差を割り引き、3着以内なら加点
+# ═════════════════════════════════════════
+HIGH_LEVEL_NAMES = ('伏竜', '東風', '共同通信', '毎日杯', '白百合', 'ヒヤシンス', 'プリンシパル')
+
+
+def highlevel_factors(race, horses):
+    keys = {}
+    for h in horses:
+        for l in h.get('career', h['lines']):
+            keys.setdefault(line_key(l), []).append(h)
+    for h in horses:
+        h['bHL'], h['hlNotes'], h['hlLines'] = 0.0, [], []
+        b = 0.0
+        for l in [x for x in h.get('career', h['lines']) if x['pos'] > 0 and is_flat(x)][:5]:
+            why = ''
+            name_hit = next((k for k in HIGH_LEVEL_NAMES if k in l['r']), None)
+            if name_hit:
+                why = '出世レース'
+            if not why and l.get('t') and l['p'] in JRA_PLACE.values():
+                win_t = l['t'] - max(0, l['m'])
+                ll = dict(l, t=win_t)
+                si_w = speed_index(ll)
+                if si_w is not None and ll.get('_stdReal') and si_w >= 10:   # 実データの基準がある時だけ
+                    why = f'勝ち時計が基準より速い（指数{si_w:+.0f}）'
+            if not why:
+                shared = CLS[class_of_text(l['r'], l['p'])][1]
+                for o in keys.get(line_key(l), []):
+                    if o is h:
+                        continue
+                    later = [f for f in o.get('career', o['lines']) if f['pos'] > 0 and f['d'] > l['d'] and f['pos'] <= 2]
+                    best = max((CLS[class_of_text(f['r'], f['p'])][1] for f in later), default=0)
+                    if best >= max(5, shared + 1):   # その後に重賞で2着以内
+                        why = f'対戦した{o["name"]}がその後重賞で好走'
+                        break
+            if not why:
+                continue
+            tag = f"{short_date(l['d'])}{l['p']}{l['r']}（{why}）"
+            if l['pos'] <= 3:
+                b += 0.006
+                h['hlNotes'].append(f"{tag}で{l['pos']}着と好走")
+            elif l['pos'] <= 8:
+                h.setdefault('flowRelief', {})
+                h['flowRelief'][line_key(l)] = min(h['flowRelief'].get(line_key(l), 1.0), 0.5)
+                h['hlNotes'].append(f"{tag}で{l['pos']}着。相手が強かったので負けは度外視")
+            h['hlLines'].append(l)
+        h['bHL'] = min(b, 0.02)
+
+
+# ═════════════════════════════════════════
 # 海外モード（凱旋門賞など）
 # ═════════════════════════════════════════
 # 凱旋門賞と同じパリロンシャン芝2400mで行われる前哨戦（netkeibaでは名前が途中で切れていることがある）
@@ -1443,21 +1499,70 @@ MAJOR_G1 = ('キングジョ', 'アイリッシ', 'インターナ', 'ヨーク�
             'プリンスオ', 'エクリプス', 'コロネーシ', '宝塚記念', '天皇賞', 'ジャパンC', '有馬記念', 'ドバイシー')
 
 
+# 前哨戦の格（凱旋門賞との結びつき）。ヴェルメイユ賞（G1）＞フォワ賞・パリ大賞＞ニエル賞
+ARC_TRIAL_W = {'ヴェルメイ': 1.0, 'フォワ': 0.9, 'パリ大賞': 0.9, 'ニエル': 0.6}
+
+# 現地ブックメーカーの単勝オッズ（BookmakerFan掲載：ウィリアムヒル／bet365／1xBet、2026/9/29 14:00時点）
+# レースIDごと・netkeibaの馬名で。Renderの環境変数 BOOK_ODDS_JSON で上書きできる
+BOOK_ODDS = {
+    '2026C8010105': {
+        '_updated': '2026/9/29 14:00',
+        'ダリズ': [2.5, 2.62, 2.7], 'モルティーズクロス': [5.5, 5.5, 6], 'カルパナ': [8, 8, 8],
+        'ダイヤモンドネックレス': [9, 9, 21], 'サンダリングオン': [10, 9, 8], 'ヴァランディール': [17, 15, 15],
+        'ミニーホーク': [17, 17, 21], 'ベイシティローラー': [26, 26, 17], 'ベンヴェヌートチェッリーニ': [26, 21, 21],
+        'メイショウタバル': [34, 34, 26], 'フレンドリーソウル': [34, 34], 'サダッド': [41, 34, 26],
+        'パールドマジェスティ': [41, 41, 50], 'サンリー': [51, 51, 21], 'アドマイヤテラ': [51, 51, 34],
+        'ブライトライト': [101, 101, 34], 'アローイーグル': [101, 101, 65], 'タティコラム': [101, 101, 80],
+        'ライトザゴースト': [151, 101, 80], 'チェスナットロケット': [201, 151, 100],
+    },
+}
+try:
+    _bo = json.loads(os.environ.get('BOOK_ODDS_JSON', '{}'))
+    for _rid, _tab in _bo.items():
+        BOOK_ODDS.setdefault(_rid, {}).update(_tab)
+except Exception as _e:
+    print(f"[book] BOOK_ODDS_JSON を読めません: {_e}", flush=True)
+
+
+def book_probs(race, horses):
+    """現地オッズ（複数社の中央値）から、出走馬の中での勝率を出す。表に無い馬は大穴（201倍）扱い"""
+    tab = BOOK_ODDS.get(race.get('id'))
+    if not tab:
+        return None
+    odds = {}
+    for h in horses:
+        v = tab.get(h['name'])
+        if v:
+            vs = sorted(v)
+            odds[h['n']] = vs[len(vs) // 2]
+        else:
+            odds[h['n']] = None
+    inv = {n: 1 / (o or 201) for n, o in odds.items()}
+    tot = sum(inv.values())
+    race['bookUpdated'] = tab.get('_updated', '')
+    return {n: (inv[n] / tot, odds[n]) for n in inv}
+
+
 def abroad_factors(race, horses):
-    """海外モード：前哨戦の内容、同じコースの実績、日本馬と重い馬場の相性"""
+    """海外モード：前哨戦、同じコースの実績、ゲート番、年齢、日本馬の馬体重と馬場、現地オッズ"""
     for h in horses:
         h['bAbroad'], h['abroadNotes'] = 0.0, []
     if not race.get('abroad'):
         return
     heavy = race['going'] in ('重', '不良')
+    N = len(horses)
+    bp = book_probs(race, horses)
+    race['bookProbs'] = bp
     for h in horses:
         b, notes = 0.0, []
         ls = [l for l in h['lines'] if l['pos'] > 0]
+        # 前哨戦・主要G1（前走・2走前）
         for i, l in enumerate(ls[:2]):
             w = 1.0 if i == 0 else 0.6
             ago = '前走' if i == 0 else '2走前'
-            if any(k in l['r'] for k in ARC_TRIALS):
-                add = {1: 0.02, 2: 0.012, 3: 0.006}.get(l['pos'], 0) * w
+            tk = next((k for k in ARC_TRIAL_W if k in l['r']), None)
+            if tk:
+                add = {1: 0.02, 2: 0.012, 3: 0.006}.get(l['pos'], 0) * w * ARC_TRIAL_W[tk]
                 if add:
                     b += add
                     notes.append(f"{ago}の同舞台の前哨戦{l['r']}で{l['pos']}着")
@@ -1466,14 +1571,45 @@ def abroad_factors(race, horses):
                 if add:
                     b += add
                     notes.append(f"{ago}の主要G1{l['r']}で{l['pos']}着")
+        # 同じ競馬場・距離での実績（勝ち数が多いほど）
         cs = h.get('career', h['lines'])
-        if any(l['p'] == race['venue'] and abs(dist_num(l['dist']) - race['dist']) <= 100 and 0 < l['pos'] <= 3 for l in cs):
-            b += 0.005
-            notes.append(f"{race['venue']}の{race['dist']}m前後で3着以内の実績あり")
-        if heavy and h.get('area') in ('日本', '美浦', '栗東'):
-            b -= 0.01
-            notes.append('日本馬は重い欧州の馬場で苦戦してきた歴史がある')
-        h['bAbroad'] = clamp(b, -0.015, 0.035)
+        wins_here = sum(1 for l in cs if l['p'] == race['venue'] and l['pos'] == 1)
+        top3_here = any(l['p'] == race['venue'] and abs(dist_num(l['dist']) - race['dist']) <= 100 and 0 < l['pos'] <= 3 for l in cs)
+        if wins_here or top3_here:
+            b += min(0.012, 0.003 * wins_here) + (0.004 if top3_here else 0)
+            notes.append(f"{race['venue']}で{wins_here}勝" + ("、同距離で3着以内の実績あり" if top3_here else ''))
+        # ゲート番（凱旋門賞：2019年以降、1〜5番が好成績、11番以降は不振）
+        g = h.get('gate')
+        if g and not race.get('provisional') and N >= 12:
+            if g <= 5:
+                b += 0.012; notes.append(f"{g}番ゲートの内枠（内が有利な傾向）")
+            elif g >= 11:
+                b -= 0.012; notes.append(f"{g}番ゲートの外枠（外は不振の傾向）")
+        # 年齢（4歳が最も好成績、6歳以上は3着以内なし。3歳は斤量増以降やや苦戦）
+        a = h.get('age')
+        if a:
+            if a >= 6:
+                b -= 0.02; notes.append(f"{a}歳（6歳以上は近年3着以内なし）")
+            elif a == 4:
+                b += 0.006; notes.append('4歳（年齢別で最も好成績）')
+        # 日本馬：馬体重（480kg以上は好走なし）と重い馬場
+        if h.get('area') in ('日本', '美浦', '栗東'):
+            bw_l = next((l for l in h['lines'] if re.match(r'^\d{3}', l.get('bw') or '')), None)
+            bw = int(bw_l['bw'][:3]) if bw_l else None
+            if bw and bw >= 480:
+                b -= 0.015; notes.append(f"日本馬で馬体重{bw}kg（480kg以上の日本馬は凱旋門賞で好走なし）")
+            elif bw and bw <= 469:
+                b += 0.005; notes.append(f"日本馬で馬体重{bw}kgの小柄な馬（好走は小柄な馬に集中）")
+            if heavy:
+                b -= 0.01; notes.append('日本馬は重い欧州の馬場で苦戦してきた歴史がある')
+        # 現地オッズ（欧州の市場の評価）。出走頭数に対する勝率の高さで加点・減点
+        if bp and h['n'] in bp:
+            p, o = bp[h['n']]
+            h['pBook'], h['oBook'] = p, o
+            add = clamp(0.012 * math.log(max(p * N, 1e-3)), -0.02, 0.03)
+            b += add
+            notes.append(f"現地オッズ{o}倍（現地で見た勝率{p * 100:.1f}%）" if o else '現地オッズに名前なし（大穴扱い）')
+        h['bAbroad'] = clamp(b, -0.05, 0.07)
         h['abroadNotes'] = notes
 
 
@@ -1914,9 +2050,15 @@ def analyze(text):
     predict_positions(race, horses)
     race['nige'] = sum(1 for h in horses if h['st'] == '逃')
 
+    highlevel_factors(race, horses)
     auto_heuristics(race, horses)
     extra_factors(race, horses, soup, race_id)
     arr = ranked(race, horses, odds)
+    if race.get('bookProbs'):
+        for h in arr:
+            if h.get('pBook') is not None:
+                h['evModel'] = h.get('ev')
+                h['ev'] = h['pBook'] * h['o'] if h.get('o') else None
     return (race, arr), None
 
 
@@ -1973,6 +2115,8 @@ def format_reply(race, arr):
         out += [b, ""]
     out.append("")
     out.append("※スコア×1.00が基準。S≥1.08／A≥1.03／B≥1.00／C≥0.96／D")
+    if race.get('bookProbs'):
+        out.append(f"※期待値は現地オッズから見た勝率×日本のオッズ（現地オッズ{race.get('bookUpdated', '')}時点）")
     msg = "\n".join(out)
     return msg[:4900]
 
@@ -2290,7 +2434,9 @@ def render_image(race, arr):
     y += box_h + 24
 
     ctext(d, W / 2, y, 'スコア×1.00基準　S≥1.08 ／ A≥1.03 ／ B≥1.00 ／ C≥0.96 ／ D', F('sans_r', 20), MUTED)
-    ctext(d, W / 2, y + 30, '※AIシミュレーションの参考値です。オッズは取得時点のもの', F('sans_r', 20), MUTED)
+    foot = (f"※期待値＝現地オッズから見た勝率×日本のオッズ（現地オッズ{race.get('bookUpdated', '')}時点）"
+            if race.get('bookProbs') else '※AIシミュレーションの参考値です。オッズは取得時点のもの')
+    ctext(d, W / 2, y + 30, fit_text(d, foot, F('sans_r', 20), W - 72), F('sans_r', 20), MUTED)
     return img
 
 
@@ -2387,6 +2533,8 @@ def make_reasons(race, h):
         R.append(('騎手データ', '。'.join(jt) + sgn(h.get('bJockey', 0))))
     if h.get('condNotes'):
         R.append(('状態', '、'.join(h['condNotes']) + sgn(h.get('bCond', 0))))
+    if h.get('hlNotes'):
+        R.append(('ハイレベル戦', '。'.join(h['hlNotes'][:3]) + sgn(h.get('bHL', 0))))
     if h.get('abroadNotes'):
         R.append(('海外レース', '。'.join(h['abroadNotes']) + sgn(h.get('bAbroad', 0))))
     if h.get('moveNotes'):
@@ -2413,7 +2561,7 @@ def sgn(v):
 SHORT_HEAD = {'総合評価': '総合評価', '過去レースのレベル': 'レース格', '対戦相手のその後': '対戦相手',
               '近走': '近走', 'コース・距離適性': '適性', '脚質・展開': '展開', '騎手・条件': '騎手・斤量',
               '道悪適性': '道悪', '穴馬チェック': '穴馬', '血統・厩舎': '血統', 'タイム': 'タイム',
-              '上がり': '上がり', '枠順': '枠順', '当日の馬場': '当日馬場', '騎手データ': '騎手成績', '状態': '状態', '全成績から': '全成績', '近走の中身': '近走の中身', 'コース特性': 'コース', '格付け': '格付け', '海外レース': '海外'}
+              '上がり': '上がり', '枠順': '枠順', '当日の馬場': '当日馬場', '騎手データ': '騎手成績', '状態': '状態', '全成績から': '全成績', '近走の中身': '近走の中身', 'コース特性': 'コース', '格付け': '格付け', '海外レース': '海外', 'ハイレベル戦': 'ハイレベル'}
 
 
 _cw_cache = {}
@@ -2772,6 +2920,151 @@ def stats_text():
 
 
 # ═════════════════════════════════════════
+# 対話型コマンド（直前に予想したレースについて「血統」「馬場」「3000円」「ハイレベル」などに答える）
+# ═════════════════════════════════════════
+USER_SESSIONS = {}          # {LINEのユーザーID: (保存時刻, race, arr)}
+SESSION_TTL = 30 * 60
+
+
+def save_session(uid, race, arr):
+    now = time.time()
+    for k in [k for k, v in USER_SESSIONS.items() if now - v[0] > SESSION_TTL]:
+        USER_SESSIONS.pop(k, None)
+    USER_SESSIONS[uid] = (now, race, arr)
+
+
+def get_session(uid):
+    v = USER_SESSIONS.get(uid)
+    return (v[1], v[2]) if v and time.time() - v[0] <= SESSION_TTL else None
+
+
+def pedigree_text(race, arr):
+    wet = race['going'] != '良' or race.get('abroad')
+    rows = []
+    for h in arr:
+        sc, why = 0.0, []
+        if h['sire'] in EURO_SIRES or h['sire'] in JP_SIRE_EURO_PARENT:
+            sc += 2; why.append(f"父{h['sire']}は欧州系")
+        if h.get('damsire') in EURO_SIRES:
+            sc += 1; why.append(f"母父{h['damsire']}は欧州系")
+        if wet and h['sire'] in SIRE_MUD:
+            sc += SIRE_MUD[h['sire']] / 5 * 1.5; why.append(f"父{h['sire']}は道悪巧者")
+        if h['sire'] in SIRE_CLASS:
+            sc += (SIRE_CLASS[h['sire']] - 3) * 0.5; why.append(f"父{h['sire']}は上級クラスの産駒が多い")
+        sc += (h.get('fit', 3) - 3) * 0.5
+        if h.get('fit', 3) >= 4:
+            why.append('今回の距離・コースの実績あり')
+        rows.append((sc, h, why))
+    rows.sort(key=lambda x: -x[0])
+    out = [f"🧬 血統適性ランキング（{race['venue']}{race['R']}R {race['surf']}{race['dist']}m・{race['going']}）", ""]
+    for i, (sc, h, why) in enumerate(rows[:5], 1):
+        out.append(f"{i}位 {h['n']}番 {h['name']}")
+        out.append(f"　父{h['sire'] or '不明'}／母父{h.get('damsire') or '不明'}")
+        if why:
+            out.append('　' + '、'.join(why))
+    return '\n'.join(out)
+
+
+def going_text(race, arr):
+    out = [f"🌧 馬場の見立て（{race['venue']}{race['R']}R）", "",
+           f"馬場：{race['going']}" + ('（あなたが指定）' if race.get('going_manual') else '' if race['going_known'] else '（未発表のため良で計算）')]
+    tb = race.get('trackBias')
+    if tb:
+        out.append(f"今日の{race['surf']}の傾向：{tb['text']}（終わった{tb['races']}レースから）")
+    if race.get('course'):
+        out.append(f"コースの特徴：{race['course']['note']}")
+    if race.get('abroad'):
+        out.append("欧州の馬場は雨で急に重くなります。URLの後ろに「重」などと付けて送ると、その馬場で計算し直します")
+    mud = sorted([h for h in arr if h.get('mudM')], key=lambda h: -h['mudM'])[:5]
+    if mud:
+        out += ["", "道悪が得意そうな馬（血統・馬格・実績から）"]
+        for h in mud:
+            out.append(f"・{h['n']}番 {h['name']}：{'、'.join(h.get('mudParts') or ['馬格から判定'])}")
+    bw = [h for h in arr if h.get('bwDiff') is not None and abs(h['bwDiff']) >= 10]
+    if bw:
+        out += ["", "当日の馬体重で注意"]
+        for h in bw:
+            out.append(f"・{h['n']}番 {h['name']}：{h['bwNow']}kg（{h['bwDiff']:+d}）")
+    return '\n'.join(out)
+
+
+def budget_text(race, arr, budget):
+    """おすすめ買い目を、予算内に100円単位で割り振る"""
+    budget = budget // 100 * 100
+    if budget < 100:
+        return "予算は100円以上で送ってください（例：3000円）"
+    items = []   # (見出し, 券種, 組み合わせ)
+    for b in bet_plan(arr):
+        for kind, combos in b['parts']:
+            items.append((b['label'], kind, combos))
+    use, skipped, left = [], [], budget
+    for lab, kind, combos in items:
+        cost = 100 * len(combos)
+        if cost <= left:
+            use.append([lab, kind, combos, 100])
+            left -= cost
+        else:
+            skipped.append(f"{lab} {kind}（{len(combos)}点）")
+    # 余ったお金は、当たりやすい単勝・ワイド・馬連に上乗せ
+    thick = [u for u in use if u[1] in ('単勝', 'ワイド', '馬連') and u[0] in ('推奨', '本線')]
+    i = 0
+    while thick and left >= 100 * len(thick[i % len(thick)][2]):
+        u = thick[i % len(thick)]
+        u[3] += 100
+        left -= 100 * len(u[2])
+        i += 1
+    out = [f"💰 資金配分プラン（予算{budget:,}円）", f"{race['venue']}{race['R']}R {race['name']}", ""]
+    total = 0
+    for lab, kind, combos, per in use:
+        c = per * len(combos)
+        total += c
+        cs = ', '.join('-'.join(map(str, x)) if len(x) > 1 else str(x[0]) for x in combos[:6])
+        more = f" ほか{len(combos) - 6}点" if len(combos) > 6 else ''
+        out.append(f"【{lab}】{kind} {cs}{more}")
+        out.append(f"　1点{per}円 × {len(combos)}点 ＝ {c:,}円")
+    out += ["", f"合計 {total:,}円（残り{budget - total:,}円）"]
+    if skipped:
+        out.append("予算が足りず外したもの：" + '、'.join(skipped))
+    out.append("※当たりやすい単勝・ワイド・馬連を厚めにしています")
+    return '\n'.join(out)
+
+
+def highlevel_text(race, arr):
+    hs = [h for h in arr if h.get('hlNotes')]
+    if not hs:
+        return "🔥 このレースには、ハイレベル戦を経験した馬が見つかりませんでした"
+    hs.sort(key=lambda h: (h['rk'] <= 3, h['rk']))   # 人気（上位）以外を先に
+    out = [f"🔥 特注馬（ハイレベル戦の経験馬）{race['venue']}{race['R']}R", ""]
+    for h in hs[:6]:
+        mark = MARKS[h['rk'] - 1] if h['rk'] <= len(MARKS) else '　'
+        out.append(f"{mark}{h['n']}番 {h['name']}（予想{h['rk']}位・{h['o'] or '―'}倍）")
+        for n_ in h['hlNotes'][:2]:
+            out.append('　' + n_)
+    return '\n'.join(out)
+
+
+def command_reply(text, uid):
+    """対話型コマンドなら返事の文章を、そうでなければ None"""
+    t = text.strip()
+    bm = re.fullmatch(r'(?:予算)?\s*([\d,]+)\s*円', t)
+    cmd = '血統' if t == '血統' else '馬場' if t == '馬場' else 'ハイレベル' if t in ('ハイレベル', '特注馬') \
+        else '予算' if bm else None
+    if not cmd:
+        return None
+    sess = get_session(uid)
+    if not sess:
+        return "先にレースのURLを送ってください。予想のあと30分間は「血統」「馬場」「3000円」「ハイレベル」で詳しく答えます"
+    race, arr = sess
+    if cmd == '血統':
+        return pedigree_text(race, arr)
+    if cmd == '馬場':
+        return going_text(race, arr)
+    if cmd == 'ハイレベル':
+        return highlevel_text(race, arr)
+    return budget_text(race, arr, int(bm.group(1).replace(',', '')))
+
+
+# ═════════════════════════════════════════
 # LINE
 # ═════════════════════════════════════════
 @app.route("/")
@@ -2802,16 +3095,21 @@ def handle_message(event):
     text = event.message.text.strip()
     print(f'[recv] {text[:80]}', flush=True)
     base = public_base_url()
-    threading.Thread(target=process_message, args=(event.reply_token, text, base), daemon=True).start()
+    uid = getattr(event.source, 'user_id', None) or 'anon'
+    threading.Thread(target=process_message, args=(event.reply_token, text, base, uid), daemon=True).start()
 
 
-def build_messages(text, base):
+def build_messages(text, base, uid='anon'):
     """予想を作って、LINEに送るメッセージのリストと、返信後にやる処理を返す"""
     if text in ('成績', '成績確認'):
         return [TextSendMessage(text=stats_text())], None
+    cr = command_reply(text, uid)
+    if cr:
+        return [TextSendMessage(text=cr[:4900])], None
     msgs, race_arr = _build_prediction(text, base)
     after = None
     if race_arr:
+        save_session(uid, *race_arr)
         def after():
             record_prediction(*race_arr)
             settle_pending(limit=10)
@@ -2819,9 +3117,10 @@ def build_messages(text, base):
 
 
 def _build_prediction(text, base):
-    if not ("netkeiba.com" in text or re.fullmatch(r'\d{12}', text)):
+    if not ("netkeiba.com" in text or re.fullmatch(r'\d{12}', text) or re.fullmatch(r'\d{4}[A-Z][0-9A-Za-z]{7}(\s+\S+)?', text)):
         return [TextSendMessage(text="netkeibaの出馬表のURL（またはレースID12桁）を送ってください！\n"
-                                     "「成績」と送ると、これまでの予想の成績を確認できます。")], None
+                                     "「成績」と送ると、これまでの予想の成績を確認できます。\n"
+                                     "予想のあと30分間は「血統」「馬場」「3000円（予算）」「ハイレベル」でも答えます。")], None
     try:
         result, err = analyze(text)
     except requests.HTTPError as e:
@@ -2853,11 +3152,11 @@ def _build_prediction(text, base):
                                      + format_reply(race, arr))], (race, arr)
 
 
-def process_message(reply_token, text, base):
+def process_message(reply_token, text, base, uid='anon'):
     t0 = time.time()
     after = None
     try:
-        messages, after = build_messages(text, base)
+        messages, after = build_messages(text, base, uid)
     except Exception as e:
         traceback.print_exc()
         messages = [TextSendMessage(text=f"予想中にエラーが発生しました。\n詳細: {e}")]
