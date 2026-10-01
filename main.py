@@ -2976,8 +2976,16 @@ def parse_payouts(soup):
 def settle_one(row):
     """1レース分の答え合わせ。結果がまだなら None"""
     site = row.get('site') or 'https://race.netkeiba.com'
-    soup = fetch_soup(f"{site}/race/result.html?race_id={row['race_id']}")
-    order = parse_result_order(soup)
+    pages = ['result_abroad.html', 'result.html'] if is_abroad_id(row['race_id']) else ['result.html']
+    order, soup = {}, None
+    for pg in pages:   # 海外レースは結果ページの名前が違うことがあるので、順に探す
+        try:
+            soup = fetch_soup(f"{site}/race/{pg}?race_id={row['race_id']}")
+        except Exception:
+            continue
+        order = parse_result_order(soup)
+        if order:
+            break
     if not any(v == 1 for v in order.values()):
         return None
     pays = parse_payouts(soup)
