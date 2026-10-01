@@ -2285,13 +2285,8 @@ def gold_frame(d, box, r=14, w=2):
 def render_image(race, arr):
     W, PAD = 1080, 36
     row_h = 92
-    blist = bets(arr)
-    tmp = ImageDraw.Draw(Image.new('RGB', (10, 10)))
-    bet_rows = []
-    for line in blist:
-        lab, rest_ = (line.split(' ', 1) + [''])[:2]
-        bet_rows.append((lab, wrap(tmp, rest_, F('sans_b', 28), W - PAD * 2 - 170)))
-    bet_h = sum(22 + 40 * len(ls) for _, ls in bet_rows)
+    brows = bet_rows_for(arr)
+    bet_h = 92 + bet_section_height(brows, W - PAD * 2 - 120) - 80   # 下の「box_h = 80 + bet_h」に合わせる
     LU_H = lineup_height(race)
     H = 610 + LU_H + 64 + row_h * len(arr) + 40 + 90 + bet_h + 120
 
@@ -2418,25 +2413,175 @@ def render_image(race, arr):
     y += row_h * len(arr) + 30
 
     # ── 買い目 ──
-    box_h = 80 + bet_h
-    d.rounded_rectangle((PAD, y, W - PAD, y + box_h), radius=16, fill=(14, 22, 42))
-    gold_frame(d, (PAD, y, W - PAD, y + box_h), r=16)
-    ctext(d, W / 2, y + 16, '― おすすめ買い目 ―', F('serif_b', 36), GOLD)
-    LC = {'推奨': (220, 110, 40), '本線': (200, 160, 70), '妙味': (38, 160, 80), '穴': (214, 60, 60), '高目': (150, 80, 200)}
-    fl = F('sans_b', 26)
-    yy = y + 78
-    for lab, lines in bet_rows:
-        d.rounded_rectangle((PAD + 24, yy, PAD + 124, yy + 44), radius=22, fill=LC.get(lab, GOLD_D))
-        ctext(d, PAD + 74, yy + 6, lab, fl, (255, 255, 255))
-        for k, ln in enumerate(lines):
-            d.text((PAD + 144, yy + 5 + k * 40), ln, font=F('sans_b', 28), fill=SILVER)
-        yy += 22 + 40 * len(lines)
+    box_h = draw_bet_section(d, PAD, y, W - PAD, brows, {h['n']: h.get('w') for h in arr})
     y += box_h + 24
 
     ctext(d, W / 2, y, 'スコア×1.00基準　S≥1.08 ／ A≥1.03 ／ B≥1.00 ／ C≥0.96 ／ D', F('sans_r', 20), MUTED)
     foot = (f"※期待値＝現地オッズから見た勝率×日本のオッズ（現地オッズ{race.get('bookUpdated', '')}時点）"
             if race.get('bookProbs') else '※AIシミュレーションの参考値です。オッズは取得時点のもの')
     ctext(d, W / 2, y + 30, fit_text(d, foot, F('sans_r', 20), W - 72), F('sans_r', 20), MUTED)
+    return img
+
+
+# ═════════════════════════════════════════
+# 買い目の表示（券種ごとに色分けしたカード）と予算の割り振り
+# ═════════════════════════════════════════
+CAT_COLOR = {'推奨': (226, 112, 40), '本線': (201, 160, 70), '妙味': (40, 165, 85), '穴': (216, 62, 62), '高目': (150, 85, 205)}
+KIND_COLOR = {'単勝': (224, 86, 86), '複勝': (234, 140, 70), '馬連': (60, 135, 225), 'ワイド': (40, 175, 160),
+              '馬単': (90, 110, 230), '3連複': (140, 105, 225), '3連単': (214, 72, 160), '枠連': (120, 140, 160)}
+CAT_W = {'推奨': 0.15, '本線': 0.40, '妙味': 0.10, '穴': 0.10, '高目': 0.25}      # 予算の割合（項目ごと）
+SUB_W = {'本線': {'馬連': 0.30, 'ワイド': 0.30, '3連複': 0.25, '3連単': 0.15},
+         '妙味': {'単勝': 0.5, '複勝': 0.5}, '高目': {'3連単': 0.5, '3連複': 0.5}}
+
+
+def bet_rows_for(arr):
+    """bet_plan を、画像に描くための行（1行＝1券種）に直す"""
+    rows = []
+    for b in bet_plan(arr):
+        text = b['text']
+        note = ''
+        nm = re.search(r'（([^（）]*(?:期待値|◎)[^（）]*)）', text)
+        if nm:
+            note = nm.group(1)
+            text = text.replace(nm.group(0), '')
+        text = re.sub(r'（\d+点）', '', text).strip()
+        body = re.sub(r'^(単勝|複勝|単複|馬連|ワイド|馬単|3連複|3連単)\s*', '', text)
+        for kind, combos in b['parts']:
+            rows.append({'label': b['label'], 'kind': kind, 'combos': combos, 'body': body, 'note': note,
+                         'n': len(combos), 'per': None, 'amount': None})
+    return rows
+
+
+def allocate_budget(arr, budget):
+    """予算を、各項目（推奨・本線・妙味・穴・高目）の割合で100円単位に割り振る"""
+    rows = bet_rows_for(arr)
+    budget = budget // 100 * 100
+    for r in rows:
+        sub = SUB_W.get(r['label'], {}).get(r['kind'])
+        same = [x for x in rows if x['label'] == r['label']]
+        share = sub if sub is not None else 1 / len(same)
+        r['target'] = budget * CAT_W.get(r['label'], 0.1) * share
+        r['per'] = int(r['target'] // (100 * r['n'])) * 100
+    left = budget - sum(r['per'] * r['n'] for r in rows)
+    # 割合では1点100円に届かなかった項目も、予算が残っていれば100円ずつ入れる（大事な順）
+    order = sorted(rows, key=lambda r: list(CAT_W).index(r['label']) if r['label'] in CAT_W else 9)
+    for r in order:
+        if r['per'] == 0 and left >= 100 * r['n']:
+            r['per'] = 100
+            left -= 100 * r['n']
+    # 余りは、当たりやすい順（推奨→本線の馬連・ワイド→妙味）に100円ずつ上乗せ
+    thick = [r for r in order if r['per'] > 0 and r['kind'] in ('単勝', '複勝', '馬連', 'ワイド')]
+    i = 0
+    while thick and left >= 100:
+        r = thick[i % len(thick)]
+        if left >= 100 * r['n']:
+            r['per'] += 100
+            left -= 100 * r['n']
+        elif all(left < 100 * x['n'] for x in thick):
+            break
+        i += 1
+    used = [r for r in rows if r['per'] > 0]
+    for r in used:
+        r['amount'] = r['per'] * r['n']
+    skipped = [r for r in rows if r['per'] == 0]
+    return used, skipped, budget
+
+
+def _row_lines(d, r, maxw):
+    simple = all(len(c) <= 2 for c in r['combos']) and r['n'] <= 4
+    return [] if simple else wrap(d, r['body'], F('sans_b', 27), maxw)
+
+
+def bet_section_height(rows, inner_w):
+    tmp = ImageDraw.Draw(Image.new('RGB', (10, 10)))
+    h = 0
+    for r in rows:
+        lines = _row_lines(tmp, r, inner_w)
+        h += 24 + 46 + (54 if not lines else 12 + 38 * len(lines)) + (36 if r['note'] else 0) + 14
+    return h
+
+
+def draw_bet_section(d, x0, y0, x1, rows, wmap, title='― おすすめ買い目 ―', sub=''):
+    """買い目をカードで描く。1行＝1券種。左に項目（推奨・本線…）の色帯、券種のバッジ、組み合わせ、金額"""
+    inner_w = x1 - x0 - 120
+    box_h = 92 + (34 if sub else 0) + bet_section_height(rows, inner_w)
+    d.rounded_rectangle((x0, y0, x1, y0 + box_h), radius=18, fill=(12, 19, 38))
+    gold_frame(d, (x0, y0, x1, y0 + box_h), r=18)
+    ctext(d, (x0 + x1) / 2, y0 + 16, title, F('serif_b', 36), GOLD)
+    y = y0 + 72
+    if sub:
+        ctext(d, (x0 + x1) / 2, y - 4, sub, F('sans_b', 24), SILVER)
+        y += 34
+    for r in rows:
+        lines = _row_lines(d, r, inner_w)
+        rh = 24 + 46 + (54 if not lines else 12 + 38 * len(lines)) + (36 if r['note'] else 0)
+        cc = CAT_COLOR.get(r['label'], GOLD_D)
+        # カード本体と左の色帯
+        d.rounded_rectangle((x0 + 18, y, x1 - 18, y + rh), radius=14, fill=(22, 32, 58))
+        d.rounded_rectangle((x0 + 18, y, x0 + 30, y + rh), radius=6, fill=cc)
+        # 見出し：項目の札＋券種のバッジ
+        cx, cy = x0 + 46, y + 14
+        d.rounded_rectangle((cx, cy, cx + 84, cy + 40), radius=20, fill=cc)
+        ctext(d, cx + 42, cy + 5, r['label'], F('sans_b', 24), (255, 255, 255))
+        kc = KIND_COLOR.get(r['kind'], (110, 120, 140))
+        kw = tw(d, r['kind'], F('sans_b', 26)) + 30
+        d.rounded_rectangle((cx + 96, cy, cx + 96 + kw, cy + 40), radius=8, fill=kc)
+        ctext(d, cx + 96 + kw / 2, cy + 4, r['kind'], F('sans_b', 26), (255, 255, 255))
+        d.text((cx + 96 + kw + 14, cy + 7), f"{r['n']}点", font=F('sans_r', 24), fill=MUTED)
+        # 右側：金額（予算モード）
+        if r.get('amount'):
+            amt = f"{r['amount']:,}円"
+            d.text((x1 - 40 - tw(d, amt, F('sans_b', 34)), cy - 2), amt, font=F('sans_b', 34), fill=GOLD)
+            per = f"1点{r['per']:,}円"
+            d.text((x1 - 40 - tw(d, per, F('sans_r', 20)), cy + 42), per, font=F('sans_r', 20), fill=MUTED)
+        # 組み合わせ
+        by = y + 70
+        if not lines:
+            bx = x0 + 50
+            for c in r['combos']:
+                for k, num in enumerate(c):
+                    bg, fg = WAKU.get(wmap.get(num) or 0, ((245, 245, 245), (20, 20, 20)))
+                    d.ellipse((bx, by, bx + 44, by + 44), fill=bg, outline=GOLD_D, width=2)
+                    ctext(d, bx + 22, by + 6, str(num), F('sans_b', 24), fg)
+                    bx += 48
+                    if k < len(c) - 1:
+                        d.text((bx, by + 4), '-', font=F('sans_b', 28), fill=MUTED)
+                        bx += 18
+                bx += 30
+            by += 54
+        else:
+            for k, ln in enumerate(lines):
+                d.text((x0 + 50, by + 6 + k * 38), ln, font=F('sans_b', 27), fill=SILVER)
+            by += 12 + 38 * len(lines)
+        if r['note']:
+            d.text((x0 + 50, by), r['note'], font=F('sans_r', 22), fill=(130, 215, 150) if '期待値' in r['note'] else MUTED)
+        y += rh + 14
+    return box_h
+
+
+def render_budget_image(race, arr, budget):
+    """予算を割り振った買い目の画像"""
+    used, skipped, budget = allocate_budget(arr, budget)
+    W, PAD = 1080, 36
+    total = sum(r['amount'] for r in used)
+    wmap = {h['n']: h.get('w') for h in arr}
+    inner_h = 92 + 34 + bet_section_height(used, W - PAD * 2 - 120)
+    H = 230 + inner_h + (70 if skipped else 0) + 90
+    img = gradient_bg(W, H)
+    d = ImageDraw.Draw(img)
+    gold_frame(d, (14, 14, W - 14, H - 14), r=22, w=3)
+    ctext(d, W / 2, 40, '資金配分プラン', F('serif_b', 52), GOLD)
+    title = f"{race['venue']}{race['R']}R  {race['name']}"
+    ctext(d, W / 2, 112, fit_text(d, title, F('sans_b', 34), W - PAD * 2), F('sans_b', 34), SILVER)
+    ctext(d, W / 2, 162, f"予算 {budget:,}円 ／ 使う金額 {total:,}円（残り {budget - total:,}円）", F('sans_b', 28), GOLD)
+    y = 214
+    sub = '推奨15%・本線40%・妙味10%・穴10%・高目25%を目安に配分'
+    y += draw_bet_section(d, PAD, y, W - PAD, used, wmap, title='― 買い目と金額 ―', sub=sub) + 16
+    if skipped:
+        t = '予算が足りず外したもの：' + '、'.join(f"{r['label']}{r['kind']}（{r['n']}点）" for r in skipped)
+        ctext(d, W / 2, y, fit_text(d, t, F('sans_r', 22), W - PAD * 2), F('sans_r', 22), MUTED)
+        y += 40
+    ctext(d, W / 2, y + 10, '※当たりやすい単勝・ワイド・馬連に端数を上乗せしています', F('sans_r', 20), MUTED)
     return img
 
 
@@ -2989,43 +3134,19 @@ def going_text(race, arr):
 
 
 def budget_text(race, arr, budget):
-    """おすすめ買い目を、予算内に100円単位で割り振る"""
-    budget = budget // 100 * 100
+    """予算を各項目に割り振った買い目（文章版）"""
     if budget < 100:
         return "予算は100円以上で送ってください（例：3000円）"
-    items = []   # (見出し, 券種, 組み合わせ)
-    for b in bet_plan(arr):
-        for kind, combos in b['parts']:
-            items.append((b['label'], kind, combos))
-    use, skipped, left = [], [], budget
-    for lab, kind, combos in items:
-        cost = 100 * len(combos)
-        if cost <= left:
-            use.append([lab, kind, combos, 100])
-            left -= cost
-        else:
-            skipped.append(f"{lab} {kind}（{len(combos)}点）")
-    # 余ったお金は、当たりやすい単勝・ワイド・馬連に上乗せ
-    thick = [u for u in use if u[1] in ('単勝', 'ワイド', '馬連') and u[0] in ('推奨', '本線')]
-    i = 0
-    while thick and left >= 100 * len(thick[i % len(thick)][2]):
-        u = thick[i % len(thick)]
-        u[3] += 100
-        left -= 100 * len(u[2])
-        i += 1
+    used, skipped, budget = allocate_budget(arr, budget)
+    total = sum(r['amount'] for r in used)
     out = [f"💰 資金配分プラン（予算{budget:,}円）", f"{race['venue']}{race['R']}R {race['name']}", ""]
-    total = 0
-    for lab, kind, combos, per in use:
-        c = per * len(combos)
-        total += c
-        cs = ', '.join('-'.join(map(str, x)) if len(x) > 1 else str(x[0]) for x in combos[:6])
-        more = f" ほか{len(combos) - 6}点" if len(combos) > 6 else ''
-        out.append(f"【{lab}】{kind} {cs}{more}")
-        out.append(f"　1点{per}円 × {len(combos)}点 ＝ {c:,}円")
-    out += ["", f"合計 {total:,}円（残り{budget - total:,}円）"]
+    for r in used:
+        out.append(f"【{r['label']}】{r['kind']} {r['body']}")
+        out.append(f"　1点{r['per']:,}円 × {r['n']}点 ＝ {r['amount']:,}円")
+        out.append("")
+    out.append(f"合計 {total:,}円（残り{budget - total:,}円）")
     if skipped:
-        out.append("予算が足りず外したもの：" + '、'.join(skipped))
-    out.append("※当たりやすい単勝・ワイド・馬連を厚めにしています")
+        out.append("予算が足りず外したもの：" + '、'.join(f"{r['label']}{r['kind']}（{r['n']}点）" for r in skipped))
     return '\n'.join(out)
 
 
@@ -3043,12 +3164,22 @@ def highlevel_text(race, arr):
     return '\n'.join(out)
 
 
+def parse_budget(text):
+    """「3000円」「予算5,000円」「１万円」「1万5千円」「予算 8000」などから金額を読む。読めなければ None"""
+    t = norm_digits(text.strip()).replace('，', ',').replace(',', '').replace(' ', '').replace('　', '')
+    m = re.fullmatch(r'(?:予算)?(?:(\d+)万)?(?:(\d+)千)?(\d+)?円?', t)
+    if not m or not any(m.groups()) or (not t.endswith('円') and not t.startswith('予算')):
+        return None
+    man, sen, rest = (int(x) if x else 0 for x in m.groups())
+    return man * 10000 + sen * 1000 + rest
+
+
 def command_reply(text, uid):
     """対話型コマンドなら返事の文章を、そうでなければ None"""
     t = text.strip()
-    bm = re.fullmatch(r'(?:予算)?\s*([\d,]+)\s*円', t)
+    bv = parse_budget(t)
     cmd = '血統' if t == '血統' else '馬場' if t == '馬場' else 'ハイレベル' if t in ('ハイレベル', '特注馬') \
-        else '予算' if bm else None
+        else '予算' if bv is not None else None
     if not cmd:
         return None
     sess = get_session(uid)
@@ -3061,7 +3192,7 @@ def command_reply(text, uid):
         return going_text(race, arr)
     if cmd == 'ハイレベル':
         return highlevel_text(race, arr)
-    return budget_text(race, arr, int(bm.group(1).replace(',', '')))
+    return budget_text(race, arr, bv)
 
 
 # ═════════════════════════════════════════
@@ -3103,6 +3234,22 @@ def build_messages(text, base, uid='anon'):
     """予想を作って、LINEに送るメッセージのリストと、返信後にやる処理を返す"""
     if text in ('成績', '成績確認'):
         return [TextSendMessage(text=stats_text())], None
+    bv = parse_budget(text)
+    sess = get_session(uid) if bv else None
+    if bv and sess and bv >= 100:
+        race, arr = sess
+        budget = bv
+        msgs = []
+        try:
+            if fonts_ok(20):
+                with _render_lock:
+                    key = save_image(render_budget_image(race, arr, budget))
+                msgs.append(ImageSendMessage(original_content_url=f"{base}/img/{key}.png",
+                                             preview_image_url=f"{base}/img/{key}_pv.jpg"))
+        except Exception:
+            traceback.print_exc()
+        msgs.append(TextSendMessage(text=budget_text(race, arr, budget)[:4900]))
+        return msgs, None
     cr = command_reply(text, uid)
     if cr:
         return [TextSendMessage(text=cr[:4900])], None
