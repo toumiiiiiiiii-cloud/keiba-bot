@@ -682,7 +682,140 @@ def ranked(race, horses, odds):
         h['ev'] = h['p'] * h['o'] if h['o'] else None
         h['anaScore'] = h['ana'] + max(0, h['mudb']) * (1 if going in ('重', '不良') else 0)
         h['anaFlag'] = h['rk'] >= 4 and h['anaScore'] >= 0.02
+    if apply_model(race, arr, odds):
+        # 新方式の勝率の高い順に並べ直す（印もこの順）。評価は「平均的な馬の何倍勝ちやすいか」で付け直す
+        arr.sort(key=lambda h: -h['p'])
+        N = len(arr)
+        for i, h in enumerate(arr):
+            h['rk'] = i + 1
+            r_ = h['p'] * N
+            h['rank'] = 'S' if r_ >= 2.0 else 'A' if r_ >= 1.3 else 'B' if r_ >= 0.8 else 'C' if r_ >= 0.5 else 'D'
+            h['anaFlag'] = h['rk'] >= 4 and h['anaScore'] >= 0.02
     return arr
+
+
+# ═════════════════════════════════════════
+# 新方式：オッズ＋AI（過去5年分のデータで学習した重み data/model_weights.json）
+#   ・オッズ（市場の評価）を土台に、AIの材料で補正して勝率を出す
+#   ・材料の計算は model_row() の1か所だけ。バックテストもBotも同じものを使う
+#   ・オッズが半分以上そろっていないとき（前日など）や海外レースは、今までのAIだけで計算する
+# ═════════════════════════════════════════
+MODEL_BASE = ['lv', 'form', 'fit', 'jk', 'paceAdj', 'mudb', 'ana', 'rl', 'bTime', 'bAgari', 'bDraw', 'bTrack',
+              'bJockey', 'bCond', 'bCareer', 'bPos', 'bFlow', 'bHL']
+MODEL = None
+try:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'model_weights.json'), encoding='utf-8') as _f:
+        MODEL = json.load(_f)
+    print(f"[model] オッズ＋AIの重みを読み込み：材料{len(MODEL['names'])}個（学習 {MODEL.get('trained_range', '')}）", flush=True)
+except Exception as _e:
+    print(f"[model] 重みのファイルなし（今までのAIだけで計算）: {_e}", flush=True)
+
+
+def model_row(race, h, N):
+    """新方式の材料（オッズ以外）を作る。値はすべて数字。バックテストとBotで共通"""
+    f = {}
+    for k in MODEL_BASE:
+        v = h.get(k)
+        f[k] = float(v) if isinstance(v, (int, float)) else 0.0
+    si = h.get('si')
+    f['si'] = float(si) if si is not None else 0.0
+    f['si_missing'] = 0.0 if si is not None else 1.0
+    ag = h.get('agRank')
+    f['agRankR'] = (ag - 1) / max(1, N - 1) if ag else 0.5
+    lines = [l for l in h.get('lines', []) if is_flat(l)]
+    l0 = lines[0] if lines else None
+    ran = bool(l0 and l0['pos'] > 0)
+    # 前走の負け方と人気の落ち方
+    f['lastGap'] = clamp((l0['pos'] - l0['pop']) / 10, -1.5, 1.5) if ran and l0.get('pop') else 0.0
+    f['lastPosR'] = (l0['pos'] - 1) / max(1, (l0.get('f') or 16) - 1) if ran else 0.5
+    f['lastMargin'] = min(max(0.0, l0['m']), 3.0) if ran and not l0.get('mEst') else 1.0
+    # 条件の変わり目
+    d0 = dist_num(l0['dist']) if l0 else race['dist']
+    f['distChg'] = (race['dist'] - d0) / 1000
+    f['distChgAbs'] = abs(f['distChg'])
+    f['surfChg'] = 1.0 if l0 and l0['dist'][:1] != race['surf'] else 0.0
+    f['venueChg'] = 1.0 if l0 and l0['p'] != race['venue'] else 0.0
+    f['clsChg'] = clamp(CLS[race['clsIdx']][1] - CLS[class_of_text(l0['r'], l0['p'])][1], -3, 3) if l0 else 0.0
+    # 間隔・馬体重・斤量・キャリア・年齢・性別
+    w = h.get('weeksCalc', h.get('weeks'))
+    f['offLog'] = math.log1p(w) if w is not None else math.log1p(4)
+    f['noRun'] = 0.0 if lines else 1.0
+    f['bwd'] = clamp((h.get('bwDiff') or 0) / 10, -3, 3)
+    f['bwdAbs'] = abs(f['bwd'])
+    f['wtChg'] = clamp((h['wt'] - l0['w']) / 2, -4, 4) if l0 and l0.get('w') and h.get('wt') else 0.0
+    f['careerLog'] = math.log1p(len(h.get('career') or h.get('lines') or []))
+    f['age'] = float((h.get('age') or 4) - 4)
+    f['female'] = 1.0 if h.get('sex') == '牝' else 0.0
+    # 枠（短距離ほど効く）
+    dp = draw_pos(h, N)
+    f['draw'] = dp
+    f['drawShort'] = dp if race['dist'] <= 1400 else 0.0
+    # 騎手の「売れすぎ度」（勝った数－オッズから見た勝ちの見込み）。学習データから作った表
+    f['jkBias'] = float(h.get('jkBias') or 0.0)
+
+    # ── 不利があったらしい前走（不利の記録は無いので、通過順と上がりから推測する） ──
+    # ① 出遅れの推定：前走の最初のコーナーの位置が、その馬のふだん（2〜5走前）よりずっと後ろ
+    def first_ratio(l):
+        mm = re.match(r'(\d+)', l.get('ps') or '')
+        n_ = l.get('f') or 0
+        return (int(mm.group(1)) - 1) / (n_ - 1) if mm and n_ > 1 else None
+    r0 = first_ratio(l0) if ran else None
+    usual = [x for x in (first_ratio(l) for l in lines[1:5]) if x is not None]
+    if r0 is not None and usual:
+        dev = r0 - sum(usual) / len(usual)
+        f['startDev'] = clamp(dev, -1.0, 1.0)
+        f['lateStart'] = 1.0 if dev >= 0.35 and sum(usual) / len(usual) <= 0.5 else 0.0
+    else:
+        f['startDev'], f['lateStart'] = 0.0, 0.0
+    # ② 脚を余した負けの推定：前走の上がりがメンバー3位以内なのに、5着以下
+    f['l3GoodLoss'] = 0.0
+    c0 = next((l for l in (h.get('career') or []) if l['pos'] > 0 and is_flat(l)), None)
+    if c0 and c0.get('rid') and c0['pos'] >= 5:
+        res = (parse_result_full(c0['rid']) if os.environ.get('SYH_BACKTEST')
+               else (_cache.get(('res', c0['rid'])) or (0, None))[1])   # Botでは取得済みの結果だけ使う（待たない）
+        if res:
+            me = next((r for r in res['rows'] if r['n'] == c0.get('n')), None)
+            l3s = sorted(r['l3'] for r in res['rows'] if r.get('l3'))
+            if me and me.get('l3') and l3s and l3s.index(me['l3']) <= 2:
+                f['l3GoodLoss'] = (c0['pos'] - 1) / max(1, res['N'] - 1)
+    # ③ 人気の落ち方：今回の人気－前走の人気（＋は人気を落とした）
+    pn = h.get('popNow')
+    f['popDrop'] = clamp((pn - l0['pop']) / 10, -1.5, 1.5) if pn and ran and l0.get('pop') else 0.0
+    return f
+
+
+def apply_model(race, arr, odds):
+    """オッズ＋AIの勝率に置き換える。置き換えたら True"""
+    if not MODEL or os.environ.get('SYH_BACKTEST') or race.get('abroad'):
+        return False
+    have = [h for h in arr if odds.get(h['n'])]
+    if len(have) < max(5, math.ceil(len(arr) * 0.8)):
+        race['modelNote'] = 'オッズ未発表のため、AIだけで計算'
+        return False
+    mx = max(odds[h['n']] for h in have)
+    inv = {h['n']: 1 / (odds.get(h['n']) or mx * 1.5) for h in arr}
+    tot = sum(inv.values())
+    names, mean, std, beta = MODEL['names'], MODEL['mean'], MODEL['std'], MODEL['beta']
+    jt = MODEL.get('jockey_bias', {})
+    N = len(arr)
+    for k, h in enumerate(sorted(arr, key=lambda h: odds.get(h['n']) or 9999), 1):
+        h['popNow'] = k
+    zs = []
+    for h in arr:
+        h['jkBias'] = jt.get(h.get('jid') or '', 0.0)
+        row = model_row(race, h, N)
+        x = [math.log(inv[h['n']] / tot)] + [row.get(n, 0.0) for n in names[1:]]
+        zs.append(sum(b * (v - m) / s for b, v, m, s in zip(beta, x, mean, std)))
+    zmax = max(zs)
+    ex = [math.exp(z - zmax) for z in zs]
+    tot2 = sum(ex)
+    for h, e in zip(arr, ex):
+        h['pAI'] = h['p']
+        h['p'] = e / tot2
+        h['ev'] = h['p'] * h['o'] if h.get('o') else None
+    race['model'] = True
+    race['modelNote'] = f"勝率＝オッズ＋AI（{MODEL.get('trained_range', '過去データ')}で学習）"
+    return True
 
 
 def chaos_info(arr):
@@ -731,6 +864,10 @@ def win_pick(arr):
     return top, '◎'
 
 
+VERIFY_EV = 1.1      # 検証枠の基準（期待値がこれ以上の単勝を記録）
+VERIFY_LABEL = '検証'
+
+
 def bet_plan(arr):
     """おすすめ買い目。各要素は {'label','text','parts':[(券種, [組み合わせ,...]), ...]}"""
     n = [h['n'] for h in arr]
@@ -762,6 +899,12 @@ def bet_plan(arr):
         plan.append({'label': '穴', 'text': "ワイド " + ', '.join(f"{n[0]}-{h['n']}" for h in anas),
                      'parts': [('ワイド', [(n[0], h['n']) for h in anas])]})
     plan += high_bets(arr)
+    # 検証枠：新方式（オッズ＋AI）で期待値1.1以上の単勝。本当に効くかを記録で確かめるためのもの（買わない）
+    if any('pAI' in h for h in arr):
+        ver = [h for h in arr if h.get('ev') and h['ev'] >= VERIFY_EV]
+        if ver:
+            plan.append({'label': '検証', 'text': "単勝 " + ','.join(str(h['n']) for h in ver)
+                         + f"（期待値{VERIFY_EV}以上・記録用）", 'parts': [('単勝', [(h['n'],) for h in ver])]})
     return plan
 
 
@@ -2114,7 +2257,12 @@ def format_reply(race, arr):
     for b in bets(arr):
         out += [b, ""]
     out.append("")
-    out.append("※スコア×1.00が基準。S≥1.08／A≥1.03／B≥1.00／C≥0.96／D")
+    if race.get('model'):
+        out.append(f"※{race['modelNote']}。評価は平均的な馬の何倍勝ちやすいか（S≥2.0倍／A≥1.3／B≥0.8／C≥0.5／D）")
+    else:
+        out.append("※スコア×1.00が基準。S≥1.08／A≥1.03／B≥1.00／C≥0.96／D")
+        if race.get('modelNote'):
+            out.append(f"※{race['modelNote']}")
     if race.get('bookProbs'):
         out.append(f"※期待値は現地オッズから見た勝率×日本のオッズ（現地オッズ{race.get('bookUpdated', '')}時点）")
     msg = "\n".join(out)
@@ -2416,9 +2564,14 @@ def render_image(race, arr):
     box_h = draw_bet_section(d, PAD, y, W - PAD, brows, {h['n']: h.get('w') for h in arr})
     y += box_h + 24
 
-    ctext(d, W / 2, y, 'スコア×1.00基準　S≥1.08 ／ A≥1.03 ／ B≥1.00 ／ C≥0.96 ／ D', F('sans_r', 20), MUTED)
-    foot = (f"※期待値＝現地オッズから見た勝率×日本のオッズ（現地オッズ{race.get('bookUpdated', '')}時点）"
-            if race.get('bookProbs') else '※AIシミュレーションの参考値です。オッズは取得時点のもの')
+    if race.get('model'):
+        ctext(d, W / 2, y, '評価＝平均的な馬の何倍勝ちやすいか　S≥2.0倍 ／ A≥1.3 ／ B≥0.8 ／ C≥0.5 ／ D', F('sans_r', 20), MUTED)
+        foot = f"※{race['modelNote']}。オッズは取得時点のもの"
+    else:
+        ctext(d, W / 2, y, 'スコア×1.00基準　S≥1.08 ／ A≥1.03 ／ B≥1.00 ／ C≥0.96 ／ D', F('sans_r', 20), MUTED)
+        foot = (f"※期待値＝現地オッズから見た勝率×日本のオッズ（現地オッズ{race.get('bookUpdated', '')}時点）"
+                if race.get('bookProbs') else
+                f"※{race['modelNote']}" if race.get('modelNote') else '※AIシミュレーションの参考値です。オッズは取得時点のもの')
     ctext(d, W / 2, y + 30, fit_text(d, foot, F('sans_r', 20), W - 72), F('sans_r', 20), MUTED)
     return img
 
@@ -2426,7 +2579,8 @@ def render_image(race, arr):
 # ═════════════════════════════════════════
 # 買い目の表示（券種ごとに色分けしたカード）と予算の割り振り
 # ═════════════════════════════════════════
-CAT_COLOR = {'推奨': (226, 112, 40), '本線': (201, 160, 70), '妙味': (40, 165, 85), '穴': (216, 62, 62), '高目': (150, 85, 205)}
+CAT_COLOR = {'推奨': (226, 112, 40), '本線': (201, 160, 70), '妙味': (40, 165, 85), '穴': (216, 62, 62), '高目': (150, 85, 205),
+             '検証': (90, 110, 140)}
 KIND_COLOR = {'単勝': (224, 86, 86), '複勝': (234, 140, 70), '馬連': (60, 135, 225), 'ワイド': (40, 175, 160),
               '馬単': (90, 110, 230), '3連複': (140, 105, 225), '3連単': (214, 72, 160), '枠連': (120, 140, 160)}
 CAT_W = {'推奨': 0.15, '本線': 0.40, '妙味': 0.10, '穴': 0.10, '高目': 0.25}      # 予算の割合（項目ごと）
@@ -2454,7 +2608,7 @@ def bet_rows_for(arr):
 
 def allocate_budget(arr, budget):
     """予算を、各項目（推奨・本線・妙味・穴・高目）の割合で100円単位に割り振る"""
-    rows = bet_rows_for(arr)
+    rows = [r for r in bet_rows_for(arr) if r['label'] != VERIFY_LABEL]   # 検証枠は記録用なので配分しない
     budget = budget // 100 * 100
     for r in rows:
         sub = SUB_W.get(r['label'], {}).get(r['kind'])
@@ -3002,8 +3156,9 @@ def settle_one(row):
             key = f"{b['label']} {kind}"
             dc, dr = detail.get(key, [0, 0])
             detail[key] = [dc + c, dr + got]
-            cost += c
-            ret += got
+            if b['label'] != VERIFY_LABEL:
+                cost += c
+                ret += got
     return {'race_id': row['race_id'], 'result': '-'.join(map(str, top3)), 'honmei_pos': order.get(hm, ''),
             'cost': cost, 'ret': ret, 'detail': json.dumps(detail, ensure_ascii=False)}
 
@@ -3065,7 +3220,13 @@ def stats_text():
              f"買い目すべて（各100円）", f"　投資 {cost:,.0f}円 → 払戻 {ret:,.0f}円（回収率 {pc(ret, cost)}）", "",
              "【買い目別】"]
     for k, (races, hit, c, g) in by.items():
-        lines.append(f"{k}：的中 {pc(hit, races)} ／ 回収 {pc(g, c)}")
+        if not k.startswith(VERIFY_LABEL):
+            lines.append(f"{k}：的中 {pc(hit, races)} ／ 回収 {pc(g, c)}")
+    ver = [(k, v) for k, v in by.items() if k.startswith(VERIFY_LABEL)]
+    if ver:
+        lines += ["", f"【検証中】期待値{VERIFY_EV}以上の単勝（記録用・上の合計には入っていません）"]
+        for k, (races, hit, c, g) in ver:
+            lines.append(f"{races}レース・{c // 100:.0f}点：的中 {pc(hit, races)} ／ 回収 {pc(g, c)}（払戻{g:,.0f}円）")
     lines += ["", "直近の結果"]
     for r in rows[-5:][::-1]:
         lines.append(f"{r['race']}　◎{r.get('honmei_pos', '?')}着　{float(r.get('ret') or 0) - float(r.get('cost') or 0):+,.0f}円")
