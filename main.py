@@ -1743,6 +1743,14 @@ def career_factors(race, horses):
 #   ハイレベル戦で4〜8着に負けたのは「相手が強かった」として着差を割り引き、3着以内なら加点
 # ═════════════════════════════════════════
 HIGH_LEVEL_NAMES = ('伏竜', '東風', '共同通信', '毎日杯', '白百合', 'ヒヤシンス', 'プリンシパル')
+# パソコンで過去のデータから見つけたハイレベル戦の一覧（出走馬全員のその後と勝ち時計から判定。data/highlevel_races.json）
+HL_TABLE = {}
+try:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'highlevel_races.json'), encoding='utf-8') as _f:
+        HL_TABLE = json.load(_f).get('races', {})
+    print(f"[highlevel] ハイレベル戦の一覧を読み込み：{len(HL_TABLE)}レース", flush=True)
+except Exception as _e:
+    print(f"[highlevel] ハイレベル戦の一覧なし: {_e}", flush=True)
 
 
 def highlevel_factors(race, horses):
@@ -1755,8 +1763,11 @@ def highlevel_factors(race, horses):
         b = 0.0
         for l in [x for x in h.get('career', h['lines']) if x['pos'] > 0 and is_flat(x)][:5]:
             why = ''
+            hl = HL_TABLE.get(l.get('rid') or '')
+            if hl:
+                why = f"ハイレベル戦：{hl[1]}"
             name_hit = next((k for k in HIGH_LEVEL_NAMES if k in l['r']), None)
-            if name_hit:
+            if not why and name_hit:
                 why = '出世レース'
             if not why and l.get('t') and l['p'] in JRA_PLACE.values():
                 win_t = l['t'] - max(0, l['m'])
