@@ -13,6 +13,7 @@ import json
 import datetime
 import traceback
 from concurrent.futures import ThreadPoolExecutor, wait
+from collections import defaultdict
 from bs4 import BeautifulSoup
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
@@ -868,27 +869,113 @@ VERIFY_EV = 1.1      # 検証枠の基準（期待値がこれ以上の単勝を
 VERIFY_LABEL = '検証'
 
 
+# ── 組み合わせの「当たる見込み」と「予想配当」 ──
+# 単勝オッズから各馬の勝つ見込みを出し、Harville（ハービル）の式で組み合わせの見込みに広げる
+TAKE = {'単勝': .20, '複勝': .20, '馬連': .225, 'ワイド': .225, '馬単': .25, '3連複': .25, '3連単': .275}   # JRAの控除率
+MIN_ODDS = {'馬連': 4.0, 'ワイド': 1.8, '馬単': 6.0, '3連複': 8.0, '3連単': 30.0}   # これ未満の予想配当は買わない
+HIGH_MAX = {'3連単': 18, '3連複': 10}                                                # 高目の点数の上限
+
+
+def prob_tables(arr):
+    """pa：予想の勝率（AI／オッズ＋AI）、pm：オッズ（市場）から見た勝率"""
+    pa = {h['n']: max(1e-6, h['p']) for h in arr}
+    have = [h for h in arr if h.get('o')]
+    if len(have) >= max(3, math.ceil(len(arr) * 0.8)):
+        mx = max(h['o'] for h in have)
+        inv = {h['n']: 1 / (h.get('o') or mx * 1.5) for h in arr}
+        t = sum(inv.values())
+        pm = {k: v / t for k, v in inv.items()}
+    else:
+        pm = dict(pa)
+    return pa, pm
+
+
+def combo_prob(kind, c, p):
+    def ex(i, j):
+        return p[i] * p[j] / max(1e-9, 1 - p[i])
+
+    def tri(i, j, k):
+        return ex(i, j) * p[k] / max(1e-9, 1 - p[i] - p[j])
+
+    def trio(i, j, k):
+        return tri(i, j, k) + tri(i, k, j) + tri(j, i, k) + tri(j, k, i) + tri(k, i, j) + tri(k, j, i)
+    if kind == '単勝':
+        return p[c[0]]
+    if kind == '複勝':
+        i = c[0]
+        others = [x for x in p if x != i]
+        return p[i] + sum(ex(j, i) for j in others) + sum(tri(j, k, i) for j in others for k in others if j != k)
+    if kind == '馬単':
+        return ex(c[0], c[1])
+    if kind == '馬連':
+        return ex(c[0], c[1]) + ex(c[1], c[0])
+    if kind == '3連単':
+        return tri(*c)
+    if kind == '3連複':
+        return trio(*c)
+    if kind == 'ワイド':
+        i, j = c
+        return sum(trio(i, j, k) for k in p if k not in (i, j))
+    return 0.0
+
+
+def est_odds(kind, c, pm):
+    """予想配当（倍）。実際の配当は売れ方で変わるので目安"""
+    return min(99999.0, (1 - TAKE.get(kind, .25)) / max(combo_prob(kind, c, pm), 1e-6))
+
+
+def value_horse(arr, pa, pm, lo=3, hi=8):
+    """AIがオッズより高く評価している馬（妙味の相手）"""
+    cands = [h for h in arr[lo:hi] if pa[h['n']] / pm[h['n']] >= 1.05]
+    return max(cands, key=lambda h: pa[h['n']] / pm[h['n']]) if cands else None
+
+
+def _keep(kind, combos, pm):
+    keep = [c for c in combos if est_odds(kind, c, pm) >= MIN_ODDS.get(kind, 0)]
+    return keep, len(combos) - len(keep)
+
+
+def _note(dropped):
+    return f"・配当の安い{dropped}点を除外" if dropped else ''
+
+
 def bet_plan(arr):
-    """おすすめ買い目。各要素は {'label','text','parts':[(券種, [組み合わせ,...]), ...]}"""
+    """おすすめ買い目。各要素は {'label','text','parts':[(券種, [組み合わせ,...]), ...]}
+    予想配当が安すぎる組み合わせは外し、人気馬ばかりのときは妙味のある相手を入れる"""
     n = [h['n'] for h in arr]
     plan = []
     if not n:
         return plan
+    pa, pm = prob_tables(arr)
     w, why = win_pick(arr)
     ev_t = f"・期待値{w['ev']:.2f}" if w.get('ev') else ''
     plan.append({'label': '推奨', 'text': f"単勝 {w['n']}（{why}{ev_t}）", 'parts': [('単勝', [(w['n'],)])]})
+    pop_top3 = set(sorted(pm, key=lambda k: -pm[k])[:3])
+    fav_all = len(n) >= 3 and set(n[:3]) <= pop_top3      # ◎○▲が3頭とも上位人気
+    vh = value_horse(arr, pa, pm)
     if len(n) >= 3:
-        plan.append({'label': '本線', 'text': f"馬連 {n[0]}-{n[1]}, {n[0]}-{n[2]}",
-                     'parts': [('馬連', [(n[0], n[1]), (n[0], n[2])])]})
-        plan.append({'label': '本線', 'text': f"ワイド {n[0]}-{n[1]}", 'parts': [('ワイド', [(n[0], n[1])])]})
+        um, d1 = _keep('馬連', [(n[0], n[1]), (n[0], n[2])], pm)
+        plan.append({'label': '本線', 'text': ("馬連 " + ', '.join(f"{a}-{b}" for a, b in um) + _note(d1)) if um
+                     else "馬連 見送り（人気どうしで配当が安すぎる）", 'parts': [('馬連', um)]})
+        wcands = [(n[0], n[1]), (n[0], n[2])] + ([(n[0], vh['n'])] if vh else [])
+        wd = next(([c] for c in wcands if est_odds('ワイド', c, pm) >= MIN_ODDS['ワイド']), [])
+        plan.append({'label': '本線', 'text': (f"ワイド {wd[0][0]}-{wd[0][1]}" if wd
+                     else "ワイド 見送り（人気どうしで配当が安すぎる）"), 'parts': [('ワイド', wd)]})
     if len(n) >= 6:
-        combos = sorted({tuple(sorted((n[0], b, c))) for b in n[1:3] for c in n[1:6] if b != c})
-        plan.append({'label': '本線', 'text': f"3連複 {n[0]} - {n[1]},{n[2]} - {','.join(map(str, n[1:6]))}（{len(combos)}点）",
-                     'parts': [('3連複', combos)]})
-        # 本線の3連単：◎1着固定 → ○▲ → ○▲△△△
-        tan = [(n[0], b, c) for b in n[1:3] for c in n[1:6] if b != c]
-        plan.append({'label': '本線', 'text': f"3連単 1着{n[0]} → 2着{n[1]},{n[2]} → 3着{','.join(map(str, n[1:6]))}（{len(tan)}点）",
-                     'parts': [('3連単', tan)]})
+        partners = n[1:6]
+        swap = ''
+        if fav_all and vh and vh['n'] not in partners:
+            partners = n[1:5] + [vh['n']]
+            swap = f"・人気馬ばかりのため{vh['n']}番を相手に追加"
+        p_ = ','.join(map(str, partners))
+        fuku = sorted({tuple(sorted((n[0], b, c))) for b in n[1:3] for c in partners if b != c})
+        fuku, d2 = _keep('3連複', fuku, pm)
+        plan.append({'label': '本線', 'text': (f"3連複 {n[0]} - {n[1]},{n[2]} - {p_}（{len(fuku)}点{_note(d2)}{swap}）" if fuku
+                     else "3連複 見送り（人気どうしで配当が安すぎる）"), 'parts': [('3連複', fuku)]})
+        tan = [(n[0], b, c) for b in n[1:3] for c in partners if b != c]
+        tan, d3 = _keep('3連単', tan, pm)
+        plan.append({'label': '本線', 'text': (f"3連単 1着{n[0]} → 2着{n[1]},{n[2]} → 3着{p_}（{len(tan)}点{_note(d3)}{swap}）" if tan
+                     else "3連単 見送り（人気どうしで配当が安すぎる）"), 'parts': [('3連単', tan)]})
     evs = [h for h in arr[:8] if h.get('ev') and h['ev'] >= 1.15]
     if evs:
         b = max(evs, key=lambda h: h['ev'])
@@ -896,9 +983,10 @@ def bet_plan(arr):
                      'parts': [('単勝', [(b['n'],)]), ('複勝', [(b['n'],)])]})
     anas = [h for h in arr if h['anaFlag']][:2]
     if anas:
-        plan.append({'label': '穴', 'text': "ワイド " + ', '.join(f"{n[0]}-{h['n']}" for h in anas),
-                     'parts': [('ワイド', [(n[0], h['n']) for h in anas])]})
-    plan += high_bets(arr)
+        aw, _ = _keep('ワイド', [(n[0], h['n']) for h in anas], pm)
+        if aw:
+            plan.append({'label': '穴', 'text': "ワイド " + ', '.join(f"{a}-{b}" for a, b in aw), 'parts': [('ワイド', aw)]})
+    plan += high_bets(arr, pa, pm)
     # 検証枠：新方式（オッズ＋AI）で期待値1.1以上の単勝。本当に効くかを記録で確かめるためのもの（買わない）
     if any('pAI' in h for h in arr):
         ver = [h for h in arr if h.get('ev') and h['ev'] >= VERIFY_EV]
@@ -912,38 +1000,53 @@ def bets(arr):
     return [f"{b['label']} {b['text']}" for b in bet_plan(arr)]
 
 
-def high_sets(arr):
+def high_sets(arr, pa=None, pm=None):
     """高目狙いの3つの馬のグループ。
-    1頭目：◎＋期待値が一番高い馬 ／ 2頭目：1頭目の馬＋○▲＋穴馬・高期待値の馬 ／ 3頭目：2頭目の馬＋△△△☆"""
-    top8 = arr[:8]
-    value = sorted([h for h in top8[1:] if h.get('ev') and h['ev'] >= 1.3], key=lambda h: -h['ev'])
+    1頭目：◎＋AIがオッズより高く評価する馬 ／ 2頭目：1頭目＋○▲＋穴馬 ／ 3頭目：2頭目＋△△"""
+    if pa is None:
+        pa, pm = prob_tables(arr)
+    vh = value_horse(arr, pa, pm, lo=1, hi=6)
     anas = [h for h in arr if h['anaFlag']]
-    first = [arr[0]] + value[:1]
-    # 1着候補同士の入れ替わり（例：穴馬が勝って◎が2着）も拾えるよう、1頭目の馬も2頭目に必ず入れる
+    first = [arr[0]] + ([vh] if vh else [])
     second = list(first)
-    for h in arr[1:3] + anas + value:
-        if h not in second and len(second) < len(first) + 3:
+    for h in arr[1:3] + anas[:1]:
+        if h not in second and len(second) < 5:
             second.append(h)
-    third = []
-    for h in second + first + arr[1:7]:
+    third = list(second)
+    for h in arr[1:7]:
         if h not in third and len(third) < 7:
             third.append(h)
     return first, second, third
 
 
-def high_bets(arr):
-    """高目狙いの3連単と3連複（同じ馬の組み立てで）"""
+def high_bets(arr, pa=None, pm=None):
+    """高目狙いの3連単と3連複。予想配当の安い組み合わせを外し、
+    「当たる見込み×予想配当」の高い順に、3連単18点・3連複10点まで"""
     if len(arr) < 5:
         return []
-    first, second, third = high_sets(arr)
+    if pa is None:
+        pa, pm = prob_tables(arr)
+    first, second, third = high_sets(arr, pa, pm)
     j = lambda hs: ','.join(str(h['n']) for h in hs)
-    tan = [(a['n'], b['n'], c['n']) for a in first for b in second for c in third
-           if len({a['n'], b['n'], c['n']}) == 3]
+    out = []
+    tan = [(a['n'], b['n'], c['n']) for a in first for b in second for c in third if len({a['n'], b['n'], c['n']}) == 3]
     fuku = sorted({tuple(sorted(t)) for t in tan})
-    return [{'label': '高目', 'text': f"3連単 1着{j(first)} → 2着{j(second)} → 3着{j(third)}（{len(tan)}点）",
-             'parts': [('3連単', tan)]},
-            {'label': '高目', 'text': f"3連複 {j(first)} - {j(second)} - {j(third)}（{len(fuku)}点）",
-             'parts': [('3連複', fuku)]}]
+    for kind, combos, form in (('3連単', tan, f"1着{j(first)} → 2着{j(second)} → 3着{j(third)}"),
+                               ('3連複', fuku, f"{j(first)} - {j(second)} - {j(third)}")):
+        keep, dropped = _keep(kind, combos, pm)
+        keep.sort(key=lambda c: -combo_prob(kind, c, pa) * est_odds(kind, c, pm))
+        cut = max(0, len(keep) - HIGH_MAX[kind])
+        keep = keep[:HIGH_MAX[kind]]
+        if not keep:
+            continue
+        why = []
+        if dropped:
+            why.append(f"配当の安い{dropped}点を除外")
+        if cut:
+            why.append(f"見込みの低い{cut}点を除外")
+        out.append({'label': '高目', 'text': f"{kind} {form}（{len(keep)}点" + (f"・{'・'.join(why)}" if why else '') + "）",
+                    'parts': [(kind, keep)]})
+    return out
 
 
 def trifecta_high(arr):
@@ -2594,7 +2697,7 @@ def bet_rows_for(arr):
     for b in bet_plan(arr):
         text = b['text']
         note = ''
-        nm = re.search(r'（([^（）]*(?:期待値|◎)[^（）]*)）', text)
+        nm = re.search(r'（([^（）]*(?:期待値|◎|除外|追加|見送り)[^（）]*)）', text)
         if nm:
             note = nm.group(1)
             text = text.replace(nm.group(0), '')
@@ -2606,42 +2709,87 @@ def bet_rows_for(arr):
     return rows
 
 
-def allocate_budget(arr, budget):
-    """予算を、各項目（推奨・本線・妙味・穴・高目）の割合で100円単位に割り振る"""
-    rows = [r for r in bet_rows_for(arr) if r['label'] != VERIFY_LABEL]   # 検証枠は記録用なので配分しない
+KIND_ORDER = ['単勝', '複勝', '馬連', 'ワイド', '3連複', '3連単']
+
+
+MAX_PTS = {'単勝': 3, '複勝': 3, '馬連': 6, 'ワイド': 6, '3連複': 6, '3連単': 6}
+MIN_ODDS_BUDGET = dict(MIN_ODDS, 単勝=1.5, 複勝=1.2)
+
+
+def candidate_combos(arr, kind, top=6):
+    """予算の買い目の候補：印の上位の馬でできる組み合わせ"""
+    from itertools import combinations, permutations
+    tops = [h['n'] for h in arr[:top]]
+    if kind in ('単勝', '複勝'):
+        return [(n,) for n in tops]
+    if kind in ('馬連', 'ワイド'):
+        return [tuple(sorted(c)) for c in combinations(tops, 2)]
+    if kind == '3連複':
+        return [tuple(sorted(c)) for c in combinations(tops, 3)]
+    if kind == '3連単':
+        return list(permutations(tops[:5], 3))
+    return []
+
+
+def allocate_by_kind(arr, budget, unit=None):
+    """券種ごとに「その券種だけで予算を使うなら」の買い目。1点の金額はそろえて、
+    期待値（当たる見込み×予想配当）の高い組み合わせから点数分だけ選ぶ。
+    unit：1点の金額（指定なしなら、予算を使い切れる点数を最大6点の中から選ぶ）"""
     budget = budget // 100 * 100
-    for r in rows:
-        sub = SUB_W.get(r['label'], {}).get(r['kind'])
-        same = [x for x in rows if x['label'] == r['label']]
-        share = sub if sub is not None else 1 / len(same)
-        r['target'] = budget * CAT_W.get(r['label'], 0.1) * share
-        r['per'] = int(r['target'] // (100 * r['n'])) * 100
-    left = budget - sum(r['per'] * r['n'] for r in rows)
-    # 割合では1点100円に届かなかった項目も、予算が残っていれば100円ずつ入れる（大事な順）
-    order = sorted(rows, key=lambda r: list(CAT_W).index(r['label']) if r['label'] in CAT_W else 9)
-    for r in order:
-        if r['per'] == 0 and left >= 100 * r['n']:
-            r['per'] = 100
-            left -= 100 * r['n']
-    # 余りは、当たりやすい順（推奨→本線の馬連・ワイド→妙味）に100円ずつ上乗せ
-    thick = [r for r in order if r['per'] > 0 and r['kind'] in ('単勝', '複勝', '馬連', 'ワイド')]
-    i = 0
-    while thick and left >= 100:
-        r = thick[i % len(thick)]
-        if left >= 100 * r['n']:
-            r['per'] += 100
-            left -= 100 * r['n']
-        elif all(left < 100 * x['n'] for x in thick):
-            break
-        i += 1
-    used = [r for r in rows if r['per'] > 0]
-    for r in used:
-        r['amount'] = r['per'] * r['n']
-    skipped = [r for r in rows if r['per'] == 0]
-    return used, skipped, budget
+    pa, pm = prob_tables(arr)
+    out = []
+    for kind in KIND_ORDER:
+        pool = []
+        for c in candidate_combos(arr, kind):
+            o = est_odds(kind, c, pm)
+            if o >= MIN_ODDS_BUDGET.get(kind, 0):
+                pool.append({'c': c, 'odds': o, 'p': combo_prob(kind, c, pa)})
+        if not pool:
+            continue
+        pool.sort(key=lambda x: -x['p'] * x['odds'])
+        cap = min(MAX_PTS[kind], len(pool))
+        if unit:
+            per = max(100, unit // 100 * 100)
+            n_pts = min(cap, budget // per) if budget >= per else 0
+        else:
+            # 予算をいちばん使い切れる点数（同じなら多い方）
+            best = None
+            for n_ in range(1, cap + 1):
+                per_ = budget // n_ // 100 * 100
+                if per_ < 100:
+                    break
+                left = budget - per_ * n_
+                if best is None or left < best[0] or (left == best[0] and n_ > best[1]):
+                    best = (left, n_, per_)
+            if not best:
+                continue
+            _, n_pts, per = best
+        if n_pts <= 0:
+            continue
+        items = pool[:n_pts]
+        for x in items:
+            x['stake'] = per
+            x['ret'] = per * x['odds']
+        items.sort(key=lambda x: x['c'])
+        if kind in ('複勝', 'ワイド'):   # 同時に2つ以上当たることがあるので「どれか1つ以上当たる見込み」で出す
+            miss = 1.0
+            for x in items:
+                miss *= 1 - min(0.99, x['p'])
+            hit = 1 - miss
+        else:                          # 当たりは1つだけなので、見込みの合計
+            hit = sum(x['p'] for x in items)
+        out.append({'kind': kind, 'items': items, 'per': per, 'total': per * len(items),
+                    'hit': min(0.99, hit), 'dropped': 0})
+    return out, budget
+
+
+def combo_str(kind, c):
+    return ('→' if kind in ('馬単', '3連単') else '-').join(map(str, c))
 
 
 def _row_lines(d, r, maxw):
+    if not r['combos']:
+        return wrap(d, r['body'] or '見送り', F('sans_b', 27), maxw)
     simple = all(len(c) <= 2 for c in r['combos']) and r['n'] <= 4
     return [] if simple else wrap(d, r['body'], F('sans_b', 27), maxw)
 
@@ -2681,7 +2829,7 @@ def draw_bet_section(d, x0, y0, x1, rows, wmap, title='― おすすめ買い目
         kw = tw(d, r['kind'], F('sans_b', 26)) + 30
         d.rounded_rectangle((cx + 96, cy, cx + 96 + kw, cy + 40), radius=8, fill=kc)
         ctext(d, cx + 96 + kw / 2, cy + 4, r['kind'], F('sans_b', 26), (255, 255, 255))
-        d.text((cx + 96 + kw + 14, cy + 7), f"{r['n']}点", font=F('sans_r', 24), fill=MUTED)
+        d.text((cx + 96 + kw + 14, cy + 7), f"{r['n']}点" if r['n'] else '見送り', font=F('sans_r', 24), fill=MUTED)
         # 右側：金額（予算モード）
         if r.get('amount'):
             amt = f"{r['amount']:,}円"
@@ -2713,29 +2861,47 @@ def draw_bet_section(d, x0, y0, x1, rows, wmap, title='― おすすめ買い目
     return box_h
 
 
-def render_budget_image(race, arr, budget):
-    """予算を割り振った買い目の画像"""
-    used, skipped, budget = allocate_budget(arr, budget)
+def render_budget_image(race, arr, budget, unit=None):
+    """予算の配分の画像（券種ごとに、その券種だけで予算を使う場合。1点の金額はそろえる）"""
+    plans, budget = allocate_by_kind(arr, budget, unit)
     W, PAD = 1080, 36
-    total = sum(r['amount'] for r in used)
     wmap = {h['n']: h.get('w') for h in arr}
-    inner_h = 92 + 34 + bet_section_height(used, W - PAD * 2 - 120)
-    H = 230 + inner_h + (70 if skipped else 0) + 90
+    LH = 40
+    heights = [24 + 46 + 12 + LH * len(pl['items']) + (30 if pl['dropped'] else 0) + 16 for pl in plans]
+    H = 290 + sum(h_ + 16 for h_ in heights) + 100
     img = gradient_bg(W, H)
     d = ImageDraw.Draw(img)
     gold_frame(d, (14, 14, W - 14, H - 14), r=22, w=3)
     ctext(d, W / 2, 40, '資金配分プラン', F('serif_b', 52), GOLD)
     title = f"{race['venue']}{race['R']}R  {race['name']}"
     ctext(d, W / 2, 112, fit_text(d, title, F('sans_b', 34), W - PAD * 2), F('sans_b', 34), SILVER)
-    ctext(d, W / 2, 162, f"予算 {budget:,}円 ／ 使う金額 {total:,}円（残り {budget - total:,}円）", F('sans_b', 28), GOLD)
-    y = 214
-    sub = '推奨15%・本線40%・妙味10%・穴10%・高目25%を目安に配分'
-    y += draw_bet_section(d, PAD, y, W - PAD, used, wmap, title='― 買い目と金額 ―', sub=sub) + 16
-    if skipped:
-        t = '予算が足りず外したもの：' + '、'.join(f"{r['label']}{r['kind']}（{r['n']}点）" for r in skipped)
-        ctext(d, W / 2, y, fit_text(d, t, F('sans_r', 22), W - PAD * 2), F('sans_r', 22), MUTED)
-        y += 40
-    ctext(d, W / 2, y + 10, '※当たりやすい単勝・ワイド・馬連に端数を上乗せしています', F('sans_r', 20), MUTED)
+    ctext(d, W / 2, 162, f"予算 {budget:,}円 を、券種ごとに配分", F('sans_b', 30), GOLD)
+    ctext(d, W / 2, 206, 'どれか1つの券種を選んで買う想定です。期待値の高い組み合わせから選んでいます', F('sans_r', 22), MUTED)
+    y = 254
+    for pl, hh in zip(plans, heights):
+        kc = KIND_COLOR.get(pl['kind'], (110, 120, 140))
+        d.rounded_rectangle((PAD, y, W - PAD, y + hh), radius=14, fill=(22, 32, 58))
+        d.rounded_rectangle((PAD, y, PAD + 12, y + hh), radius=6, fill=kc)
+        kw = tw(d, pl['kind'], F('sans_b', 28)) + 32
+        d.rounded_rectangle((PAD + 28, y + 16, PAD + 28 + kw, y + 58), radius=8, fill=kc)
+        ctext(d, PAD + 28 + kw / 2, y + 20, pl['kind'], F('sans_b', 28), (255, 255, 255))
+        info = f"1点{pl['per']:,}円×{len(pl['items'])}点　当たる見込み 約{pl['hit'] * 100:.0f}%"
+        d.text((PAD + 44 + kw, y + 24), info, font=F('sans_r', 24), fill=MUTED)
+        amt = f"{pl['total']:,}円"
+        d.text((W - PAD - 24 - tw(d, amt, F('sans_b', 34)), y + 16), amt, font=F('sans_b', 34), fill=GOLD)
+        yy = y + 82
+        for x in pl['items']:
+            d.text((PAD + 44, yy), combo_str(pl['kind'], x['c']), font=F('sans_b', 28), fill=SILVER)
+            st = f"{x['stake']:,}円"
+            d.text((PAD + 400 - tw(d, st, F('sans_b', 28)), yy), st, font=F('sans_b', 28), fill=GOLD)
+            d.text((PAD + 430, yy + 4), f"→ 当たれば 約{x['ret']:,.0f}円（予想{x['odds']:.1f}倍）",
+                   font=F('sans_r', 24), fill=MUTED)
+            yy += LH
+        if pl['dropped']:
+            d.text((PAD + 44, yy + 2), f"※予算に入りきらない{pl['dropped']}点は、見込みの低い順に外しました",
+                   font=F('sans_r', 22), fill=MUTED)
+        y += hh + 16
+    ctext(d, W / 2, y + 6, '※予想配当は今の単勝オッズからの目安です（実際の配当は売れ方で変わります）', F('sans_r', 20), MUTED)
     return img
 
 
@@ -3302,20 +3468,21 @@ def going_text(race, arr):
     return '\n'.join(out)
 
 
-def budget_text(race, arr, budget):
-    """予算を各項目に割り振った買い目（文章版）"""
+def budget_text(race, arr, budget, unit=None):
+    """予算の配分（文章版）。券種ごとに、その券種だけで予算を使う場合"""
     if budget < 100:
         return "予算は100円以上で送ってください（例：3000円）"
-    used, skipped, budget = allocate_budget(arr, budget)
-    total = sum(r['amount'] for r in used)
-    out = [f"💰 資金配分プラン（予算{budget:,}円）", f"{race['venue']}{race['R']}R {race['name']}", ""]
-    for r in used:
-        out.append(f"【{r['label']}】{r['kind']} {r['body']}")
-        out.append(f"　1点{r['per']:,}円 × {r['n']}点 ＝ {r['amount']:,}円")
+    plans, budget = allocate_by_kind(arr, budget, unit)
+    out = [f"💰 資金配分プラン（予算{budget:,}円）", f"{race['venue']}{race['R']}R {race['name']}",
+           "券種ごとに、その券種だけで予算を使う場合の配分です", ""]
+    for pl in plans:
+        out.append(f"【{pl['kind']}】1点{pl['per']:,}円×{len(pl['items'])}点＝{pl['total']:,}円（当たる見込み約{pl['hit'] * 100:.0f}%）")
+        for x in pl['items']:
+            out.append(f"　{combo_str(pl['kind'], x['c'])}　{x['stake']:,}円 → 約{x['ret']:,.0f}円")
+        if pl['dropped']:
+            out.append(f"　※予算に入りきらない{pl['dropped']}点は外しました")
         out.append("")
-    out.append(f"合計 {total:,}円（残り{budget - total:,}円）")
-    if skipped:
-        out.append("予算が足りず外したもの：" + '、'.join(f"{r['label']}{r['kind']}（{r['n']}点）" for r in skipped))
+    out.append("※予想配当は今の単勝オッズからの目安です。「3000円 500円ずつ」のように1点の金額も指定できます")
     return '\n'.join(out)
 
 
@@ -3333,14 +3500,38 @@ def highlevel_text(race, arr):
     return '\n'.join(out)
 
 
-def parse_budget(text):
-    """「3000円」「予算5,000円」「１万円」「1万5千円」「予算 8000」などから金額を読む。読めなければ None"""
-    t = norm_digits(text.strip()).replace('，', ',').replace(',', '').replace(' ', '').replace('　', '')
-    m = re.fullmatch(r'(?:予算)?(?:(\d+)万)?(?:(\d+)千)?(\d+)?円?', t)
-    if not m or not any(m.groups()) or (not t.endswith('円') and not t.startswith('予算')):
+def _yen(t):
+    """「3000」「3,000円」「1万円」「1万5千円」を数字に"""
+    t = norm_digits(t).replace('，', ',').replace(',', '')
+    m = re.fullmatch(r'(?:(\d+)万)?(?:(\d+)千)?(\d+)?円?', t)
+    if not m or not any(m.groups()):
         return None
     man, sen, rest = (int(x) if x else 0 for x in m.groups())
     return man * 10000 + sen * 1000 + rest
+
+
+def parse_budget_unit(text):
+    """「3000円」「予算5,000円」「1万円」「3000円 500円ずつ」「3000円 各500円」→（予算, 1点の金額 or None）"""
+    t = norm_digits(text.strip()).replace('　', ' ')
+    if not (('円' in t) or t.startswith('予算')):
+        return None, None
+    t = re.sub(r'^予算\s*', '', t)
+    t = re.sub(r'ずつ', '', t)
+    t = re.sub(r'各|1点', ' ', t)
+    parts = [x for x in re.split(r'\s+|(?<=円)(?=\S)', t) if x]
+    if not parts or len(parts) > 2:
+        return None, None
+    budget = _yen(parts[0])
+    unit = None
+    if len(parts) == 2:
+        unit = _yen(parts[1])
+        if unit is None:
+            return None, None
+    return budget, unit
+
+
+def parse_budget(text):
+    return parse_budget_unit(text)[0]
 
 
 def command_reply(text, uid):
@@ -3361,7 +3552,7 @@ def command_reply(text, uid):
         return going_text(race, arr)
     if cmd == 'ハイレベル':
         return highlevel_text(race, arr)
-    return budget_text(race, arr, bv)
+    return budget_text(race, arr, bv, parse_budget_unit(t)[1])
 
 
 # ═════════════════════════════════════════
@@ -3403,7 +3594,7 @@ def build_messages(text, base, uid='anon'):
     """予想を作って、LINEに送るメッセージのリストと、返信後にやる処理を返す"""
     if text in ('成績', '成績確認'):
         return [TextSendMessage(text=stats_text())], None
-    bv = parse_budget(text)
+    bv, unit = parse_budget_unit(text)
     sess = get_session(uid) if bv else None
     if bv and sess and bv >= 100:
         race, arr = sess
@@ -3412,12 +3603,12 @@ def build_messages(text, base, uid='anon'):
         try:
             if fonts_ok(20):
                 with _render_lock:
-                    key = save_image(render_budget_image(race, arr, budget))
+                    key = save_image(render_budget_image(race, arr, budget, unit))
                 msgs.append(ImageSendMessage(original_content_url=f"{base}/img/{key}.png",
                                              preview_image_url=f"{base}/img/{key}_pv.jpg"))
         except Exception:
             traceback.print_exc()
-        msgs.append(TextSendMessage(text=budget_text(race, arr, budget)[:4900]))
+        msgs.append(TextSendMessage(text=budget_text(race, arr, budget, unit)[:4900]))
         return msgs, None
     cr = command_reply(text, uid)
     if cr:
