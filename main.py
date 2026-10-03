@@ -3358,7 +3358,8 @@ def test_page():
         return traceback.format_exc(), 500, {'Content-Type': 'text/plain; charset=utf-8'}
 
 
-threading.Thread(target=preload_fonts, daemon=True).start()
+if not os.environ.get('SYH_BACKTEST'):   # パソコンでのバックテスト時は、画像用の文字データを取りに行かない
+    threading.Thread(target=preload_fonts, daemon=True).start()
 
 
 if __name__ == "__main__":
