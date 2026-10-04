@@ -820,6 +820,8 @@ def model_row(race, h, N):
     f['hlMax'] = clamp(max(v for v, _ in hs), -2, 4) if hs else 0.0
     f['hlFinish'] = clamp(max(v * (1.0 if p and p <= 3 else 0.5 if p and p <= 5 else 0.2) for v, p in hs), -2, 4) if hs else 0.0
     f['hlMissing'] = 0.0 if hs else 1.0
+    good = [v for v, p in hs if p and p <= 3]
+    f['hlLowGood'] = clamp(min(good), -4, 0) if good else 0.0
     sc = TRAIN_SCORE.get(h.get('trainGrade'))
     f['trainScore'] = float(sc) if sc is not None else 0.0
     f['trainMissing'] = 0.0 if sc is not None else 1.0
@@ -1772,11 +1774,13 @@ def career_factors(race, horses):
 HIGH_LEVEL_NAMES = ('伏竜', '東風', '共同通信', '毎日杯', '白百合', 'ヒヤシンス', 'プリンシパル')
 # パソコンで過去のデータから見つけたハイレベル戦の一覧（出走馬全員のその後と勝ち時計から判定。data/highlevel_races.json）
 HL_TABLE = {}      # ハイレベル戦と判定したレース → [点数, 理由]
+HL_LOW = {}        # 低レベル戦と判定したレース → [点数, 理由]
 HL_SCORES = {}     # 判定したすべてのレース → 点数（0が平均、＋ほどハイレベル）
 try:
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'highlevel_races.json'), encoding='utf-8') as _f:
         _hl = json.load(_f)
     HL_TABLE, HL_SCORES = _hl.get('races', {}), _hl.get('scores', {})
+    HL_LOW = _hl.get('low', {})
     print(f"[highlevel] ハイレベル戦の一覧を読み込み：{len(HL_TABLE)}レース（点数あり{len(HL_SCORES)}レース）", flush=True)
 except Exception as _e:
     print(f"[highlevel] ハイレベル戦の一覧なし: {_e}", flush=True)
@@ -1806,6 +1810,11 @@ def highlevel_factors(race, horses):
             h['hlScores'] = [(HL_SCORES.get(l.get('rid') or ''), l['pos'])
                              for l in [x for x in h.get('career', h['lines']) if x['pos'] > 0 and is_flat(x)][:3] if l.get('rid')]
         b = 0.0
+        for l in [x for x in h.get('career', h['lines']) if x['pos'] > 0 and is_flat(x)][:3]:
+            lo = HL_LOW.get(l.get('rid') or '')
+            if lo and l['pos'] <= 3:
+                b -= 0.006
+                h['hlNotes'].append(f"{short_date(l['d'])}{l['p']}{l['r']}は低レベル戦（{lo[1]}）。ここでの{l['pos']}着は割り引き")
         for l in [x for x in h.get('career', h['lines']) if x['pos'] > 0 and is_flat(x)][:5]:
             why = ''
             hs, hr = hl_lookup(h, l)
@@ -1841,7 +1850,7 @@ def highlevel_factors(race, horses):
                 h['flowRelief'][line_key(l)] = min(h['flowRelief'].get(line_key(l), 1.0), 0.5)
                 h['hlNotes'].append(f"{tag}で{l['pos']}着。相手が強かったので負けは度外視")
             h['hlLines'].append(l)
-        h['bHL'] = min(b, 0.02)
+        h['bHL'] = clamp(b, -0.015, 0.02)
 
 
 # ═════════════════════════════════════════
