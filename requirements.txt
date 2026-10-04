@@ -8,3 +8,5 @@ lightgbm
 scikit-learn
 gunicorn
 Pillow
+   numpy
+   imageio-ffmpeg
