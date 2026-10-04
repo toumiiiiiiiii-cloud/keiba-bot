@@ -355,6 +355,9 @@ def parse_shutuba_past(soup):
                 dam, damsire = dm_.group(1).strip(), dm_.group(2).strip()
         tm_ = re.search(r'(美浦|栗東|[^\s・()（）\d]{2,6})・\S+', txt('.Horse05') or info_text)
         trainer_area = tm_.group(1) if tm_ else ''
+        ta_ = info.find('a', href=re.compile(r'/trainer/'))
+        tr_m = re.search(r'/trainer/(?:result/)?(?:recent/)?([0-9a-z]{5})', ta_.get('href', '')) if ta_ else None
+        trid = tr_m.group(1) if tr_m else None
         stm = re.search(r'([逃先差追大])\s*(?:中\s*\d+\s*週|連闘)', info_text)
         st = stm.group(1) if stm else '?'
         if st == '大':
@@ -422,7 +425,7 @@ def parse_shutuba_past(soup):
                        'dam': f'{clean(dam)}({damsire})' if damsire else clean(dam),
                        'damsire': re.sub(r'\s+', ' ', damsire).strip(), 'st': st, 'jockey': jockey, 'wt': wt, 'jid': jid, 'hid': hid, 'area': trainer_area,
                        'weeks': weeks, 'bwNow': bw_now, 'bwDiff': bw_diff, 'oddsPage': odds_pg,
-                       'sex': sex, 'age': age, 'gate': waku,
+                       'sex': sex, 'age': age, 'gate': waku, 'trid': trid,
                        'lines': lines, 'cancelled': cancelled})
     return horses
 
@@ -753,6 +756,22 @@ def model_row(race, h, N):
     f['drawShort'] = dp if race['dist'] <= 1400 else 0.0
     # 騎手の「売れすぎ度」（勝った数－オッズから見た勝ちの見込み）。学習データから作った表
     f['jkBias'] = float(h.get('jkBias') or 0.0)
+    # 調教師の売れすぎ度、調教師×騎手のコンビの売れすぎ度（学習データから作った表）
+    f['trBias'] = float(h.get('trBias') or 0.0)
+    f['tjBias'] = float(h.get('tjBias') or 0.0)
+    # 昇級初戦：前走を勝って、今回クラスが上がった。勝ち方（2着との差、秒）も
+    up = bool(ran and l0['pos'] == 1 and CLS[race['clsIdx']][1] > CLS[class_of_text(l0['r'], l0['p'])][1] + 0.1)
+    f['upFirst'] = 1.0 if up else 0.0
+    f['upFirstMargin'] = clamp(-l0['m'], 0.0, 1.5) if up and not l0.get('mEst') else 0.0
+    # 当日の馬場：前残り度×この馬の予想位置、内有利度×この馬の枠（終わったレースが多いほど確か）
+    tb = race.get('trackBias')
+    if tb:
+        conf = min(1.0, tb.get('races', 0) / 6)
+        er_ = h.get('earlyRatio')
+        f['tbFront'] = tb['front'] * conf * (0.5 - (er_ if er_ is not None else 0.5))
+        f['tbInner'] = tb['inner'] * conf * (0.5 - dp)
+    else:
+        f['tbFront'], f['tbInner'] = 0.0, 0.0
 
     # ── 不利があったらしい前走（不利の記録は無いので、通過順と上がりから推測する） ──
     # ① 出遅れの推定：前走の最初のコーナーの位置が、その馬のふだん（2〜5走前）よりずっと後ろ
@@ -795,6 +814,11 @@ def model_row(race, h, N):
     f['courseFront'] = float(h.get('courseFront') or 0.0) * (0.5 - f['early'])
     f['courseDraw'] = float(h.get('courseDraw') or 0.0) * (0.5 - dp)
     # ── 調教 ──
+    # ── ハイレベル戦：過去3走のハイレベル度の最大と、ハイレベル戦での走りぶり ──
+    hs = [(v, p) for v, p in (h.get('hlScores') or []) if v is not None]
+    f['hlMax'] = clamp(max(v for v, _ in hs), -2, 4) if hs else 0.0
+    f['hlFinish'] = clamp(max(v * (1.0 if p and p <= 3 else 0.5 if p and p <= 5 else 0.2) for v, p in hs), -2, 4) if hs else 0.0
+    f['hlMissing'] = 0.0 if hs else 1.0
     sc = TRAIN_SCORE.get(h.get('trainGrade'))
     f['trainScore'] = float(sc) if sc is not None else 0.0
     f['trainMissing'] = 0.0 if sc is not None else 1.0
@@ -822,6 +846,8 @@ def apply_model(race, arr, odds):
         h['jkBias'] = jt.get(h.get('jid') or '', 0.0)
         ct = MODEL.get('course_tables', {}).get(f"{race['venue']}|{race['surf']}|{race['dist']}")
         h['courseFront'], h['courseDraw'] = (ct if ct else (0.0, 0.0))
+        h['trBias'] = MODEL.get('trainer_bias', {}).get(h.get('trid') or '', 0.0)
+        h['tjBias'] = MODEL.get('combo_bias', {}).get(f"{h.get('trid')}|{h.get('jid')}", 0.0)
         row = model_row(race, h, N)
         x = [math.log(inv[h['n']] / tot)] + [row.get(n, 0.0) for n in names[1:]]
         zs.append(sum(b * (v - m) / s for b, v, m, s in zip(beta, x, mean, std)))
@@ -1744,13 +1770,27 @@ def career_factors(race, horses):
 # ═════════════════════════════════════════
 HIGH_LEVEL_NAMES = ('伏竜', '東風', '共同通信', '毎日杯', '白百合', 'ヒヤシンス', 'プリンシパル')
 # パソコンで過去のデータから見つけたハイレベル戦の一覧（出走馬全員のその後と勝ち時計から判定。data/highlevel_races.json）
-HL_TABLE = {}
+HL_TABLE = {}      # ハイレベル戦と判定したレース → [点数, 理由]
+HL_SCORES = {}     # 判定したすべてのレース → 点数（0が平均、＋ほどハイレベル）
 try:
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'highlevel_races.json'), encoding='utf-8') as _f:
-        HL_TABLE = json.load(_f).get('races', {})
-    print(f"[highlevel] ハイレベル戦の一覧を読み込み：{len(HL_TABLE)}レース", flush=True)
+        _hl = json.load(_f)
+    HL_TABLE, HL_SCORES = _hl.get('races', {}), _hl.get('scores', {})
+    print(f"[highlevel] ハイレベル戦の一覧を読み込み：{len(HL_TABLE)}レース（点数あり{len(HL_SCORES)}レース）", flush=True)
 except Exception as _e:
     print(f"[highlevel] ハイレベル戦の一覧なし: {_e}", flush=True)
+
+
+HL_THRESHOLD = 1.0
+
+
+def hl_lookup(h, l):
+    """過去走のハイレベル戦の点数と内訳。バックテストでは「前日までの結果」で計算した値（h['_hlInfo']）を使う"""
+    m = h.get('_hlInfo')
+    if m is not None:
+        return m.get(l.get('rid'), (None, ''))
+    v = HL_TABLE.get(l.get('rid') or '')
+    return (v[0], v[1]) if v else (None, '')
 
 
 def highlevel_factors(race, horses):
@@ -1760,12 +1800,16 @@ def highlevel_factors(race, horses):
             keys.setdefault(line_key(l), []).append(h)
     for h in horses:
         h['bHL'], h['hlNotes'], h['hlLines'] = 0.0, [], []
+        # 新方式の材料：過去3走のハイレベル度（バックテストでは前日までの結果で計算した値が入っている）
+        if 'hlScores' not in h:
+            h['hlScores'] = [(HL_SCORES.get(l.get('rid') or ''), l['pos'])
+                             for l in [x for x in h.get('career', h['lines']) if x['pos'] > 0 and is_flat(x)][:3] if l.get('rid')]
         b = 0.0
         for l in [x for x in h.get('career', h['lines']) if x['pos'] > 0 and is_flat(x)][:5]:
             why = ''
-            hl = HL_TABLE.get(l.get('rid') or '')
-            if hl:
-                why = f"ハイレベル戦：{hl[1]}"
+            hs, hr = hl_lookup(h, l)
+            if hs is not None and hs >= HL_THRESHOLD:
+                why = f"ハイレベル戦：{hr}"
             name_hit = next((k for k in HIGH_LEVEL_NAMES if k in l['r']), None)
             if not why and name_hit:
                 why = '出世レース'
