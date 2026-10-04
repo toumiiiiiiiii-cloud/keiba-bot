@@ -758,6 +758,7 @@ def model_row(race, h, N):
     f['jkBias'] = float(h.get('jkBias') or 0.0)
     # 調教師の売れすぎ度、調教師×騎手のコンビの売れすぎ度（学習データから作った表）
     f['trBias'] = float(h.get('trBias') or 0.0)
+    f['jkFront'] = float(h.get('jkFront') or 0.0)
     f['tjBias'] = float(h.get('tjBias') or 0.0)
     # 昇級初戦：前走を勝って、今回クラスが上がった。勝ち方（2着との差、秒）も
     up = bool(ran and l0['pos'] == 1 and CLS[race['clsIdx']][1] > CLS[class_of_text(l0['r'], l0['p'])][1] + 0.1)
@@ -2316,6 +2317,7 @@ def predict_positions(race, horses):
             h['posFrom'] = 'netkeibaの脚質から推定' if h['st'] in STYLE_RATIO else '情報なし'
         # 内枠の方が前に行きやすい
         ratio += 0.06 * (draw_pos(h, N) - 0.5)
+        ratio -= float(h.get('jkFront') or 0.0)       # 前に行かせる騎手なら前へ、控える騎手なら後ろへ
         h['earlyRatio'] = clamp(ratio, 0, 1)
 
     order = sorted(horses, key=lambda h: (h['earlyRatio'], -h['leadRate']))
@@ -2395,6 +2397,9 @@ def analyze(text):
     race['base'] = base
     race['id'] = race_id
     race['date'] = parse_race_date(soup)
+    if MODEL:   # 騎手の前に行く癖（学習データから作った表）。展開予想の前にのせる
+        for h in horses:
+            h['jkFront'] = MODEL.get('jockey_front', {}).get(h.get('jid') or '', 0.0)
     t_start = time.time()
     early = {'tb': BG.submit(_safe, track_bias, race, race_id, race['date']),
              'jk': {j: BG.submit(_safe, fetch_jockey_stats, j) for j in {h['jid'] for h in horses if h.get('jid')}},
@@ -2842,7 +2847,53 @@ def candidate_combos(arr, kind, top=7):
     return []
 
 
-def allocate_by_kind(arr, budget, unit=None):
+def allocate_by_ev(arr, budget):
+    """期待値（当たる見込み×予想配当）が1を超える組み合わせだけに、期待値の高さに応じて配分する（ケリー基準の考え方）。
+    すべて軸（◎）を含む。期待値1超が無い券種は出さない"""
+    budget = budget // 100 * 100
+    pa, pm = prob_tables(arr)
+    out = []
+    for kind in KIND_ORDER:
+        if kind in ('馬連', 'ワイド'):
+            pk = pair_pick(arr, kind, pm, value_horse(arr, pa, pm))
+            cands = [tuple(sorted(pk[0]))] if pk else []
+        else:
+            cands = candidate_combos(arr, kind)
+        pool = []
+        for c in cands:
+            o = est_odds(kind, c, pm)
+            pr = combo_prob(kind, c, pa)
+            ev = pr * o
+            if ev > 1.0 and o >= MIN_ODDS_BUDGET.get(kind, 0) and o > 1:
+                pool.append({'c': c, 'odds': o, 'p': pr, 'ev': ev, 'k': (ev - 1) / (o - 1)})
+        pool.sort(key=lambda x: -x['ev'])
+        items = pool[:MAX_PTS[kind]]
+        while items and 100 * len(items) > budget:
+            items.pop()
+        if not items:
+            continue
+        tot_k = sum(x['k'] for x in items)
+        for x in items:
+            x['stake'] = max(100, int(budget * x['k'] / tot_k // 100) * 100)
+        while sum(x['stake'] for x in items) > budget:
+            big = max((x for x in items if x['stake'] > 100), key=lambda x: x['stake'], default=None)
+            if not big:
+                break
+            big['stake'] -= 100
+        left = budget - sum(x['stake'] for x in items)
+        best = max(items, key=lambda x: x['k'])
+        best['stake'] += left // 100 * 100
+        for x in items:
+            x['ret'] = x['stake'] * x['odds']
+        items.sort(key=lambda x: x['c'])
+        out.append({'kind': kind, 'items': items, 'per': None, 'total': sum(x['stake'] for x in items),
+                    'hit': min(0.99, sum(x['p'] for x in items)), 'dropped': 0})
+    return out, budget
+
+
+def allocate_by_kind(arr, budget, unit=None, ev_mode=False):
+    if ev_mode:
+        return allocate_by_ev(arr, budget)
     """券種ごとに「その券種だけで予算を使うなら」の買い目。1点の金額はそろえて、
     期待値（当たる見込み×予想配当）の高い組み合わせから点数分だけ選ぶ。
     unit：1点の金額（指定なしなら、予算を使い切れる点数を最大6点の中から選ぶ）"""
@@ -2977,22 +3028,26 @@ def draw_bet_section(d, x0, y0, x1, rows, wmap, title='― おすすめ買い目
     return box_h
 
 
-def render_budget_image(race, arr, budget, unit=None):
-    """予算の配分の画像（券種ごとに、その券種だけで予算を使う場合。1点の金額はそろえる）"""
-    plans, budget = allocate_by_kind(arr, budget, unit)
+def render_budget_image(race, arr, budget, unit=None, ev_mode=False):
+    """予算の配分の画像（券種ごとに、その券種だけで予算を使う場合。1点の金額はそろえる／期待値モード）"""
+    plans, budget = allocate_by_kind(arr, budget, unit, ev_mode)
     W, PAD = 1080, 36
     wmap = {h['n']: h.get('w') for h in arr}
     LH = 40
     heights = [24 + 46 + 12 + LH * len(pl['items']) + (30 if pl['dropped'] else 0) + 16 for pl in plans]
-    H = 290 + sum(h_ + 16 for h_ in heights) + 100
+    H = 290 + sum(h_ + 16 for h_ in heights) + 100 + (110 if not plans else 0)
     img = gradient_bg(W, H)
     d = ImageDraw.Draw(img)
     gold_frame(d, (14, 14, W - 14, H - 14), r=22, w=3)
-    ctext(d, W / 2, 40, '資金配分プラン', F('serif_b', 52), GOLD)
+    ctext(d, W / 2, 40, '期待値配分' if ev_mode else '資金配分プラン', F('serif_b', 52), GOLD)
     title = f"{race['venue']}{race['R']}R  {race['name']}"
     ctext(d, W / 2, 112, fit_text(d, title, F('sans_b', 34), W - PAD * 2), F('sans_b', 34), SILVER)
     ctext(d, W / 2, 162, f"予算 {budget:,}円　軸 ◎{arr[0]['n']} {arr[0]['name']}", F('sans_b', 30), GOLD)
-    ctext(d, W / 2, 206, '全部の買い目に軸が入ります。券種を1つ選んで買う想定で、相手は期待値の高い順です', F('sans_r', 22), MUTED)
+    sub_t = ('期待値1を超える組み合わせだけに、期待値が高いほど多く配分（軸入り）' if ev_mode else
+             '全部の買い目に軸が入ります。券種を1つ選んで買う想定で、相手は期待値の高い順です')
+    ctext(d, W / 2, 206, sub_t, F('sans_r', 22), MUTED)
+    if not plans:
+        ctext(d, W / 2, 300, '期待値1を超える組み合わせがありません（見送りがおすすめ）', F('sans_b', 30), SILVER)
     y = 254
     for pl, hh in zip(plans, heights):
         kc = KIND_COLOR.get(pl['kind'], (110, 120, 140))
@@ -3001,7 +3056,8 @@ def render_budget_image(race, arr, budget, unit=None):
         kw = tw(d, pl['kind'], F('sans_b', 28)) + 32
         d.rounded_rectangle((PAD + 28, y + 16, PAD + 28 + kw, y + 58), radius=8, fill=kc)
         ctext(d, PAD + 28 + kw / 2, y + 20, pl['kind'], F('sans_b', 28), (255, 255, 255))
-        info = f"1点{pl['per']:,}円×{len(pl['items'])}点　当たる見込み 約{pl['hit'] * 100:.0f}%"
+        info = (f"1点{pl['per']:,}円×{len(pl['items'])}点　当たる見込み 約{pl['hit'] * 100:.0f}%" if pl.get('per')
+                else f"{len(pl['items'])}点　当たる見込み 約{pl['hit'] * 100:.0f}%")
         d.text((PAD + 44 + kw, y + 24), info, font=F('sans_r', 24), fill=MUTED)
         amt = f"{pl['total']:,}円"
         d.text((W - PAD - 24 - tw(d, amt, F('sans_b', 34)), y + 16), amt, font=F('sans_b', 34), fill=GOLD)
@@ -3010,13 +3066,15 @@ def render_budget_image(race, arr, budget, unit=None):
             d.text((PAD + 44, yy), combo_str(pl['kind'], x['c']), font=F('sans_b', 28), fill=SILVER)
             st = f"{x['stake']:,}円"
             d.text((PAD + 400 - tw(d, st, F('sans_b', 28)), yy), st, font=F('sans_b', 28), fill=GOLD)
-            d.text((PAD + 430, yy + 4), f"→ 当たれば 約{x['ret']:,.0f}円（予想{x['odds']:.1f}倍）",
+            d.text((PAD + 430, yy + 4), f"→ 当たれば 約{x['ret']:,.0f}円（予想{x['odds']:.1f}倍" + (f"・期待値{x['ev']:.2f}" if x.get('ev') else '') + "）",
                    font=F('sans_r', 24), fill=MUTED)
             yy += LH
         if pl['dropped']:
             d.text((PAD + 44, yy + 2), f"※予算に入りきらない{pl['dropped']}点は、見込みの低い順に外しました",
                    font=F('sans_r', 22), fill=MUTED)
         y += hh + 16
+    if not plans:
+        y += 110
     ctext(d, W / 2, y + 6, '※予想配当は今の単勝オッズからの目安です（実際の配当は売れ方で変わります）', F('sans_r', 20), MUTED)
     return img
 
@@ -3586,18 +3644,25 @@ def going_text(race, arr):
     return '\n'.join(out)
 
 
-def budget_text(race, arr, budget, unit=None):
+def budget_text(race, arr, budget, unit=None, ev_mode=False):
     """予算の配分（文章版）。券種ごとに、その券種だけで予算を使う場合"""
     if budget < 100:
         return "予算は100円以上で送ってください（例：3000円）"
-    plans, budget = allocate_by_kind(arr, budget, unit)
-    out = [f"💰 資金配分プラン（予算{budget:,}円）", f"{race['venue']}{race['R']}R {race['name']}",
+    plans, budget = allocate_by_kind(arr, budget, unit, ev_mode)
+    if ev_mode and not plans:
+        return (f"💰 期待値配分（予算{budget:,}円）\n{race['venue']}{race['R']}R {race['name']}\n\n"
+                "期待値1を超える組み合わせがありません。このレースは見送りがおすすめです")
+    out = [f"💰 {'期待値配分' if ev_mode else '資金配分プラン'}（予算{budget:,}円）", f"{race['venue']}{race['R']}R {race['name']}",
            f"軸：◎{arr[0]['n']} {arr[0]['name']}（全部の買い目に入ります）",
-           "券種ごとに、その券種だけで予算を使う場合の配分です", ""]
+           ("期待値1を超える組み合わせだけに、期待値が高いほど多く配分しています" if ev_mode else
+            "券種ごとに、その券種だけで予算を使う場合の配分です"), ""]
     for pl in plans:
-        out.append(f"【{pl['kind']}】1点{pl['per']:,}円×{len(pl['items'])}点＝{pl['total']:,}円（当たる見込み約{pl['hit'] * 100:.0f}%）")
+        if pl.get('per'):
+            out.append(f"【{pl['kind']}】1点{pl['per']:,}円×{len(pl['items'])}点＝{pl['total']:,}円（当たる見込み約{pl['hit'] * 100:.0f}%）")
+        else:
+            out.append(f"【{pl['kind']}】{len(pl['items'])}点＝{pl['total']:,}円（当たる見込み約{pl['hit'] * 100:.0f}%）")
         for x in pl['items']:
-            out.append(f"　{combo_str(pl['kind'], x['c'])}　{x['stake']:,}円 → 約{x['ret']:,.0f}円")
+            out.append(f"　{combo_str(pl['kind'], x['c'])}　{x['stake']:,}円 → 約{x['ret']:,.0f}円" + (f"（期待値{x['ev']:.2f}）" if x.get('ev') else ''))
         if pl['dropped']:
             out.append(f"　※予算に入りきらない{pl['dropped']}点は外しました")
         out.append("")
@@ -3635,6 +3700,7 @@ def parse_budget_unit(text):
     if not (('円' in t) or t.startswith('予算')):
         return None, None
     t = re.sub(r'^予算\s*', '', t)
+    t = re.sub(r'\s*(期待値|ケリー)(配分)?\s*', ' ', t).strip()
     t = re.sub(r'ずつ', '', t)
     t = re.sub(r'各|1点', ' ', t)
     parts = [x for x in re.split(r'\s+|(?<=円)(?=\S)', t) if x]
@@ -3671,7 +3737,7 @@ def command_reply(text, uid):
         return going_text(race, arr)
     if cmd == 'ハイレベル':
         return highlevel_text(race, arr)
-    return budget_text(race, arr, bv, parse_budget_unit(t)[1])
+    return budget_text(race, arr, bv, parse_budget_unit(t)[1], bool(re.search(r'期待値|ケリー', t)))
 
 
 # ═════════════════════════════════════════
@@ -3714,6 +3780,7 @@ def build_messages(text, base, uid='anon'):
     if text in ('成績', '成績確認'):
         return [TextSendMessage(text=stats_text())], None
     bv, unit = parse_budget_unit(text)
+    ev_mode = bool(re.search(r'期待値|ケリー', text))
     sess = get_session(uid) if bv else None
     if bv and sess and bv >= 100:
         race, arr = sess
@@ -3722,12 +3789,12 @@ def build_messages(text, base, uid='anon'):
         try:
             if fonts_ok(20):
                 with _render_lock:
-                    key = save_image(render_budget_image(race, arr, budget, unit))
+                    key = save_image(render_budget_image(race, arr, budget, unit, ev_mode))
                 msgs.append(ImageSendMessage(original_content_url=f"{base}/img/{key}.png",
                                              preview_image_url=f"{base}/img/{key}_pv.jpg"))
         except Exception:
             traceback.print_exc()
-        msgs.append(TextSendMessage(text=budget_text(race, arr, budget, unit)[:4900]))
+        msgs.append(TextSendMessage(text=budget_text(race, arr, budget, unit, ev_mode)[:4900]))
         return msgs, None
     cr = command_reply(text, uid)
     if cr:
