@@ -1777,6 +1777,8 @@ HL_TABLE = {}      # ハイレベル戦と判定したレース → [点数, 理
 HL_LOW = {}        # 低レベル戦と判定したレース → [点数, 理由]
 HL_SCORES = {}     # 判定したすべてのレース → 点数（0が平均、＋ほどハイレベル）
 try:
+    if os.environ.get('SYH_BACKTEST'):   # バックテストでは読まない（未来の結果が入っているため）
+        raise RuntimeError('バックテストでは使いません')
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'highlevel_races.json'), encoding='utf-8') as _f:
         _hl = json.load(_f)
     HL_TABLE, HL_SCORES = _hl.get('races', {}), _hl.get('scores', {})
@@ -2365,6 +2367,54 @@ def predict_positions(race, horses):
 
 
 # ═════════════════════════════════════════
+# レースシミュレーションの結果（パソコンで1000回走らせた結果。data/simulations.json。海外と重賞のみ）
+# ═════════════════════════════════════════
+SIMS = {}
+try:
+    if os.environ.get('SYH_BACKTEST'):
+        raise RuntimeError('バックテストでは使いません')
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'simulations.json'), encoding='utf-8') as _f:
+        SIMS = json.load(_f)
+    print(f"[sim] シミュレーションの結果を読み込み：{len(SIMS)}レース", flush=True)
+except Exception as _e:
+    print(f"[sim] シミュレーションの結果なし: {_e}", flush=True)
+
+
+def apply_simulation(race, horses):
+    """シミュレーションで一番多かった展開（ペース・逃げ馬・隊列）を、このレースの展開予想として使う"""
+    sim = SIMS.get(race.get('id'))
+    if not sim:
+        return False
+    by_n = {h['n']: h for h in horses}
+    for h in horses:
+        hs = sim['horses'].get(str(h['n']))
+        if not hs:
+            continue
+        h['sim'] = hs
+        h['earlyRatio'] = hs['early']
+        h['posGroup'] = hs['group']
+        h['bPos'] = 0.0
+    to_bot = {'先頭': '逃げ', '先団': '先行', '中団': '中団', '後方': '後方'}   # シミュレーションの呼び方 → Botの呼び方
+    for h in horses:
+        if h.get('sim'):
+            h['posGroup'] = to_bot.get(h['sim']['group'], h['sim']['group'])
+    order = sorted([h for h in horses if h.get('sim')], key=lambda h: h['sim']['early'])
+    race['lineup'] = {g: [h for h in order if h['posGroup'] == g] for g in GROUPS}
+    ld = by_n.get(sim['leader'])
+    race['leader'] = ld
+    share = sim['pace_share'].get(sim['pace'], 0)
+    race['pace'] = sim['pace']
+    race['pace_from'] = f"シミュレーション{sim['runs']}回で最多（{share * 100:.0f}%）"
+    race['hana'] = (f"シミュ{sim['runs']}回：{ld['n']}番が逃げ（{sim['leader_share'] * 100:.0f}%）・"
+                    f"{PACE_LABEL[sim['pace']]}ペース{share * 100:.0f}%") if ld else ''
+    if ld and sim['pace'] == 'slow' and sim['leader_share'] >= 0.5:
+        ld['bPos'] = 0.01     # 単騎で逃げられそう
+    race['nige'] = sum(1 for h in horses if h.get('sim') and h['sim']['group'] == '先頭')
+    race['simulation'] = sim
+    return True
+
+
+# ═════════════════════════════════════════
 # まとめ：LINEに返す文章を作る
 # ═════════════════════════════════════════
 def analyze(text):
@@ -2419,6 +2469,7 @@ def analyze(text):
     flow_analysis(race, horses)
     predict_positions(race, horses)
     race['nige'] = sum(1 for h in horses if h['st'] == '逃')
+    apply_simulation(race, horses)      # シミュレーションの結果があれば、その展開を使う（海外・重賞）
 
     highlevel_factors(race, horses)
     auto_heuristics(race, horses)
@@ -2454,6 +2505,10 @@ def format_reply(race, arr):
         out.append("　".join(f"{g}:{','.join(str(h['n']) for h in race['lineup'][g]) or 'ー'}" for g in GROUPS))
     if race['going'] != '良':
         out.append("道悪のため、道悪適性（血統・馬格・実績）を加点し、実力差を少し縮めて評価")
+    if race.get('simulation'):
+        sm = race['simulation']
+        top = '・'.join(str(n) for n in sm['ranking'][:5])
+        out.append(f"【シミュレーション{sm['runs']}回】平均着順の上位：{top}")
     if race.get('course'):
         out.append(f"【{race['venue']}の特徴】{race['course']['note']}")
     if race.get('trackBias'):
@@ -3195,6 +3250,10 @@ def make_reasons(race, h):
         R.append(('コース特性', f"{race['venue']}：{P['note']}。脚質{st_}・{h['n']}番の条件で"
                   f"{'有利' if h['bCourse'] > 0 else '不利'}"
                   + (f"。{h['courseNote']}" if h.get('courseNote') else '') + sgn(h['bCourse'])))
+    if h.get('sim'):
+        hs = h['sim']
+        R.append(('シミュレーション', f"{race['simulation']['runs']}回走らせて平均{hs['avg']:.1f}着（{hs['rank']}位）・"
+                  f"勝率{hs['win'] * 100:.1f}%・3着内{hs['top3'] * 100:.1f}%。位置取りは主に{hs['group']}"))
     if h.get('flowNotes'):
         R.append(('近走の中身', '。'.join(h['flowNotes']) + sgn(h.get('bFlow', 0))))
     if h.get('careerNotes'):
@@ -3211,7 +3270,7 @@ def sgn(v):
 SHORT_HEAD = {'総合評価': '総合評価', '過去レースのレベル': 'レース格', '対戦相手のその後': '対戦相手',
               '近走': '近走', 'コース・距離適性': '適性', '脚質・展開': '展開', '騎手・条件': '騎手・斤量',
               '道悪適性': '道悪', '穴馬チェック': '穴馬', '血統・厩舎': '血統', 'タイム': 'タイム',
-              '上がり': '上がり', '枠順': '枠順', '当日の馬場': '当日馬場', '騎手データ': '騎手成績', '状態': '状態', '全成績から': '全成績', '近走の中身': '近走の中身', 'コース特性': 'コース', '格付け': '格付け', '海外レース': '海外', 'ハイレベル戦': 'ハイレベル', '調教': '調教'}
+              '上がり': '上がり', '枠順': '枠順', '当日の馬場': '当日馬場', '騎手データ': '騎手成績', '状態': '状態', '全成績から': '全成績', '近走の中身': '近走の中身', 'コース特性': 'コース', '格付け': '格付け', '海外レース': '海外', 'ハイレベル戦': 'ハイレベル', '調教': '調教', 'シミュレーション': 'シミュ'}
 
 
 _cw_cache = {}
@@ -3905,7 +3964,7 @@ def test_page():
         return traceback.format_exc(), 500, {'Content-Type': 'text/plain; charset=utf-8'}
 
 
-if not os.environ.get('SYH_BACKTEST'):   # パソコンでのバックテスト時は、画像用の文字データを取りに行かない
+if not os.environ.get('SYH_BACKTEST') and not os.environ.get('SYH_NOFONT'):   # パソコンで動かすときは、画像用の文字データを取りに行かない
     threading.Thread(target=preload_fonts, daemon=True).start()
 
 
