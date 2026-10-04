@@ -18,10 +18,12 @@ from bs4 import BeautifulSoup
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage, ImageSendMessage
+from linebot.models import MessageEvent, TextMessage, TextSendMessage, ImageSendMessage, VideoSendMessage
 import glob
 import time
 import uuid
+import random
+import threading
 from flask import send_from_directory
 from PIL import Image, ImageDraw, ImageFont
 
@@ -143,12 +145,65 @@ def clamp(v, lo, hi):
 
 
 SESSION = requests.Session()
+SESSION.mount('https://', requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=16))
 BG = ThreadPoolExecutor(max_workers=8)   # 予想と同時に進める補助の取得用
+
+# ── netkeibaへのアクセスの交通整理 ──
+#   ・サイト（ホスト）ごとに同時アクセス数と間隔を制限（弾かれないように）
+#   ・タイムアウト・接続エラー・429・5xx は、間を空けて最大3回までやり直す
+#   ・作り置き（GitHub Actions）では SYH_BATCH=1 にして、さらにゆっくり取りに行く
+BATCH = bool(os.environ.get('SYH_BATCH'))
+HOST_LIMIT = {'db.netkeiba.com': 2 if BATCH else 4}          # それ以外のホストは下の既定値
+HOST_GAP = 1.0 if BATCH else 0.15                              # 同じホストへの最低間隔（秒）
+_host_sem, _host_last, _host_lock = {}, {}, threading.Lock()
+RETRY_STATUS = {429, 500, 502, 503, 504}
+
+
+class FetchError(Exception):
+    pass
+
+
+def _host_of(url):
+    m = re.match(r'https?://([^/]+)', url)
+    return m.group(1) if m else ''
+
+
+def http_get(url, timeout=15, retries=3, **kw):
+    """netkeibaへのGET。同時数・間隔の制限とやり直し付き。最後まで失敗したら例外"""
+    host = _host_of(url)
+    with _host_lock:
+        sem = _host_sem.setdefault(host, threading.Semaphore(HOST_LIMIT.get(host, 2 if BATCH else 4)))
+    last_err = None
+    for attempt in range(retries + 1):
+        with sem:
+            with _host_lock:
+                wait_s = _host_last.get(host, 0) + HOST_GAP - time.time()
+                _host_last[host] = max(time.time(), _host_last.get(host, 0) + HOST_GAP)
+            if wait_s > 0:
+                time.sleep(wait_s)
+            try:
+                res = SESSION.get(url, headers=HEADERS, timeout=timeout, **kw)
+            except (requests.Timeout, requests.ConnectionError) as e:
+                last_err = e
+                res = None
+        if res is not None:
+            if res.status_code not in RETRY_STATUS:
+                res.raise_for_status()        # 400/403/404 などはやり直しても同じなので、すぐ失敗
+                return res
+            last_err = requests.HTTPError(f'{res.status_code}', response=res)
+            ra = res.headers.get('Retry-After')
+            if ra and ra.isdigit():
+                time.sleep(min(30, int(ra)))
+        if attempt < retries:
+            time.sleep((1.5 ** attempt) * (2 if BATCH else 0.6) + random.random() * 0.5)
+    print(f"[fetch] 失敗（{retries + 1}回）: {url} {last_err}", flush=True)
+    if isinstance(last_err, requests.HTTPError):
+        raise last_err
+    raise FetchError(str(last_err))
 
 
 def fetch_soup(url, timeout=15):
-    res = SESSION.get(url, headers=HEADERS, timeout=timeout)
-    res.raise_for_status()
+    res = http_get(url, timeout=timeout)
     raw = res.content
     m = re.search(rb'charset=["\']?([\w-]+)', raw[:3000], re.I)
     enc = m.group(1).decode('ascii').lower() if m else 'euc-jp'
@@ -285,6 +340,8 @@ def parse_race_info(soup, race_id, base):
     dm = re.search(r'(芝|ダ|障)\s*(\d{3,4})m', d1t)
     r['surf'] = dm.group(1) if dm else '芝'
     r['dist'] = int(dm.group(2)) if dm else 0
+    cm = re.search(r'[(（]([^)）]*)[)）]', d1t)
+    r['courseNote'] = cm.group(1) if cm else ''          # 例「右 外 A」（動画のコース形状に使う）
     tm = re.search(r'(\d{1,2}:\d{2})発走', d1t)
     r['time'] = tm.group(1) if tm else ''
     gm = re.search(r'馬場\s*[:：]\s*(良|稍重?|重|不良?)', d1t)
@@ -459,7 +516,7 @@ def fetch_win_odds(race_id, base):
         url = ('https://race.netkeiba.com/api/api_get_jra_odds.html'
                f'?race_id={race_id}&type=1&action=update')
     try:
-        js = requests.get(url, headers=HEADERS, timeout=10).json()
+        js = http_get(url, timeout=10, retries=1).json()
         data = js.get('data')
         if not isinstance(data, dict):
             return {}
@@ -1117,22 +1174,41 @@ COURSE_DRAW = {('中山', '芝', 1200): 1.0, ('中山', '芝', 1600): 1.5, ('東
                ('中京', 'ダ', 1400): -0.7, ('新潟', 'ダ', 1200): -0.7, ('福島', 'ダ', 1150): -0.7}
 
 _cache = {}          # 取得結果の一時保存 {キー: (保存時刻, 値)}
+_cache_lock = threading.Lock()
+_key_locks = {}
+CACHE_MAX = 4000     # これを超えたら古いものから捨てる（Renderのメモリ対策）
 
 
-def cached(key, ttl, fn, fail_ttl=1800):
-    """取得結果を ttl 秒覚えておく。取れなかった（None・エラー）ときは fail_ttl 秒だけ覚えて、
-    同じ遅いページを何度も待たないようにする"""
-    now = time.time()
-    hit = _cache.get(key)
-    if hit and now - hit[0] < (ttl if hit[1] is not None else fail_ttl):
+def cached(key, ttl, fn, fail_ttl=300):
+    """取得結果を ttl 秒覚えておく。取れなかった（None・エラー）ときは fail_ttl 秒（5分）だけ覚えて、
+    同じ遅いページを何度も待たないようにする。同じキーを同時に取りに行かない（2本目は1本目の結果を待つ）"""
+    def fresh():
+        hit = _cache.get(key)
+        return hit if hit and time.time() - hit[0] < (ttl if hit[1] is not None else fail_ttl) else None
+    hit = fresh()
+    if hit:
         return hit[1]
-    try:
-        val = fn()
-    except Exception:
-        _cache[key] = (now, None)
-        raise
-    _cache[key] = (now, val)
-    return val
+    with _cache_lock:
+        lk = _key_locks.setdefault(key, threading.Lock())
+    with lk:
+        hit = fresh()
+        if hit:
+            return hit[1]
+        try:
+            val = fn()
+        except Exception:
+            with _cache_lock:
+                _cache[key] = (time.time(), None)
+            raise
+        finally:
+            with _cache_lock:
+                _key_locks.pop(key, None)
+        with _cache_lock:
+            _cache[key] = (time.time(), val)
+            if len(_cache) > CACHE_MAX:
+                for k in sorted(_cache, key=lambda k: _cache[k][0])[:len(_cache) - CACHE_MAX + 200]:
+                    _cache.pop(k, None)
+        return val
 
 
 def std_time(surf, dist, venue, cond):
@@ -1288,7 +1364,7 @@ def parse_race_date(soup):
 def race_ids_on(date):
     def load():
         url = f"https://race.netkeiba.com/top/race_list_sub.html?kaisai_date={date:%Y%m%d}"
-        res = SESSION.get(url, headers=HEADERS, timeout=10)
+        res = http_get(url, timeout=10)
         return sorted(set(re.findall(r'race_id=(\d{12})', res.text)))
     return cached(('list', date), 600, load)
 
@@ -3787,6 +3863,65 @@ def parse_budget(text):
     return parse_budget_unit(text)[0]
 
 
+# ═════════════════════════════════════════
+# 展開動画（1000回シミュレーション）
+#   ・中央の週末のレースは GitHub Actions が枠順確定後に作り置きして Cloudflare R2 に置く
+#   ・Bot は R2 の一覧（index.json。URLは環境変数 VIDEO_INDEX_URL）を見て、あればそれを送る
+#   ・作り置きが無いレースは「動画」と送ったときに、その場で作る
+# ═════════════════════════════════════════
+try:
+    import sim_video as SV
+except Exception as _e:   # numpy / imageio-ffmpeg が入っていないとき
+    SV = None
+    print(f"[video] 動画機能なし: {_e}", flush=True)
+VIDEO_INDEX_URL = os.environ.get('VIDEO_INDEX_URL', '')
+
+
+def horse_sig(arr):
+    """出走馬の顔ぶれ（取消が出たら変わる）"""
+    return '-'.join(str(n) for n in sorted(h['n'] for h in arr if h.get('n')))
+
+
+def video_index():
+    if not VIDEO_INDEX_URL:
+        return {}
+    def load():
+        r = requests.get(VIDEO_INDEX_URL, timeout=5)
+        r.raise_for_status()
+        return r.json()
+    try:
+        return cached(('video_index',), 120, load, fail_ttl=60) or {}
+    except Exception:
+        return {}
+
+
+def prebuilt_video(race, arr):
+    """作り置きの動画。顔ぶれが変わっていたら（取消など）使わない"""
+    e = video_index().get(race.get('id') or '')
+    if not e or e.get('horses') != horse_sig(arr):
+        return None
+    return e
+
+
+def video_message(race, arr, base, allow_make=False):
+    """LINEに送る動画のメッセージ。作り置きがあればそれ、無ければ allow_make のときだけその場で作る"""
+    e = prebuilt_video(race, arr)
+    if e:
+        return VideoSendMessage(original_content_url=e['mp4'], preview_image_url=e['jpg'])
+    if not (allow_make and SV):
+        return None
+    t0 = time.time()
+    sim = SV.simulate(race, arr)
+    if not sim:
+        return None
+    os.makedirs(IMG_DIR, exist_ok=True)
+    key = uuid.uuid4().hex
+    with _render_lock:
+        SV.make_video(race, arr, sim, os.path.join(IMG_DIR, key + '.mp4'), os.path.join(IMG_DIR, key + '_pv.jpg'))
+    print(f"[video] その場で作成 {time.time() - t0:.1f}秒", flush=True)
+    return VideoSendMessage(original_content_url=f"{base}/img/{key}.mp4", preview_image_url=f"{base}/img/{key}_pv.jpg")
+
+
 def command_reply(text, uid):
     """対話型コマンドなら返事の文章を、そうでなければ None"""
     t = text.strip()
@@ -3864,6 +3999,18 @@ def build_messages(text, base, uid='anon'):
             traceback.print_exc()
         msgs.append(TextSendMessage(text=budget_text(race, arr, budget, unit, ev_mode)[:4900]))
         return msgs, None
+    if text.strip() in ('動画', '展開動画'):
+        sess = get_session(uid)
+        if not sess:
+            return [TextSendMessage(text="先にレースのURLを送ってください。予想のあと30分間は「動画」で展開動画を送ります")], None
+        try:
+            vm = video_message(*sess, base, allow_make=True)
+        except Exception as e:
+            traceback.print_exc()
+            vm = None
+        if not vm:
+            return [TextSendMessage(text="このレースの展開動画は作れませんでした")], None
+        return [vm], None
     cr = command_reply(text, uid)
     if cr:
         return [TextSendMessage(text=cr[:4900])], None
@@ -3881,7 +4028,7 @@ def _build_prediction(text, base):
     if not ("netkeiba.com" in text or re.fullmatch(r'\d{12}', text) or re.fullmatch(r'\d{4}[A-Z][0-9A-Za-z]{7}(\s+\S+)?', text)):
         return [TextSendMessage(text="netkeibaの出馬表のURL（またはレースID12桁）を送ってください！\n"
                                      "「成績」と送ると、これまでの予想の成績を確認できます。\n"
-                                     "予想のあと30分間は「血統」「馬場」「3000円（予算）」「ハイレベル」でも答えます。")], None
+                                     "予想のあと30分間は「血統」「馬場」「3000円（予算）」「ハイレベル」「動画」でも答えます。")], None
     try:
         result, err = analyze(text)
     except requests.HTTPError as e:
@@ -3904,6 +4051,12 @@ def _build_prediction(text, base):
         for key in keys:
             messages.append(ImageSendMessage(original_content_url=f"{base}/img/{key}.png",
                                              preview_image_url=f"{base}/img/{key}_pv.jpg"))
+        try:   # 作り置きの展開動画があれば一緒に（LINEの返信は1回5件まで）
+            vm = video_message(race, arr, base) if len(messages) <= 3 else None
+            if vm:
+                messages.append(vm)
+        except Exception:
+            traceback.print_exc()
         messages.append(TextSendMessage(text=bets_text(race, arr)))
         return messages, (race, arr)
     except Exception as e:
@@ -3927,6 +4080,12 @@ def process_message(reply_token, text, base, uid='anon'):
         print(f'[reply] 送信OK（{len(messages)}件・{time.time() - t0:.1f}秒）', flush=True)
     except Exception as e:
         print(f'[reply] 返信に失敗: {e}', flush=True)
+        if uid and uid != 'anon':   # 時間切れなどで返信できなかったら、push で送り直す（pushは月の通数に数えられる）
+            try:
+                line_bot_api.push_message(uid, messages)
+                print(f'[reply] pushで送り直しOK（{time.time() - t0:.1f}秒）', flush=True)
+            except Exception as e2:
+                print(f'[reply] pushも失敗: {e2}', flush=True)
     if after:   # 返信を送ったあとで、成績の記録と答え合わせ（予想の速さには影響しない）
         _safe(after)
 
