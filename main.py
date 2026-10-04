@@ -1958,7 +1958,7 @@ def class_move_factors(race, horses):
     today_v = CLS[race['clsIdx']][1]
     venue = race['venue']
     for h in horses:
-        ls = [l for l in h['lines'] if l['pos'] > 0 or l.get('pos'] == 0]
+        ls = [l for l in h['lines'] if l['pos'] > 0 or l.get('pos') == 0]
         if not ls:
             continue
         l0 = ls[0]
