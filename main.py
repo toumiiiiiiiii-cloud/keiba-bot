@@ -2790,7 +2790,7 @@ def gold_frame(d, box, r=14, w=2):
 
 def render_image(race, arr):
     W, PAD = 1080, 36
-    row_h = 92
+    row_h = 96
     brows = bet_rows_for(arr)
     bet_h = 92 + bet_section_height(brows, W - PAD * 2 - 120) - 80   # 下の「box_h = 80 + bet_h」に合わせる
     LU_H = lineup_height(race)
@@ -3401,7 +3401,8 @@ def render_reasons_image(race, targets, page, pages):
     img = gradient_bg(W, H)
     d = ImageDraw.Draw(img)
     gold_frame(d, (14, 14, W - 14, H - 14), r=22, w=3)
-    ctext(d, W / 2, 40, f'シェイクユアハート ／ 根拠 {page}/{pages}', F('serif_b', 44), GOLD)
+    ctext(d, W / 2, 40, f'シェイクユアハート ／ 根拠 {page}/{pages}' if page else 'シェイクユアハート ／ 詳しい根拠',
+          F('serif_b', 44), GOLD)
     title = f"{race['venue']}{race['R']}R {race['name']}"
     ctext(d, W / 2, 106, fit_text(d, title, F('sans_b', 34), W - PAD * 2), F('sans_b', 34), SILVER)
     d.line((PAD + 120, 166, W - PAD - 120, 166), fill=GOLD_D, width=2)
@@ -3431,6 +3432,260 @@ def render_reasons_image(race, targets, page, pages):
             yy += len(body) * 36 + 12
         y += height + 20
     ctext(d, W / 2, y + 10, '※根拠は過去5走とnetkeibaの出馬表から自動で作成しています', F('sans_r', 20), MUTED)
+    return img
+
+
+# ═════════════════════════════════════════
+# 全頭短評（2枚目）：1頭2〜3行で、強みと不安をひとことに
+# ═════════════════════════════════════════
+def _cut(t, n=10):
+    return re.split(r'[（(]', t or '')[0].strip()[:n]
+
+
+def short_comment(race, h):
+    """1行（長くても2行）の短評。強み2つ＋不安1つを、根拠の加点・減点の大きさから選ぶ"""
+    pace = PACE_LABEL[race['pace']]
+    g = h.get
+    cond = _cut((g('condNotes') or [''])[0], 12)
+    car = _cut((g('careerNotes') or [''])[0], 10)
+    f = [  # (点数, 強み, 不安)
+        (g('bPos', 0), '単騎逃げ濃厚', 'ハナ争い'),
+        (g('paceAdj', 0), f'{pace}の展開向く', f'{pace}の展開不向き'),
+        (g('bTime', 0), '時計上位', '時計見劣り'),
+        (g('bAgari', 0), f"上がり{g('agRank')}位の末脚", '末脚見劣り'),
+        (g('rl', 0) * 0.4, '相手骨っぽい中で好走', ''),
+        (g('bHL', 0), 'ハイレベル戦好走', 'ハイレベル戦で凡走'),
+        (g('bJockey', 0), '鞍上好調', '騎手データ'),
+        (g('bTrain', 0), '調教良好', '調教いまひとつ'),
+        (g('bCond', 0), '叩き2戦目' if '叩き' in cond else '状態上向き', '休み明け' if '休み明け' in cond else '状態面'),
+        (g('bFlow', 0), '近走内容濃い', '近走内容薄い'),
+        (g('bCareer', 0), car or '条件好転', car or '全成績'),
+        (g('bDraw', 0), '枠順有利', '枠順不利'),
+        (g('bTrack', 0), '今日の馬場◎', '今日の馬場合わず'),
+        (g('bCourse', 0), 'コース向く', 'コース合わず'),
+        ((g('form', 3) - 3) * 0.012, '近走好調', '近走不振'),
+    ]
+    if race.get('going') != '良':
+        f.append((g('mudb', 0), '道悪巧者', '道悪苦手'))
+    if g('distSum', 0) > 0:
+        f.append((min(g('distSum'), 2.5) * 0.012, '距離実績', ''))
+    if g('cl'):
+        f.append((g('cl')['gap'] * 0.02, '格上相手に実績', '相手強化'))
+    pos = [x[1] for x in sorted([x for x in f if x[0] >= 0.004 and x[1]], key=lambda x: -x[0])[:2]]
+    neg = [x[2] for x in sorted([x for x in f if x[0] <= -0.004 and x[2]], key=lambda x: x[0])[:1]]
+    s = ''
+    if g('isNew'):
+        s += '新馬。血統から評価。'
+    if g('anaFlag'):
+        s += '穴条件あり。'
+    if pos:
+        s += '＋'.join(pos) + '。'
+    if neg:
+        s += f'{neg[0]}が課題。'
+    if g('o'):
+        ev = h['p'] * h['o']
+        s += '妙味大。' if ev >= 1.3 else '過剰人気気味。' if ev < 0.7 else ''
+    return s or '判断材料が少ない。'
+
+
+def short_mark(i, h):
+    """◎○▲△△△☆ のあとは、穴の条件があれば「注」、ランクB以上は「押」、それ以外は「消」"""
+    if i < len(MARKS):
+        return MARKS[i]
+    if h.get('anaFlag'):
+        return '注'
+    return '押' if h.get('rank') in ('S', 'A', 'B') else '消'
+
+
+MARK_STYLE = {'◎': ((170, 30, 40), (255, 255, 255)), '○': ((30, 70, 170), (255, 255, 255)),
+              '▲': ((190, 150, 40), (255, 255, 255)), '△': ((60, 66, 84), (255, 255, 255)),
+              '☆': ((150, 110, 30), (255, 240, 200)), '注': ((70, 76, 96), (255, 255, 255)),
+              '押': ((30, 110, 60), (255, 255, 255)), '消': ((40, 44, 56), (170, 176, 190))}
+MARK_NAME = [('◎', '本命'), ('○', '対抗'), ('▲', '単穴'), ('☆', '穴'), ('△', '連下'), ('注', '注意'), ('押', '押さえ'), ('消', '消し')]
+
+
+def draw_mark(d, cx, cy, mk, r=24):
+    bg, fg = MARK_STYLE.get(mk, MARK_STYLE['△'])
+    d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=bg, outline=GOLD_D, width=2)
+    ctext(d, cx, cy - r * 0.78, mk, F('sans_b', int(r * 1.15)), fg)
+
+
+def render_short_image(race, arr):
+    """全馬 印＆短評。馬名の横に短評を置いて、文字を大きくする（1頭1〜2行）"""
+    W, PAD = 1440, 30
+    fN, fC = F('sans_b', 34), F('sans_b', 28)
+    c_mark, c_num, c_name = PAD + 18, PAD + 100, PAD + 170      # 列の左端
+    c_cmt = c_name + 400
+    cmt_w = W - PAD - 20 - c_cmt
+    tmp = ImageDraw.Draw(Image.new('RGB', (10, 10)))
+    rows = []
+    for i, h in enumerate(arr):
+        lines = wrap(tmp, short_comment(race, h), fC, cmt_w)[:2]
+        rows.append((i, h, short_mark(i, h), lines, 78 if len(lines) == 1 else 112))
+    H = 444 + sum(r[4] for r in rows) + 30 + 300
+    img = gradient_bg(W, H)
+    d = ImageDraw.Draw(img)
+    gold_frame(d, (14, 14, W - 14, H - 14), r=24, w=3)
+    date = race.get('date')
+    top = (f"{date:%m/%d} " if hasattr(date, 'strftime') else '') + f"{race['venue']}{race['R']}R"
+    ctext(d, W / 2, 34, top, F('sans_b', 34), SILVER)
+    ctext(d, W / 2, 80, fit_text(d, race['name'], F('serif_b', 64), W - 200), F('serif_b', 64), GOLD)
+    ctext(d, W / 2, 168, '全馬印＆短評', F('serif_b', 52), (250, 236, 200))
+    sub = f"{race['surf']}{race['dist']}m ／ 馬場 {race.get('going', '')} ／ {PACE_LABEL[race['pace']]}ペース想定 ／ 並び順：印順"
+    sw = tw(d, sub, F('sans_r', 26)) + 60
+    d.rounded_rectangle((W / 2 - sw / 2, 240, W / 2 + sw / 2, 286), radius=23, fill=(20, 28, 52), outline=GOLD_D)
+    ctext(d, W / 2, 246, sub, F('sans_r', 26), SILVER)
+    # 凡例
+    y = 312
+    d.rounded_rectangle((PAD, y, W - PAD, y + 64), radius=14, fill=(14, 22, 42), outline=GOLD_D, width=2)
+    lx = PAD + 34
+    step = (W - PAD * 2 - 40) / len(MARK_NAME)
+    for k, (mk, nm) in enumerate(MARK_NAME):
+        x = lx + k * step
+        draw_mark(d, x + 18, y + 32, mk, r=19)
+        d.text((x + 46, y + 14), nm, font=F('sans_b', 26), fill=SILVER)
+    y += 84
+    # 表の見出し
+    d.rectangle((PAD, y, W - PAD, y + 48), fill=(34, 30, 20))
+    for cx, t in ((c_mark + 24, '印'), (c_num + 26, '馬番'), (c_name + 180, '馬名'), (c_cmt + cmt_w / 2, '短評')):
+        ctext(d, cx, y + 8, t, F('sans_b', 24), GOLD)
+    y += 48
+    for k, (i, h, mk, lines, rh) in enumerate(rows):
+        d.rectangle((PAD, y, W - PAD, y + rh), fill=(16, 24, 46) if k % 2 == 0 else (11, 17, 34))
+        d.line((PAD, y + rh, W - PAD, y + rh), fill=(60, 54, 36), width=1)
+        for cx in (c_num - 8, c_name - 10, c_cmt - 14):
+            d.line((cx, y, cx, y + rh), fill=(60, 54, 36), width=1)
+        cy = y + rh / 2
+        draw_mark(d, c_mark + 24, cy, mk)
+        bg, fg = WAKU.get(h.get('w') or 0, ((245, 245, 245), (20, 20, 20)))
+        d.rounded_rectangle((c_num + 2, cy - 24, c_num + 50, cy + 24), radius=8, fill=bg, outline=GOLD_D)
+        ctext(d, c_num + 26, cy - 20, str(h['n']), F('sans_b', 30), fg)
+        fz = next((F('sans_b', z) for z in (34, 30, 26, 23) if tw(d, h['name'], F('sans_b', z)) <= 380), F('sans_b', 23))
+        d.text((c_name, cy - fz.size * 0.72), fit_text(d, h['name'], fz, 380), font=fz, fill=(250, 250, 255))
+        ty = cy - len(lines) * 17 - 2
+        for j, ln in enumerate(lines):
+            d.text((c_cmt, ty + j * 36), ln, font=fC, fill=(225, 228, 238))
+        y += rh
+    # 注目ポイント
+    y += 30
+    d.rounded_rectangle((PAD, y, W - PAD, y + 210), radius=18, fill=(14, 22, 42))
+    gold_frame(d, (PAD, y, W - PAD, y + 210), r=18, w=2)
+    ctext(d, PAD + 150, y + 64, '注目ポイント', F('serif_b', 40), GOLD)
+    ctext(d, PAD + 150, y + 118, 'KEY POINTS', F('sans_b', 20), GOLD_D)
+    d.line((PAD + 300, y + 24, PAD + 300, y + 186), fill=GOLD_D, width=2)
+    val = [h for h in arr[1:10] if h.get('o')]
+    val = max(val, key=lambda h: h['p'] * h['o']) if val else None
+    pts = [f"本命は {arr[0]['n']} {arr[0]['name']}"]
+    if val and val['p'] * val['o'] >= 1.1:
+        pts.append(f"妙味なら {val['n']} {val['name']}")
+    if len(arr) >= 3:
+        pts.append(f"相手本線は {arr[1]['name']} ＆ {arr[2]['name']}")
+    for j, t in enumerate(pts):
+        py = y + 30 + j * 56
+        d.ellipse((PAD + 330, py, PAD + 370, py + 40), fill=GOLD)
+        ctext(d, PAD + 350, py + 3, str(j + 1), F('sans_b', 26), (30, 24, 10))
+        d.text((PAD + 388, py - 2), fit_text(d, t, F('sans_b', 34), W - PAD - 420), font=F('sans_b', 34), fill=(250, 236, 200))
+    ctext(d, W / 2, y + 222, '馬名か馬番（例：10番）を送ると、その馬の詳しい根拠を返します', F('sans_b', 24), MUTED)
+    return img
+
+
+def find_horse(text, arr):
+    """「10番」「10」「フィンガー」「フィン」などから馬を探す"""
+    t = text.strip().replace(' ', '').replace('　', '')
+    t = t.translate(str.maketrans('０１２３４５６７８９', '0123456789'))
+    m = re.fullmatch(r'(\d{1,2})番?', t)
+    if m:
+        return next((h for h in arr if h.get('n') == int(m.group(1))), None)
+    if len(t) < 2:
+        return None
+    exact = [h for h in arr if h['name'] == t]
+    if exact:
+        return exact[0]
+    part = [h for h in arr if t in h['name']]
+    return part[0] if len(part) == 1 else None
+
+
+def horse_detail_image(race, arr, h):
+    i = arr.index(h)
+    return render_reasons_image(race, [(i if i < len(MARKS) else 99, h)], 0, 0)
+
+
+# ═════════════════════════════════════════
+# 展開図（3枚目）：スタート後・3コーナー・4コーナーの隊列（右が先頭、上が内ラチ）
+# ═════════════════════════════════════════
+def render_tenkai_image(race, arr, sim):
+    stages = SV.stage_layout(race, arr, sim)
+    by_n = {h['n']: h for h in arr if h.get('n')}
+    W, PAD = 1080, 32
+    R_ = 25                      # 丸の半径
+    MAX_LANE = 6                 # 段（内→外）の最大数
+    x_r, x_l = W - PAD - 64, PAD + 100
+    # 横に近い馬は外（下の段）へ
+    layouts = []
+    for name, gaps, gain in stages:
+        placed = []
+        if name == '4コーナー':     # 勢い：ほかの馬より多く詰めた分だけ（全体の詰まりは差し引く）
+            med = sorted(gain.values())[len(gain) // 2]
+            gain = {n: v - med for n, v in gain.items()}
+        min_dx = R_ * 2 + 30
+        sc = (x_r - x_l) / (max(gaps.values()) or 1)   # 地点ごとに横幅いっぱいに広げる（先頭〜最後方）
+        for n in sorted(gaps, key=lambda n: gaps[n]):
+            x = x_r - gaps[n] * sc
+            def room(l):   # その段で一番近い馬までの距離
+                return min([abs(px - x) for _, px, pl in placed if pl == l] or [9999])
+            free = [l for l in range(MAX_LANE) if room(l) >= min_dx]
+            lane = free[0] if free else max(range(MAX_LANE), key=room)   # 5段までに収める
+            placed.append((n, x, lane))
+        layouts.append((name, placed, gain))
+    row_h = 96
+    panel_h = [76 + (max(p[2] for p in pl) + 1) * row_h + 24 for _, pl, _ in layouts]
+    H = 200 + sum(ph + 22 for ph in panel_h) + 150
+    img = gradient_bg(W, H)
+    d = ImageDraw.Draw(img)
+    gold_frame(d, (14, 14, W - 14, H - 14), r=22, w=3)
+    ctext(d, W / 2, 34, 'シェイクユアハート ／ 展開予想', F('serif_b', 44), GOLD)
+    title = f"{race['venue']}{race['R']}R {race['name']}"
+    ctext(d, W / 2, 98, fit_text(d, title, F('sans_b', 32), W - PAD * 2), F('sans_b', 32), SILVER)
+    d.line((PAD + 120, 156, W - PAD - 120, 156), fill=GOLD_D, width=2)
+    y = 176
+    for (name, placed, gain), ph in zip(layouts, panel_h):
+        d.rounded_rectangle((PAD, y, W - PAD, y + ph), radius=16, fill=(14, 22, 42))
+        gold_frame(d, (PAD, y, W - PAD, y + ph), r=16)
+        d.rounded_rectangle((PAD + 18, y + 14, PAD + 190, y + 54), radius=20, fill=(48, 38, 16), outline=GOLD_D)
+        ctext(d, PAD + 104, y + 17, name, F('sans_b', 24), GOLD)
+        d.text((W - PAD - 190, y + 20), '進行方向 ▶', font=F('sans_b', 22), fill=MUTED)
+        ty = y + 66
+        d.rounded_rectangle((PAD + 14, ty, W - PAD - 14, y + ph - 14), radius=10, fill=(30, 66, 42))
+        d.line((PAD + 14, ty + 2, W - PAD - 14, ty + 2), fill=(225, 228, 236), width=4)     # 内ラチ
+        ctext(d, PAD + 44, ty + 14, '内ラチ', F('sans_b', 16), (225, 228, 236))
+        ctext(d, PAD + 44, y + ph - 46, '外', F('sans_b', 16), (160, 175, 165))
+        for n, x, lane in placed:
+            cy = ty + 46 + lane * row_h
+            h = by_n.get(n, {})
+            bg, fg = WAKU.get(h.get('w') or 0, ((245, 245, 245), (20, 20, 20)))
+            d.ellipse((x - R_, cy - R_, x + R_, cy + R_), fill=bg, outline=(20, 20, 20), width=2)
+            ctext(d, x, cy - 15, str(n), F('sans_b', 24), fg)
+            ctext(d, x, cy + R_ + 2, (h.get('name') or '')[:4], F('sans_b', 18), SILVER)
+            if name == '4コーナー':                 # 3→4コーナーで詰めた馬に「》」
+                gm = gain.get(n, 0)
+                k = 3 if gm > 8 else 2 if gm > 4 else 1 if gm > 1.5 else 0
+                if k:
+                    cw_ = tw(d, '》' * k, F('sans_b', 16))
+                    d.rounded_rectangle((x + 8, cy - R_ - 12, x + 16 + cw_, cy - R_ + 10), radius=8, fill=(120, 24, 30))
+                    d.text((x + 12, cy - R_ - 13), '》' * k, font=F('sans_b', 16), fill=(255, 200, 200))
+        y += ph + 22
+    # 下の説明
+    ld = race.get('leader')
+    tr = SV.track_of(race)
+    rep = sim['rep']
+    l1 = f"予想：{PACE_LABEL[race['pace']]}ペース" + (f"・{ld['n']}番{ld['name']}が逃げ" if ld else '')
+    l2 = f"{race['venue']} {race['surf']}{race['dist']}m {'右' if tr['right'] else '左'}回り ／ シミュ{sim['runs']}回："
+    l2 += (f"この展開になったのは{rep['n_match']}回" if rep.get('match') == 'pred'
+           else 'この逃げ馬になった回は無く、ペースだけ合わせた回を表示' if rep.get('match') == 'pred_pace'
+           else '最も多かった展開を表示')
+    ctext(d, W / 2, y + 8, fit_text(d, l1, F('sans_b', 28), W - PAD * 2), F('sans_b', 28), GOLD)
+    ctext(d, W / 2, y + 50, fit_text(d, l2, F('sans_r', 22), W - PAD * 2), F('sans_r', 22), SILVER)
+    ctext(d, W / 2, y + 88, '》は3→4コーナーで差を詰めた馬（多いほど勢いあり）。「動画」で動きも見られます', F('sans_r', 20), MUTED)
     return img
 
 
@@ -3895,10 +4150,18 @@ def video_index():
         return {}
 
 
+def pred_shape(race):
+    """予想画像の展開（ペースと逃げ馬）。作り置きの動画と食い違っていないかの確認用"""
+    ld = race.get('leader')
+    return f"{race.get('pace') or ''}|{ld['n'] if ld else ''}"
+
+
 def prebuilt_video(race, arr):
-    """作り置きの動画。顔ぶれが変わっていたら（取消など）使わない"""
+    """作り置きの動画。顔ぶれ（取消など）や予想の展開が変わっていたら使わない（「動画」でその場で作り直す）"""
     e = video_index().get(race.get('id') or '')
     if not e or e.get('horses') != horse_sig(arr):
+        return None
+    if e.get('shape') and e['shape'] != pred_shape(race):
         return None
     return e
 
@@ -4012,6 +4275,14 @@ def build_messages(text, base, uid='anon'):
             return [TextSendMessage(text="このレースの展開動画は作れませんでした")], None
         return [vm], None
     cr = command_reply(text, uid)
+    if not cr and not ('netkeiba.com' in text or re.fullmatch(r'\d{12}', text.strip())):
+        sess = get_session(uid)
+        h = find_horse(text, sess[1]) if sess else None
+        if h:   # 馬名・馬番 → その馬の詳しい根拠
+            with _render_lock:
+                key = save_image(horse_detail_image(sess[0], sess[1], h))
+            return [ImageSendMessage(original_content_url=f"{base}/img/{key}.png",
+                                     preview_image_url=f"{base}/img/{key}_pv.jpg")], None
     if cr:
         return [TextSendMessage(text=cr[:4900])], None
     msgs, race_arr = _build_prediction(text, base)
@@ -4028,7 +4299,7 @@ def _build_prediction(text, base):
     if not ("netkeiba.com" in text or re.fullmatch(r'\d{12}', text) or re.fullmatch(r'\d{4}[A-Z][0-9A-Za-z]{7}(\s+\S+)?', text)):
         return [TextSendMessage(text="netkeibaの出馬表のURL（またはレースID12桁）を送ってください！\n"
                                      "「成績」と送ると、これまでの予想の成績を確認できます。\n"
-                                     "予想のあと30分間は「血統」「馬場」「3000円（予算）」「ハイレベル」「動画」でも答えます。")], None
+                                     "予想のあと30分間は「血統」「馬場」「3000円（予算）」「ハイレベル」「動画」、馬名・馬番（詳しい根拠）でも答えます。")], None
     try:
         result, err = analyze(text)
     except requests.HTTPError as e:
@@ -4046,7 +4317,14 @@ def _build_prediction(text, base):
             raise RuntimeError('サーバー起動直後で画像用の文字データを準備中です。1〜2分後にもう一度送ってください')
         messages = []
         with _render_lock:  # 画像づくりは1件ずつ（フォントの同時使用でサーバーが落ちるのを防ぐ）
-            imgs = [render_image(race, arr)] + render_reasons_images(race, arr)
+            imgs = [render_image(race, arr), render_short_image(race, arr)]
+            try:   # 3枚目：展開図（動画と同じ「予想どおりの展開になった代表の1回」から）
+                if SV:
+                    sim = SV.simulate(race, arr)
+                    if sim:
+                        imgs.append(render_tenkai_image(race, arr, sim))
+            except Exception:
+                traceback.print_exc()
             keys = [save_image(im) for im in imgs]
         for key in keys:
             messages.append(ImageSendMessage(original_content_url=f"{base}/img/{key}.png",

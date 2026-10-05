@@ -31,11 +31,13 @@ def _early_ratio(h):
     return float(r)
 
 
-def simulate(race, arr, runs=1000, seed=None):
+def simulate(race, arr, runs=1000, seed=None, match_prediction=True):
     """各馬の位置取り（earlyRatio）と勝率（p）から、1000回レースを走らせて集計する。
     ・序盤：近走の位置取り＋ゆらぎ＋たまに出遅れ → 隊列とペースが決まる
     ・ゴール：勝率（Plackett-Luce：log p ＋ ガンベル乱数）に、その回のペースの有利不利を足す
-    結果の形は data/simulations.json と同じ（apply_simulation でそのまま読める）＋動画用の代表レース"""
+    結果の形は data/simulations.json と同じ（apply_simulation でそのまま読める）＋動画用の代表レース
+    match_prediction=True のときは、代表レースを「予想画像と同じペース・同じ逃げ馬」の回から選ぶ
+    （画像と動画で展開が食い違わないように。上部の「1000回中◯%」は1000回全体の集計のまま）"""
     horses = [h for h in arr if h.get('n')]
     N = len(horses)
     if N < 2:
@@ -81,10 +83,19 @@ def simulate(race, arr, runs=1000, seed=None):
     for pos, i in enumerate(order_e):
         group[i] = '先頭' if i == modal_leader else '先団' if pos < n_front else '中団' if pos < n_mid else '後方'
 
-    # 代表の1回：最多のペース・最多の逃げ馬で、平均的な着順・隊列にいちばん近い回
-    cand = np.where((pace == modal_pace) & (leader_idx == modal_leader))[0]
+    # 代表の1回：予想と同じペース・同じ逃げ馬の回（無ければ1000回で最多の形）から、平均的な着順・隊列にいちばん近い回
+    want_pace = pace_keys.index(race['pace']) if match_prediction and race.get('pace') in pace_keys else modal_pace
+    ld = race.get('leader') if match_prediction else None
+    want_lead = int(np.where(nums == ld['n'])[0][0]) if ld and ld.get('n') in set(nums.tolist()) else modal_leader
+    match = 'pred' if match_prediction and (race.get('pace') in pace_keys) else 'modal'
+    cand = np.where((pace == want_pace) & (leader_idx == want_lead))[0]
+    n_match = int(len(cand))
+    if len(cand) == 0:              # その組み合わせが1回も出なかったら、ペースだけ合わせる
+        cand = np.where(pace == want_pace)[0]
+        match = match + '_pace'
     if len(cand) == 0:
         cand = np.where(pace == modal_pace)[0]
+        match = 'modal'
     dist_ = (np.abs(fin_rank[cand] - (avg_fin - 1)[None, :]).sum(axis=1)
              + 0.5 * np.abs(early_rank[cand] - avg_early[None, :]).sum(axis=1))
     rep = int(cand[dist_.argmin()])
@@ -110,6 +121,9 @@ def simulate(race, arr, runs=1000, seed=None):
             'finish_order': [int(nums[i]) for i in fo],
             'margins': margins,                          # 1着からの差（馬身）
             'pace': pace_keys[int(pace[rep])],
+            'leader': int(nums[early_rank[rep].argmin()]),
+            'match': match,                              # pred＝予想どおり / pred_pace＝ペースだけ一致 / modal＝最多の形
+            'n_match': n_match,                          # 予想と同じ形になった回数（1000回中）
         },
     }
     return out
@@ -271,7 +285,7 @@ def make_video(race, arr, sim, out_mp4, out_jpg=None, seconds=14):
     import imageio_ffmpeg
     dist = int(race.get('dist') or 1600)
     tr = track_of(race)
-    course = Course(tr, (40, 104, W - 40, H - 108 + BAND))
+    course = Course(tr, (40, 112, W - 40, H - 108 + BAND))
     g_early, g_fin, gate = _plan(race, arr, sim)
     by_n = {h['n']: h for h in arr if h.get('n')}
     nums = list(g_early.keys())
@@ -293,7 +307,18 @@ def make_video(race, arr, sim, out_mp4, out_jpg=None, seconds=14):
     tw_ = d.textlength(tag, font=font('b', 19))
     d.rounded_rectangle((W - 36 - tw_ - 24, 58, W - 30, 90), radius=14, fill=(48, 38, 16), outline=GOLD_D)
     d.text((W - 36 - tw_ - 12, 62), tag, font=font('b', 19), fill=GOLD)
-    d.text((28, H - 32), '※1000回で最も多かった展開に近い1回を再現。コース形状は目安です', font=font('r', 15), fill=MUTED)
+    rep = sim['rep']
+    if rep.get('match', '').startswith('pred'):
+        pl = f"予想の展開：{PACE_LABEL[rep['pace']]}ペース・{rep['leader']}番が逃げ"
+        pl += f"（1000回中{rep['n_match']}回）" if rep['match'] == 'pred' else '（ペースのみ一致）'
+        foot = '※予想と同じ展開になった回のうち、平均的な1回を再現。コース形状は目安です'
+    else:
+        pl, foot = '', '※1000回で最も多かった展開に近い1回を再現。コース形状は目安です'
+    if pl:
+        pw = d.textlength(pl, font=font('b', 17))
+        d.rounded_rectangle((W - 36 - pw - 24, 96, W - 30, 124), radius=12, fill=(18, 40, 60), outline=(70, 120, 170))
+        d.text((W - 36 - pw - 12, 99), pl, font=font('b', 17), fill=(170, 210, 245))
+    d.text((28, H - 32), foot, font=font('r', 15), fill=MUTED)
 
     f_num = font('b', 15)
     f_small = font('b', 13)
@@ -392,3 +417,25 @@ def _result_panel(img, sim, by_n, t):
         r_ = f"{st.get('win', 0) * 100:.0f}% ／ {st.get('top3', 0) * 100:.0f}%"
         d.text((bx[2] - 30 - d.textlength(r_, font=font('b', 20)), y + 2), r_, font=font('b', 20), fill=GOLD)
         y += 46
+
+
+# ═════════════════════════════════════════
+# 展開図（スタート後・3コーナー・4コーナー）用の位置
+# ═════════════════════════════════════════
+STAGES = [('スタート後', 0.0, 0.75), ('3コーナー', 0.2, 1.0), ('4コーナー', 0.55, 1.0)]   # (名前, 着順の形へ寄せる割合, 序盤の差の縮め方)
+
+
+def stage_layout(race, arr, sim):
+    """代表レース（予想と同じ展開の回）から、3つの地点での各馬の「先頭からの差（m）」を出す。
+    動画と同じ代表レースなので、画像と動画の隊列は一致する。
+    戻り値: [(地点名, {馬番: 差m}, {馬番: 3→4コーナーで詰めた量m}), ...]"""
+    g_early, g_fin, _ = _plan(race, arr, sim)
+    out, prev = [], None
+    for name, tf, ke in STAGES:
+        gaps = {n: g_early[n] * ke * (1 - tf) + g_fin[n] * tf for n in g_early}
+        lead = min(gaps.values())
+        gaps = {n: v - lead for n, v in gaps.items()}
+        gain = {n: (prev[n] - gaps[n]) if prev else 0.0 for n in gaps}
+        out.append((name, gaps, gain))
+        prev = gaps
+    return out

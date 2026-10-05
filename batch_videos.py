@@ -139,7 +139,7 @@ def build(rid, date, idx):
     old = idx.get(rid)
     e = {'mp4': put_file(mp4, f"videos/{rid}_{tag}.mp4", 'video/mp4'),
          'jpg': put_file(jpg, f"videos/{rid}_{tag}.jpg", 'image/jpeg'),
-         'horses': sig, 'going': going, 'date': date.isoformat(),
+         'horses': sig, 'going': going, 'date': date.isoformat(), 'shape': M.pred_shape(race),
          'name': race.get('name', ''), 'summary': SV.summary_line(sim),
          'made': (datetime.datetime.utcnow() + datetime.timedelta(hours=9)).strftime('%Y-%m-%d %H:%M')}
     idx[rid] = e
