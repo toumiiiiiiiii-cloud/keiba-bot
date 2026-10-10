@@ -725,6 +725,9 @@ def line_key(l):
     return f"{l.get('d')}|{l.get('p')}|{dist_num(l.get('dist'))}|{l.get('f')}"
 
 
+AI_PUSH_EV = 1.1
+
+
 def ranked(race, horses, odds):
     going, pace = race['going'], race['pace']
     shr = 1 - (1 - CLASS_SHRINK.get(going, 1)) * SETTINGS['mudw']
@@ -762,19 +765,18 @@ def ranked(race, horses, odds):
         h['anaScore'] = h['ana'] + max(0, h['mudb']) * (1 if going in ('重', '不良') else 0)
         h['anaFlag'] = h['rk'] >= 4 and h['anaScore'] >= 0.02
     if apply_model(race, arr, odds):
-        # 印（◎○▲…）の順番は「AIだけの評価」（オッズを見ない）。勝率・期待値・買い目の見込みは「オッズ＋AI」のまま。
-        # オッズ＋AIの順で並べると、市場の評価が土台なので◎がほぼ1番人気になってしまうため
-        arr.sort(key=lambda h: (-h['pAI'], -h['p']))
+        # 印の順番は「オッズ＋AI」の勝率順（バックテストで◎の勝率が最も高かった方式。AIだけだと約10ポイント下がる）
+        arr.sort(key=lambda h: -h['p'])
         N = len(arr)
         for i, h in enumerate(arr):
             h['rk'] = i + 1
-            r_ = h['pAI'] * N
+            r_ = h['p'] * N
             h['rank'] = 'S' if r_ >= 2.0 else 'A' if r_ >= 1.3 else 'B' if r_ >= 0.8 else 'C' if r_ >= 0.5 else 'D'
             h['anaFlag'] = h['rk'] >= 4 and h['anaScore'] >= 0.02
-    fav = min((h for h in arr if h.get('o')), key=lambda h: h['o'], default=None)
-    race['fav'] = fav
-    race['aiPickNote'] = (f"AI本命（1番人気は{fav['n']}番{fav['name']}）" if fav and arr and fav is not arr[0] else
-                          'AI本命＝1番人気' if fav and arr else '')
+    # AI推し：オッズ＋AIの期待値が1.1以上（2025・2026年のバックテストで、2年とも単勝の回収率が100%を超えた条件）
+    for h in arr:
+        h['aiPush'] = bool(race.get('model') and h.get('ev') and h['ev'] >= AI_PUSH_EV)
+    race['aiPush'] = sorted([h for h in arr if h['aiPush']], key=lambda h: -h['ev'])
     return arr
 
 
@@ -1160,70 +1162,35 @@ def two_axis_trio(arr, pm, mates=5):
             'parts': [('3連複', combos)]}
 
 
-# ── イチ推しの買い方：6つの買い方（単勝・馬連・ワイド・3連複・3連単・3連複2頭軸流し）から1つ ──
+# ── イチ推し：バックテストで裏付けのある「期待値1.1以上の単勝」だけ。いなければ見送り推奨 ──
 BEST_LABEL = 'イチ推し'
-BEST_MIN_HIT = 0.08      # 当たる見込みがこれ未満の買い方は選ばない（夢馬券で収支がぶれないように）
-BEST_KINDS = [('推奨', '単勝', '単勝'), ('本線', '馬連', '馬連'), ('本線', 'ワイド', 'ワイド'),
-              ('本線', '3連複', '3連複'), ('本線', '3連単', '3連単'), (TWO_AXIS_LABEL, '3連複', '3連複2頭軸流し')]
 
 
 def best_bet(arr, plan=None):
-    """出している買い方のうち、どれが一番おすすめかを1つ選ぶ。買い方ごとに全部の点数をまとめて評価する。
-    ・的中確率：その買い方のどれかが当たる見込み　・予想配当：当たったときの平均の払い戻し（点数分の投資に対して何倍か）
-    ・期待値：払い戻しの見込み÷投資　・妙味：AIの見込みが市場（オッズ）の見込みの何倍か
-    物差しはケリー基準の「資金の伸び」：期待値が高いほど、当たる見込みが高いほど大きい。
-    期待値だけだと当たりにくい買い方、的中率だけだと配当の安い買い方に偏るので、その間を取る"""
-    if plan is None:
-        plan = bet_plan(arr)
+    """期待値（オッズ＋AIの勝率×単勝オッズ）が1.1以上の馬がいれば、期待値が一番高い馬の単勝。
+    2025年・2026年のバックテストで、2年とも回収率が100%を超えたのはこの条件だけ（決まった買い方はどれも78〜88%）"""
+    if not any(h.get('o') for h in arr):
+        return {'skip': True, 'noOdds': True, 'kind': '単勝', 'combos': [],
+                'why': 'オッズ未発表のため判定できません（オッズ発表後にもう一度送ってください）'}
     pa, pm = prob_tables(arr)
-    cands = []
-    for label, kind, name in BEST_KINDS:
-        b = next((x for x in plan if x['label'] == label and any(k == kind and cs for k, cs in x['parts'])), None)
-        if not b:
-            continue
-        combos = next(cs for k, cs in b['parts'] if k == kind)
-        n = len(combos)
-        ps = [combo_prob(kind, c, pa) for c in combos]
-        pms = [combo_prob(kind, c, pm) for c in combos]
-        o_real = {h['n']: h['o'] for h in arr if h.get('o')}
-        ods = [o_real.get(c[0]) or est_odds(kind, c, pm) if kind == '単勝' else est_odds(kind, c, pm) for c in combos]
-        hit = min(0.99, sum(ps))                     # 組み合わせどうしは同時に当たらない（ワイドは1点）
-        ret = sum(p_ * o for p_, o in zip(ps, ods))  # 1点100円あたりの払い戻しの見込み（点数分の合計）
-        ev = ret / n
-        pay = ret / hit / n if hit > 0 else 0.0      # 当たったときの払い戻し÷投資
-        edge = sum(ps) / max(sum(pms), 1e-9)
-        f = (ev - 1) / (pay - 1) if ev > 1 and pay > 1 else 0.0
-        f = min(f, 0.99)
-        g = hit * math.log(1 + f * (pay - 1)) + (1 - hit) * math.log(1 - f) if f > 0 else 0.0
-        cands.append({'label': label, 'kind': kind, 'name': name, 'combos': combos, 'n': n, 'cost': n * 100,
-                      'hit': hit, 'pay': pay, 'odds': sum(ods) / n, 'ev': ev, 'edge': edge, 'g': g, 'text': b['text']})
-    if not cands:
-        return None
-    if not any(h.get('o') for h in arr):   # オッズ未発表：期待値は計算できないので、当たる見込みが一番高い買い方
-        best = max(cands, key=lambda x: (x['hit'] / x['n'], x['hit']))
-        best['noOdds'] = True
-        best['why'] = 'オッズ未発表のため、1点あたりの当たる見込みで選択（期待値はオッズ発表後に）'
-        best['all'] = cands
-        return best
-    pool = [x for x in cands if x['hit'] >= BEST_MIN_HIT] or cands
-    plus = [x for x in pool if x['ev'] > 1.0]
-    if plus:
-        best = max(plus, key=lambda x: (x['g'], x['ev']))
-        best['why'] = '期待値1超の買い方の中で、当たる見込みと配当のつり合いが最も良い'
-    else:
-        best = max(pool, key=lambda x: (x['ev'], x['hit']))
-        best['why'] = '期待値1超の買い方が無いため、最も損の少ない買い方（見送りも検討）'
-    best['all'] = sorted(cands, key=lambda x: -x['g'] if x['ev'] > 1 else 1 - x['ev'])
-    return best
+    push = [h for h in arr if h.get('aiPush')]
+    if not push:
+        return {'skip': True, 'kind': '単勝', 'combos': [],
+                'why': f'期待値{AI_PUSH_EV}以上の馬がいないため見送り推奨'}
+    h = max(push, key=lambda x: x['ev'])
+    return {'skip': False, 'kind': '単勝', 'name': '単勝', 'combos': [(h['n'],)], 'n': 1, 'cost': 100,
+            'horse': h, 'hit': h['p'], 'pay': h['o'], 'ev': h['ev'], 'edge': h['p'] / max(pm[h['n']], 1e-9),
+            'why': f"期待値{AI_PUSH_EV}以上（2年分のバックテストで単勝回収率180%台）の中で期待値が最も高い"}
 
 
 def best_bet_text(bb):
     if not bb:
         return ''
-    if bb.get('noOdds'):
-        return f"{bb['name']}（{bb['n']}点・{bb['cost']:,}円）　的中約{bb['hit'] * 100:.0f}%（オッズ未発表のため期待値は未計算）"
-    return (f"{bb['name']}（{bb['n']}点・{bb['cost']:,}円）　的中約{bb['hit'] * 100:.0f}%・"
-            f"当たれば約{bb['pay']:.1f}倍・期待値{bb['ev']:.2f}・妙味{bb['edge']:.2f}倍")
+    if bb.get('skip'):
+        return '見送り推奨' if not bb.get('noOdds') else '判定待ち'
+    h = bb['horse']
+    return (f"単勝 {h['n']} {h['name']}　勝率約{bb['hit'] * 100:.0f}%・{bb['pay']}倍・期待値{bb['ev']:.2f}・"
+            f"妙味{bb['edge']:.2f}倍")
 
 
 # ═════════════════════════════════════════
@@ -2975,7 +2942,8 @@ def render_image(race, arr):
         for tag, col in (('穴', (235, 90, 90)) if h['anaFlag'] else (None, None),
                          ('騎', (90, 170, 240)) if h['jb'] else (None, None),
                          ('初', (38, 160, 80)) if h['isNew'] else (None, None),
-                         ('注', (210, 140, 30)) if h.get('bFlow', 0) >= 0.02 else (None, None)):
+                         ('注', (210, 140, 30)) if h.get('bFlow', 0) >= 0.02 else (None, None),
+                         ('推', (40, 165, 85)) if h.get('aiPush') else (None, None)):
             if tag and tx < 540:
                 d.rounded_rectangle((tx, y0 + 16, tx + 34, y0 + 48), radius=6, fill=col)
                 ctext(d, tx + 17, y0 + 17, tag, F('sans_b', 22), (255, 255, 255))
@@ -2998,16 +2966,19 @@ def render_image(race, arr):
     y += row_h * len(arr) + 30
 
     # ── 買い目 ──
-    if race.get('aiPickNote'):
-        ctext(d, W / 2, y - 22, fit_text(d, f"◎{arr[0]['n']} {arr[0]['name']}：{race['aiPickNote']}", F('sans_b', 24), W - PAD * 2),
-              F('sans_b', 24), (255, 200, 120))
+    if race.get('model'):
+        ps = race.get('aiPush') or []
+        t_ = ('AI推し（期待値1.1以上）：' + '、'.join(f"{h['n']}{h['name']}（{h['ev']:.2f}）" for h in ps[:3])) if ps \
+            else 'AI推し（期待値1.1以上）：該当なし'
+        ctext(d, W / 2, y - 22, fit_text(d, t_, F('sans_b', 24), W - PAD * 2), F('sans_b', 24),
+              (120, 220, 140) if ps else MUTED)
         y += 22
     axis_t = f"― おすすめ買い目　軸 ◎{arr[0]['n']} {arr[0]['name']} ―"
     box_h = draw_bet_section(d, PAD, y, W - PAD, brows, {h['n']: h.get('w') for h in arr}, title=axis_t)
     y += box_h + 24
 
     if race.get('model'):
-        ctext(d, W / 2, y, '印と評価＝AIだけの評価（平均的な馬の何倍勝ちやすいか　S≥2.0倍 ／ A≥1.3 ／ B≥0.8 ／ C≥0.5 ／ D）', F('sans_r', 20), MUTED)
+        ctext(d, W / 2, y, '評価＝平均的な馬の何倍勝ちやすいか　S≥2.0倍 ／ A≥1.3 ／ B≥0.8 ／ C≥0.5 ／ D　「推」＝期待値1.1以上', F('sans_r', 20), MUTED)
         foot = f"※{race['modelNote']}。オッズは取得時点のもの"
     else:
         ctext(d, W / 2, y, 'スコア×1.00基準　S≥1.08 ／ A≥1.03 ／ B≥1.00 ／ C≥0.96 ／ D', F('sans_r', 20), MUTED)
@@ -3035,13 +3006,12 @@ def bet_rows_for(arr):
     rows = []
     plan = bet_plan(arr)
     bb = best_bet(arr, plan)
-    if bb:
-        body = re.sub(r'（[^（）]*）', '', re.sub(r'^(単勝|馬連|ワイド|3連複|3連単)\s*', '', bb['text'])).strip()
-        rows.append({'label': BEST_LABEL, 'kind': bb['name'] if bb['name'] != '単勝' else '単勝', 'combos': bb['combos'],
-                     'body': body, 'n': bb['n'],
-                     'note': (f"的中約{bb['hit'] * 100:.0f}%・オッズ未発表のため期待値は未計算" if bb.get('noOdds') else
-                              f"的中約{bb['hit'] * 100:.0f}%・当たれば約{bb['pay']:.1f}倍・期待値{bb['ev']:.2f}・妙味{bb['edge']:.2f}倍"
-                              + ('・見送りも検討' if bb['ev'] <= 1.0 else '')),
+    if bb and bb.get('skip'):
+        rows.append({'label': BEST_LABEL, 'kind': '単勝', 'combos': [], 'body': bb['why'], 'n': 0,
+                     'note': '', 'per': None, 'amount': None})
+    elif bb:
+        rows.append({'label': BEST_LABEL, 'kind': '単勝', 'combos': bb['combos'], 'body': '', 'n': 1,
+                     'note': f"{bb['horse']['name']}　勝率約{bb['hit'] * 100:.0f}%・{bb['pay']}倍・期待値{bb['ev']:.2f}・妙味{bb['edge']:.2f}倍",
                      'per': None, 'amount': None})
     for b in plan:
         text = b['text']
@@ -3671,13 +3641,12 @@ def render_short_image(race, arr):
     d.line((PAD + 300, y + 24, PAD + 300, y + 242), fill=GOLD_D, width=2)
     val = [h for h in arr[1:10] if h.get('o')]
     val = max(val, key=lambda h: h['p'] * h['o']) if val else None
-    fav = race.get('fav')
-    pts = [f"本命は {arr[0]['n']} {arr[0]['name']}" + (f"（1番人気は{fav['n']}番）" if fav and fav is not arr[0] else '')]
+    pts = [f"本命は {arr[0]['n']} {arr[0]['name']}"]
     bb = best_bet(arr)
-    if bb:
-        pts.append(f"おすすめの買い方は {bb['name']}（的中約{bb['hit'] * 100:.0f}%" + ('' if bb.get('noOdds') else f"・期待値{bb['ev']:.2f}") + '）')
-    if val and val['p'] * val['o'] >= 1.1:
-        pts.append(f"妙味なら {val['n']} {val['name']}")
+    if bb and not bb.get('skip'):
+        pts.append(f"イチ推し 単勝{bb['horse']['n']} {bb['horse']['name']}（期待値{bb['ev']:.2f}）")
+    elif bb:
+        pts.append('イチ推し ' + ('オッズ発表後に判定' if bb.get('noOdds') else '見送り推奨（期待値1.1以上の馬なし）'))
     if len(arr) >= 3:
         pts.append(f"相手本線は {arr[1]['name']} ＆ {arr[2]['name']}")
     pts = pts[:4]
@@ -3855,12 +3824,10 @@ def public_base_url():
 def bets_text(race, arr):
     plan = bet_plan(arr)
     out = [f"{race['venue']}{race['R']}R {race['name']}", f"【おすすめ買い目】軸 ◎{arr[0]['n']} {arr[0]['name']}"]
-    if race.get('aiPickNote'):
-        out.append(f"（{race['aiPickNote']}）")
     out.append("")
     bb = best_bet(arr, plan)
     if bb:
-        out += [f"🎯イチ推しの買い方：{best_bet_text(bb)}", f"　{bb['text']}", f"　→ {bb['why']}", ""]
+        out += [f"🎯イチ推し：{best_bet_text(bb)}", f"　→ {bb['why']}", ""]
     for b in plan:
         out += [f"{b['label']} {b['text']}", ""]   # 見やすいように1行ずつ空ける
     return "\n".join(out).rstrip()
@@ -3914,7 +3881,7 @@ def record_prediction(race, arr):
         return
     plan = bet_plan(arr)
     bb = best_bet(arr, plan)
-    if bb:   # イチ推しは成績を別に見るための記録（合計の収支には入れない）
+    if bb and not bb.get('skip'):   # イチ推しは成績を別に見るための記録（合計の収支には入れない）
         plan = plan + [{'label': BEST_LABEL, 'text': best_bet_text(bb), 'parts': [(bb['kind'], bb['combos'])]}]
     marks = ' '.join(f"{MARKS[i]}{h['n']}" for i, h in enumerate(arr[:7]))
     row = {
