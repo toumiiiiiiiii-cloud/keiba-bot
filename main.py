@@ -744,14 +744,19 @@ def ranked(race, horses, odds):
         h['anaScore'] = h['ana'] + max(0, h['mudb']) * (1 if going in ('重', '不良') else 0)
         h['anaFlag'] = h['rk'] >= 4 and h['anaScore'] >= 0.02
     if apply_model(race, arr, odds):
-        # 新方式の勝率の高い順に並べ直す（印もこの順）。評価は「平均的な馬の何倍勝ちやすいか」で付け直す
-        arr.sort(key=lambda h: -h['p'])
+        # 印（◎○▲…）の順番は「AIだけの評価」（オッズを見ない）。勝率・期待値・買い目の見込みは「オッズ＋AI」のまま。
+        # オッズ＋AIの順で並べると、市場の評価が土台なので◎がほぼ1番人気になってしまうため
+        arr.sort(key=lambda h: (-h['pAI'], -h['p']))
         N = len(arr)
         for i, h in enumerate(arr):
             h['rk'] = i + 1
-            r_ = h['p'] * N
+            r_ = h['pAI'] * N
             h['rank'] = 'S' if r_ >= 2.0 else 'A' if r_ >= 1.3 else 'B' if r_ >= 0.8 else 'C' if r_ >= 0.5 else 'D'
             h['anaFlag'] = h['rk'] >= 4 and h['anaScore'] >= 0.02
+    fav = min((h for h in arr if h.get('o')), key=lambda h: h['o'], default=None)
+    race['fav'] = fav
+    race['aiPickNote'] = (f"AI本命（1番人気は{fav['n']}番{fav['name']}）" if fav and arr and fav is not arr[0] else
+                          'AI本命＝1番人気' if fav and arr else '')
     return arr
 
 
@@ -1095,7 +1100,9 @@ def bet_plan(arr):
         aw, _ = _keep('ワイド', [(n[0], h['n']) for h in anas], pm)
         if aw:
             plan.append({'label': '穴', 'text': "ワイド " + ', '.join(f"{a}-{b}" for a, b in aw), 'parts': [('ワイド', aw)]})
-    plan += high_bets(arr, pa, pm)
+    two = two_axis_trio(arr, pm)
+    if two:
+        plan.append(two)
     # 検証枠：新方式（オッズ＋AI）で期待値1.1以上の単勝。本当に効くかを記録で確かめるためのもの（買わない）
     if any('pAI' in h for h in arr):
         ver = [h for h in arr if h.get('ev') and h['ev'] >= VERIFY_EV]
@@ -1109,42 +1116,88 @@ def bets(arr):
     return [f"{b['label']} {b['text']}" for b in bet_plan(arr)]
 
 
-def high_bets(arr, pa=None, pm=None):
-    """高目も◎（軸）から。
-    3連単：◎が2着・3着に来る形（◎が負けたときの高配当）／3連複：◎と、4番手以下を含む相手
-    予想配当の安い組み合わせを外し、「当たる見込み×予想配当」の高い順に3連単18点・3連複10点まで"""
-    if len(arr) < 5:
-        return []
-    if pa is None:
-        pa, pm = prob_tables(arr)
-    ax = arr[0]['n']
-    mates = [h['n'] for h in arr[1:8]]
-    deep = set(h['n'] for h in arr[3:8])
-    out = []
-    tan = [(a, ax, b) for a in mates[:5] for b in mates if a != b] + \
-          [(a, b, ax) for a in mates[:5] for b in mates if a != b]
-    fuku = sorted({tuple(sorted((ax, a, b))) for i, a in enumerate(mates) for b in mates[i + 1:] if a in deep or b in deep})
-    for kind, combos, form in (('3連単', tan, f"◎{ax}が2着・3着　相手{','.join(map(str, mates))}"),
-                               ('3連複', fuku, f"◎{ax}軸　相手{','.join(map(str, mates))}・4番手以下を必ず1頭")):
-        keep, dropped = _keep(kind, combos, pm)
-        keep.sort(key=lambda c: -combo_prob(kind, c, pa) * est_odds(kind, c, pm))
-        cut = max(0, len(keep) - HIGH_MAX[kind])
-        keep = keep[:HIGH_MAX[kind]]
-        if not keep:
+TWO_AXIS_LABEL = '2頭軸'
+
+
+def two_axis_trio(arr, pm, mates=5):
+    """3連複の2頭軸：◎-○を軸に、相手5頭（▲以下の印順）。配当が安すぎる組み合わせは、次の馬と入れ替えて5頭にそろえる"""
+    if len(arr) < 4:
+        return None
+    a, b = arr[0]['n'], arr[1]['n']
+    picked, skipped = [], 0
+    for h in arr[2:]:
+        c = tuple(sorted((a, b, h['n'])))
+        if est_odds('3連複', c, pm) >= MIN_ODDS['3連複']:
+            picked.append(h['n'])
+        else:
+            skipped += 1
+        if len(picked) >= mates:
+            break
+    if not picked:
+        return {'label': TWO_AXIS_LABEL, 'text': '3連複 見送り（人気どうしで配当が安すぎる）', 'parts': [('3連複', [])]}
+    combos = [tuple(sorted((a, b, x))) for x in picked]
+    note = f"・配当の安い{skipped}頭を次の馬と入れ替え" if skipped else ''
+    return {'label': TWO_AXIS_LABEL,
+            'text': f"3連複 軸{a}-{b} 相手{','.join(map(str, picked))}（◎○軸・{len(combos)}点{note}）",
+            'parts': [('3連複', combos)]}
+
+
+# ── イチ推しの買い方：6つの買い方（単勝・馬連・ワイド・3連複・3連単・3連複2頭軸流し）から1つ ──
+BEST_LABEL = 'イチ推し'
+BEST_MIN_HIT = 0.08      # 当たる見込みがこれ未満の買い方は選ばない（夢馬券で収支がぶれないように）
+BEST_KINDS = [('推奨', '単勝', '単勝'), ('本線', '馬連', '馬連'), ('本線', 'ワイド', 'ワイド'),
+              ('本線', '3連複', '3連複'), ('本線', '3連単', '3連単'), (TWO_AXIS_LABEL, '3連複', '3連複2頭軸流し')]
+
+
+def best_bet(arr, plan=None):
+    """出している買い方のうち、どれが一番おすすめかを1つ選ぶ。買い方ごとに全部の点数をまとめて評価する。
+    ・的中確率：その買い方のどれかが当たる見込み　・予想配当：当たったときの平均の払い戻し（点数分の投資に対して何倍か）
+    ・期待値：払い戻しの見込み÷投資　・妙味：AIの見込みが市場（オッズ）の見込みの何倍か
+    物差しはケリー基準の「資金の伸び」：期待値が高いほど、当たる見込みが高いほど大きい。
+    期待値だけだと当たりにくい買い方、的中率だけだと配当の安い買い方に偏るので、その間を取る"""
+    if plan is None:
+        plan = bet_plan(arr)
+    pa, pm = prob_tables(arr)
+    cands = []
+    for label, kind, name in BEST_KINDS:
+        b = next((x for x in plan if x['label'] == label and any(k == kind and cs for k, cs in x['parts'])), None)
+        if not b:
             continue
-        why = []
-        if dropped:
-            why.append(f"配当の安い{dropped}点を除外")
-        if cut:
-            why.append(f"見込みの低い{cut}点を除外")
-        out.append({'label': '高目', 'text': f"{kind} {form}（{len(keep)}点" + (f"・{'・'.join(why)}" if why else '') + "）",
-                    'parts': [(kind, keep)]})
-    return out
+        combos = next(cs for k, cs in b['parts'] if k == kind)
+        n = len(combos)
+        ps = [combo_prob(kind, c, pa) for c in combos]
+        pms = [combo_prob(kind, c, pm) for c in combos]
+        o_real = {h['n']: h['o'] for h in arr if h.get('o')}
+        ods = [o_real.get(c[0]) or est_odds(kind, c, pm) if kind == '単勝' else est_odds(kind, c, pm) for c in combos]
+        hit = min(0.99, sum(ps))                     # 組み合わせどうしは同時に当たらない（ワイドは1点）
+        ret = sum(p_ * o for p_, o in zip(ps, ods))  # 1点100円あたりの払い戻しの見込み（点数分の合計）
+        ev = ret / n
+        pay = ret / hit / n if hit > 0 else 0.0      # 当たったときの払い戻し÷投資
+        edge = sum(ps) / max(sum(pms), 1e-9)
+        f = (ev - 1) / (pay - 1) if ev > 1 and pay > 1 else 0.0
+        f = min(f, 0.99)
+        g = hit * math.log(1 + f * (pay - 1)) + (1 - hit) * math.log(1 - f) if f > 0 else 0.0
+        cands.append({'label': label, 'kind': kind, 'name': name, 'combos': combos, 'n': n, 'cost': n * 100,
+                      'hit': hit, 'pay': pay, 'odds': sum(ods) / n, 'ev': ev, 'edge': edge, 'g': g, 'text': b['text']})
+    if not cands:
+        return None
+    pool = [x for x in cands if x['hit'] >= BEST_MIN_HIT] or cands
+    plus = [x for x in pool if x['ev'] > 1.0]
+    if plus:
+        best = max(plus, key=lambda x: (x['g'], x['ev']))
+        best['why'] = '期待値1超の買い方の中で、当たる見込みと配当のつり合いが最も良い'
+    else:
+        best = max(pool, key=lambda x: (x['ev'], x['hit']))
+        best['why'] = '期待値1超の買い方が無いため、最も損の少ない買い方（見送りも検討）'
+    best['all'] = sorted(cands, key=lambda x: -x['g'] if x['ev'] > 1 else 1 - x['ev'])
+    return best
 
 
-def trifecta_high(arr):
-    b = high_bets(arr)
-    return b[0] if b else None
+def best_bet_text(bb):
+    if not bb:
+        return ''
+    return (f"{bb['name']}（{bb['n']}点・{bb['cost']:,}円）　的中約{bb['hit'] * 100:.0f}%・"
+            f"当たれば約{bb['pay']:.1f}倍・期待値{bb['ev']:.2f}・妙味{bb['edge']:.2f}倍")
 
 
 # ═════════════════════════════════════════
@@ -2794,7 +2847,7 @@ def render_image(race, arr):
     brows = bet_rows_for(arr)
     bet_h = 92 + bet_section_height(brows, W - PAD * 2 - 120) - 80   # 下の「box_h = 80 + bet_h」に合わせる
     LU_H = lineup_height(race)
-    H = 610 + LU_H + 64 + row_h * len(arr) + 40 + 90 + bet_h + 120
+    H = 610 + LU_H + 64 + row_h * len(arr) + 40 + 90 + bet_h + 120 + 22
 
     img = gradient_bg(W, H)  # 背景グラデーション（夜空のイメージ）
     d = ImageDraw.Draw(img)
@@ -2919,12 +2972,16 @@ def render_image(race, arr):
     y += row_h * len(arr) + 30
 
     # ── 買い目 ──
+    if race.get('aiPickNote'):
+        ctext(d, W / 2, y - 22, fit_text(d, f"◎{arr[0]['n']} {arr[0]['name']}：{race['aiPickNote']}", F('sans_b', 24), W - PAD * 2),
+              F('sans_b', 24), (255, 200, 120))
+        y += 22
     axis_t = f"― おすすめ買い目　軸 ◎{arr[0]['n']} {arr[0]['name']} ―"
     box_h = draw_bet_section(d, PAD, y, W - PAD, brows, {h['n']: h.get('w') for h in arr}, title=axis_t)
     y += box_h + 24
 
     if race.get('model'):
-        ctext(d, W / 2, y, '評価＝平均的な馬の何倍勝ちやすいか　S≥2.0倍 ／ A≥1.3 ／ B≥0.8 ／ C≥0.5 ／ D', F('sans_r', 20), MUTED)
+        ctext(d, W / 2, y, '印と評価＝AIだけの評価（平均的な馬の何倍勝ちやすいか　S≥2.0倍 ／ A≥1.3 ／ B≥0.8 ／ C≥0.5 ／ D）', F('sans_r', 20), MUTED)
         foot = f"※{race['modelNote']}。オッズは取得時点のもの"
     else:
         ctext(d, W / 2, y, 'スコア×1.00基準　S≥1.08 ／ A≥1.03 ／ B≥1.00 ／ C≥0.96 ／ D', F('sans_r', 20), MUTED)
@@ -2939,21 +2996,30 @@ def render_image(race, arr):
 # 買い目の表示（券種ごとに色分けしたカード）と予算の割り振り
 # ═════════════════════════════════════════
 CAT_COLOR = {'推奨': (226, 112, 40), '本線': (201, 160, 70), '妙味': (40, 165, 85), '穴': (216, 62, 62), '高目': (150, 85, 205),
-             '検証': (90, 110, 140)}
-KIND_COLOR = {'単勝': (224, 86, 86), '複勝': (234, 140, 70), '馬連': (60, 135, 225), 'ワイド': (40, 175, 160),
+             '2頭軸': (150, 85, 205), 'イチ推し': (230, 60, 90), '検証': (90, 110, 140)}
+KIND_COLOR = {'3連複2頭軸流し': (140, 105, 225), '単勝': (224, 86, 86), '複勝': (234, 140, 70), '馬連': (60, 135, 225), 'ワイド': (40, 175, 160),
               '馬単': (90, 110, 230), '3連複': (140, 105, 225), '3連単': (214, 72, 160), '枠連': (120, 140, 160)}
-CAT_W = {'推奨': 0.15, '本線': 0.40, '妙味': 0.10, '穴': 0.10, '高目': 0.25}      # 予算の割合（項目ごと）
+CAT_W = {'推奨': 0.15, '本線': 0.40, '妙味': 0.10, '穴': 0.10, '2頭軸': 0.25}      # 予算の割合（項目ごと）
 SUB_W = {'本線': {'馬連': 0.30, 'ワイド': 0.30, '3連複': 0.25, '3連単': 0.15},
-         '妙味': {'単勝': 0.5, '複勝': 0.5}, '高目': {'3連単': 0.5, '3連複': 0.5}}
+         '妙味': {'単勝': 0.5, '複勝': 0.5}, '2頭軸': {'3連複': 1.0}}
 
 
 def bet_rows_for(arr):
-    """bet_plan を、画像に描くための行（1行＝1券種）に直す"""
+    """bet_plan を、画像に描くための行（1行＝1券種）に直す。先頭はイチ推しの1点"""
     rows = []
-    for b in bet_plan(arr):
+    plan = bet_plan(arr)
+    bb = best_bet(arr, plan)
+    if bb:
+        body = re.sub(r'（[^（）]*）', '', re.sub(r'^(単勝|馬連|ワイド|3連複|3連単)\s*', '', bb['text'])).strip()
+        rows.append({'label': BEST_LABEL, 'kind': bb['name'] if bb['name'] != '単勝' else '単勝', 'combos': bb['combos'],
+                     'body': body, 'n': bb['n'],
+                     'note': f"的中約{bb['hit'] * 100:.0f}%・当たれば約{bb['pay']:.1f}倍・期待値{bb['ev']:.2f}・妙味{bb['edge']:.2f}倍"
+                             + ('・見送りも検討' if bb['ev'] <= 1.0 else ''),
+                     'per': None, 'amount': None})
+    for b in plan:
         text = b['text']
         note = ''
-        nm = re.search(r'（([^（）]*(?:期待値|◎|除外|追加|見送り)[^（）]*)）', text)
+        nm = re.search(r'（([^（）]*(?:期待値|◎|除外|追加|見送り|入れ替え)[^（）]*)）', text)
         if nm:
             note = nm.group(1)
             text = text.replace(nm.group(0), '')
@@ -3130,13 +3196,15 @@ def draw_bet_section(d, x0, y0, x1, rows, wmap, title='― おすすめ買い目
         d.rounded_rectangle((x0 + 18, y, x0 + 30, y + rh), radius=6, fill=cc)
         # 見出し：項目の札＋券種のバッジ
         cx, cy = x0 + 46, y + 14
-        d.rounded_rectangle((cx, cy, cx + 84, cy + 40), radius=20, fill=cc)
-        ctext(d, cx + 42, cy + 5, r['label'], F('sans_b', 24), (255, 255, 255))
+        lw = max(84, tw(d, r['label'], F('sans_b', 24)) + 28)
+        d.rounded_rectangle((cx, cy, cx + lw, cy + 40), radius=20, fill=cc)
+        ctext(d, cx + lw / 2, cy + 5, r['label'], F('sans_b', 24), (255, 255, 255))
         kc = KIND_COLOR.get(r['kind'], (110, 120, 140))
         kw = tw(d, r['kind'], F('sans_b', 26)) + 30
-        d.rounded_rectangle((cx + 96, cy, cx + 96 + kw, cy + 40), radius=8, fill=kc)
-        ctext(d, cx + 96 + kw / 2, cy + 4, r['kind'], F('sans_b', 26), (255, 255, 255))
-        d.text((cx + 96 + kw + 14, cy + 7), f"{r['n']}点" if r['n'] else '見送り', font=F('sans_r', 24), fill=MUTED)
+        kx = cx + lw + 12
+        d.rounded_rectangle((kx, cy, kx + kw, cy + 40), radius=8, fill=kc)
+        ctext(d, kx + kw / 2, cy + 4, r['kind'], F('sans_b', 26), (255, 255, 255))
+        d.text((kx + kw + 14, cy + 7), f"{r['n']}点" if r['n'] else '見送り', font=F('sans_r', 24), fill=MUTED)
         # 右側：金額（予算モード）
         if r.get('amount'):
             amt = f"{r['amount']:,}円"
@@ -3163,7 +3231,8 @@ def draw_bet_section(d, x0, y0, x1, rows, wmap, title='― おすすめ買い目
                 d.text((x0 + 50, by + 6 + k * 38), ln, font=F('sans_b', 27), fill=SILVER)
             by += 12 + 38 * len(lines)
         if r['note']:
-            d.text((x0 + 50, by), r['note'], font=F('sans_r', 22), fill=(130, 215, 150) if '期待値' in r['note'] else MUTED)
+            d.text((x0 + 50, by), fit_text(d, r['note'], F('sans_r', 22), x1 - x0 - 100), font=F('sans_r', 22),
+                   fill=(255, 190, 200) if r['label'] == BEST_LABEL else (130, 215, 150) if '期待値' in r['note'] else MUTED)
         y += rh + 14
     return box_h
 
@@ -3522,7 +3591,7 @@ def render_short_image(race, arr):
     for i, h in enumerate(arr):
         lines = wrap(tmp, short_comment(race, h), fC, cmt_w)[:2]
         rows.append((i, h, short_mark(i, h), lines, 78 if len(lines) == 1 else 112))
-    H = 444 + sum(r[4] for r in rows) + 30 + 300
+    H = 444 + sum(r[4] for r in rows) + 30 + 360
     img = gradient_bg(W, H)
     d = ImageDraw.Draw(img)
     gold_frame(d, (14, 14, W - 14, H - 14), r=24, w=3)
@@ -3568,24 +3637,29 @@ def render_short_image(race, arr):
         y += rh
     # 注目ポイント
     y += 30
-    d.rounded_rectangle((PAD, y, W - PAD, y + 210), radius=18, fill=(14, 22, 42))
-    gold_frame(d, (PAD, y, W - PAD, y + 210), r=18, w=2)
-    ctext(d, PAD + 150, y + 64, '注目ポイント', F('serif_b', 40), GOLD)
-    ctext(d, PAD + 150, y + 118, 'KEY POINTS', F('sans_b', 20), GOLD_D)
-    d.line((PAD + 300, y + 24, PAD + 300, y + 186), fill=GOLD_D, width=2)
+    d.rounded_rectangle((PAD, y, W - PAD, y + 266), radius=18, fill=(14, 22, 42))
+    gold_frame(d, (PAD, y, W - PAD, y + 266), r=18, w=2)
+    ctext(d, PAD + 150, y + 92, '注目ポイント', F('serif_b', 40), GOLD)
+    ctext(d, PAD + 150, y + 146, 'KEY POINTS', F('sans_b', 20), GOLD_D)
+    d.line((PAD + 300, y + 24, PAD + 300, y + 242), fill=GOLD_D, width=2)
     val = [h for h in arr[1:10] if h.get('o')]
     val = max(val, key=lambda h: h['p'] * h['o']) if val else None
-    pts = [f"本命は {arr[0]['n']} {arr[0]['name']}"]
+    fav = race.get('fav')
+    pts = [f"本命は {arr[0]['n']} {arr[0]['name']}" + (f"（1番人気は{fav['n']}番）" if fav and fav is not arr[0] else '')]
+    bb = best_bet(arr)
+    if bb:
+        pts.append(f"おすすめの買い方は {bb['name']}（的中約{bb['hit'] * 100:.0f}%・期待値{bb['ev']:.2f}）")
     if val and val['p'] * val['o'] >= 1.1:
         pts.append(f"妙味なら {val['n']} {val['name']}")
     if len(arr) >= 3:
         pts.append(f"相手本線は {arr[1]['name']} ＆ {arr[2]['name']}")
+    pts = pts[:4]
     for j, t in enumerate(pts):
         py = y + 30 + j * 56
         d.ellipse((PAD + 330, py, PAD + 370, py + 40), fill=GOLD)
         ctext(d, PAD + 350, py + 3, str(j + 1), F('sans_b', 26), (30, 24, 10))
         d.text((PAD + 388, py - 2), fit_text(d, t, F('sans_b', 34), W - PAD - 420), font=F('sans_b', 34), fill=(250, 236, 200))
-    ctext(d, W / 2, y + 222, '馬名か馬番（例：10番）を送ると、その馬の詳しい根拠を返します', F('sans_b', 24), MUTED)
+    ctext(d, W / 2, y + 278, '馬名か馬番（例：10番）を送ると、その馬の詳しい根拠を返します', F('sans_b', 24), MUTED)
     return img
 
 
@@ -3752,9 +3826,16 @@ def public_base_url():
 
 
 def bets_text(race, arr):
-    out = [f"{race['venue']}{race['R']}R {race['name']}", f"【おすすめ買い目】軸 ◎{arr[0]['n']} {arr[0]['name']}", ""]
-    for b in bets(arr):
-        out += [b, ""]   # 見やすいように1行ずつ空ける
+    plan = bet_plan(arr)
+    out = [f"{race['venue']}{race['R']}R {race['name']}", f"【おすすめ買い目】軸 ◎{arr[0]['n']} {arr[0]['name']}"]
+    if race.get('aiPickNote'):
+        out.append(f"（{race['aiPickNote']}）")
+    out.append("")
+    bb = best_bet(arr, plan)
+    if bb:
+        out += [f"🎯イチ推しの買い方：{best_bet_text(bb)}", f"　{bb['text']}", f"　→ {bb['why']}", ""]
+    for b in plan:
+        out += [f"{b['label']} {b['text']}", ""]   # 見やすいように1行ずつ空ける
     return "\n".join(out).rstrip()
 
 
@@ -3805,6 +3886,9 @@ def record_prediction(race, arr):
         print(f"[sheet] 発走後のため記録しません {race['id']}", flush=True)
         return
     plan = bet_plan(arr)
+    bb = best_bet(arr, plan)
+    if bb:   # イチ推しは成績を別に見るための記録（合計の収支には入れない）
+        plan = plan + [{'label': BEST_LABEL, 'text': best_bet_text(bb), 'parts': [(bb['kind'], bb['combos'])]}]
     marks = ' '.join(f"{MARKS[i]}{h['n']}" for i, h in enumerate(arr[:7]))
     row = {
         'recorded': jst_now().strftime('%Y/%m/%d %H:%M'),
@@ -3897,7 +3981,7 @@ def settle_one(row):
             key = f"{b['label']} {kind}"
             dc, dr = detail.get(key, [0, 0])
             detail[key] = [dc + c, dr + got]
-            if b['label'] != VERIFY_LABEL:
+            if b['label'] not in (VERIFY_LABEL, BEST_LABEL):
                 cost += c
                 ret += got
     return {'race_id': row['race_id'], 'result': '-'.join(map(str, top3)), 'honmei_pos': order.get(hm, ''),
