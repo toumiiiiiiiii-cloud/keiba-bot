@@ -1,0 +1,36 @@
+# 単勝オッズの記録（あとで「予想を聞いた時点のオッズ」で成績を確かめるため）
+# 土日月の 9:00〜16:40 に20分ごと＋金土日の夜（翌日の前日オッズ）。開催の無い日はすぐ終わる
+name: odds-snapshot
+
+on:
+  schedule:
+    - cron: '*/20 0-7 * * 0,1,6'   # 日本時間 土日月 9:00〜16:40（20分ごと）
+    - cron: '30 9,12 * * 0,5,6'    # 日本時間 金土日 18:30・21:30（翌日の前日オッズ）
+  workflow_dispatch:
+
+concurrency:
+  group: odds-snapshot
+  cancel-in-progress: false
+
+jobs:
+  snap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: ライブラリ
+        run: pip install -r requirements.txt boto3
+
+      - name: オッズを記録
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: python odds_snapshot.py
