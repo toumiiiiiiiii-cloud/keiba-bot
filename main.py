@@ -507,28 +507,46 @@ def fill_nar_jockeys(race_id, base, horses):
             h['jockey'] = name
 
 
-def fetch_win_odds(race_id, base):
-    """単勝オッズ（JRAのみ）。発売前などで取れなければ空"""
-    if 'nar.' in base:
-        url = ('https://nar.netkeiba.com/api/api_get_nar_odds.html'
-               f'?race_id={race_id}&type=1&action=update')
-    else:
-        url = ('https://race.netkeiba.com/api/api_get_jra_odds.html'
-               f'?race_id={race_id}&type=1&action=update')
-    try:
-        js = http_get(url, timeout=10, retries=1).json()
-        data = js.get('data')
-        if not isinstance(data, dict):
-            return {}
-        win = (data.get('odds') or {}).get('1') or {}
-        out = {}
-        for k, v in win.items():
-            val = to_float(v[0]) if v else None
-            if val:
-                out[int(k)] = val
-        return out
-    except Exception:
+def _parse_win_odds(js):
+    data = js.get('data') if isinstance(js, dict) else None
+    if not isinstance(data, dict):
         return {}
+    win = (data.get('odds') or {}).get('1') or {}
+    out = {}
+    for k, v in win.items():
+        val = to_float(v[0]) if v else None
+        if val:
+            out[int(k)] = val
+    return out
+
+
+def fetch_win_odds(race_id, base):
+    """単勝オッズ。発売前などで取れなければ空。
+    取れないことがあったので、①いつもの取得 ②クッキー無しの新しい接続 の2通りで、間を空けて試す。
+    取れなかった理由はログに出す（Renderの Logs で「[odds]」を探す）"""
+    site = 'https://nar.netkeiba.com' if 'nar.' in base else 'https://race.netkeiba.com'
+    api = 'api_get_nar_odds.html' if 'nar.' in base else 'api_get_jra_odds.html'
+    url = f"{site}/api/{api}?race_id={race_id}&type=1&action=update"
+    hdr = dict(HEADERS, Referer=f"{site}/odds/index.html?race_id={race_id}", **{'X-Requested-With': 'XMLHttpRequest'})
+    why = []
+    for k in range(3):
+        try:
+            if k == 0:
+                res = http_get(url, timeout=10, retries=1, **{})
+            else:
+                time.sleep(1.0 * k)
+                res = requests.get(url, headers=hdr, timeout=10)
+                res.raise_for_status()
+            js = res.json()
+            out = _parse_win_odds(js)
+            if out:
+                print(f"[odds] {race_id} 単勝オッズ{len(out)}頭（{js.get('status')}・{k + 1}回目）", flush=True)
+                return out
+            why.append(f"{k + 1}回目：中身なし（status={js.get('status')} reason={js.get('reason')}）")
+        except Exception as e:
+            why.append(f"{k + 1}回目：{type(e).__name__} {str(e)[:80]}")
+    print(f"[odds] {race_id} 単勝オッズを取れず：" + ' ／ '.join(why), flush=True)
+    return {}
 
 
 # ═════════════════════════════════════════
@@ -1181,6 +1199,12 @@ def best_bet(arr, plan=None):
                       'hit': hit, 'pay': pay, 'odds': sum(ods) / n, 'ev': ev, 'edge': edge, 'g': g, 'text': b['text']})
     if not cands:
         return None
+    if not any(h.get('o') for h in arr):   # オッズ未発表：期待値は計算できないので、当たる見込みが一番高い買い方
+        best = max(cands, key=lambda x: (x['hit'] / x['n'], x['hit']))
+        best['noOdds'] = True
+        best['why'] = 'オッズ未発表のため、1点あたりの当たる見込みで選択（期待値はオッズ発表後に）'
+        best['all'] = cands
+        return best
     pool = [x for x in cands if x['hit'] >= BEST_MIN_HIT] or cands
     plus = [x for x in pool if x['ev'] > 1.0]
     if plus:
@@ -1196,6 +1220,8 @@ def best_bet(arr, plan=None):
 def best_bet_text(bb):
     if not bb:
         return ''
+    if bb.get('noOdds'):
+        return f"{bb['name']}（{bb['n']}点・{bb['cost']:,}円）　的中約{bb['hit'] * 100:.0f}%（オッズ未発表のため期待値は未計算）"
     return (f"{bb['name']}（{bb['n']}点・{bb['cost']:,}円）　的中約{bb['hit'] * 100:.0f}%・"
             f"当たれば約{bb['pay']:.1f}倍・期待値{bb['ev']:.2f}・妙味{bb['edge']:.2f}倍")
 
@@ -3013,8 +3039,9 @@ def bet_rows_for(arr):
         body = re.sub(r'（[^（）]*）', '', re.sub(r'^(単勝|馬連|ワイド|3連複|3連単)\s*', '', bb['text'])).strip()
         rows.append({'label': BEST_LABEL, 'kind': bb['name'] if bb['name'] != '単勝' else '単勝', 'combos': bb['combos'],
                      'body': body, 'n': bb['n'],
-                     'note': f"的中約{bb['hit'] * 100:.0f}%・当たれば約{bb['pay']:.1f}倍・期待値{bb['ev']:.2f}・妙味{bb['edge']:.2f}倍"
-                             + ('・見送りも検討' if bb['ev'] <= 1.0 else ''),
+                     'note': (f"的中約{bb['hit'] * 100:.0f}%・オッズ未発表のため期待値は未計算" if bb.get('noOdds') else
+                              f"的中約{bb['hit'] * 100:.0f}%・当たれば約{bb['pay']:.1f}倍・期待値{bb['ev']:.2f}・妙味{bb['edge']:.2f}倍"
+                              + ('・見送りも検討' if bb['ev'] <= 1.0 else '')),
                      'per': None, 'amount': None})
     for b in plan:
         text = b['text']
@@ -3648,7 +3675,7 @@ def render_short_image(race, arr):
     pts = [f"本命は {arr[0]['n']} {arr[0]['name']}" + (f"（1番人気は{fav['n']}番）" if fav and fav is not arr[0] else '')]
     bb = best_bet(arr)
     if bb:
-        pts.append(f"おすすめの買い方は {bb['name']}（的中約{bb['hit'] * 100:.0f}%・期待値{bb['ev']:.2f}）")
+        pts.append(f"おすすめの買い方は {bb['name']}（的中約{bb['hit'] * 100:.0f}%" + ('' if bb.get('noOdds') else f"・期待値{bb['ev']:.2f}") + '）')
     if val and val['p'] * val['o'] >= 1.1:
         pts.append(f"妙味なら {val['n']} {val['name']}")
     if len(arr) >= 3:
