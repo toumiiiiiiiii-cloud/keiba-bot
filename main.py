@@ -931,7 +931,61 @@ def model_row(race, h, N):
         bl = next((l for l in (h.get('lines') or []) if re.match(r'^\d{3}', str(l.get('bw') or ''))), None)
         bw = int(str(bl['bw'])[:3]) if bl else None
     f['wtRatio'] = (h['wt'] / bw - WT_RATIO_AVG) * 100 if bw and h.get('wt') else 0.0
+    # ── 馬体重の増減を、休み明けかどうか・若さで分けて見る（当日の馬体重が出ているときだけ） ──
+    #   休み明けのプラス＝成長か太め残りか／休み明けのマイナス＝仕上げすぎ・調整不足か、などは学習で重みを決める
+    bwd_kg = h.get('bwDiff') if h.get('bwNow') else None
+    rest = w is not None and w >= 9                     # 中9週以上＝休み明け
+    if bwd_kg is not None:
+        d = clamp(bwd_kg, -24, 24) / 10
+        f['bwdRestPlus'] = max(d, 0.0) if rest else 0.0
+        f['bwdRestMinus'] = max(-d, 0.0) if rest else 0.0
+        f['bwdPlusBig'] = 1.0 if not rest and bwd_kg >= 10 else 0.0
+        f['bwdMinusBig'] = 1.0 if not rest and bwd_kg <= -10 else 0.0
+        f['bwdYoung'] = d if (h.get('age') or 4) <= 3 else 0.0       # 3歳以下のプラスは成長分のことが多い
+    else:
+        f['bwdRestPlus'] = f['bwdRestMinus'] = f['bwdPlusBig'] = f['bwdMinusBig'] = f['bwdYoung'] = 0.0
+    f['bwKg'] = clamp((h['bwNow'] - 470) / 30, -3, 3) if h.get('bwNow') else 0.0
     return f
+
+
+def market_topk(pm, lam2=0.81, lam3=0.65):
+    """オッズの勝率から「2着まで」「3着まで」に入る見込み（ヘネリー式）。pm：勝率のリスト"""
+    n = len(pm)
+    r2 = [max(x, 1e-9) ** lam2 for x in pm]
+    r3 = [max(x, 1e-9) ** lam3 for x in pm]
+    s2, s3 = sum(r2), sum(r3)
+    p2 = [0.0] * n
+    p3 = [0.0] * n
+    for a in range(n):
+        d2 = max(1e-12, s2 - r2[a])
+        for b in range(n):
+            if b == a:
+                continue
+            pab = pm[a] * r2[b] / d2
+            p2[b] += pab
+            d3 = max(1e-12, s3 - r3[a] - r3[b])
+            for c in range(n):
+                if c != a and c != b:
+                    p3[c] += pab * r3[c] / d3
+    t2 = [pm[i] + p2[i] for i in range(n)]
+    return t2, [t2[i] + p3[i] for i in range(n)]
+
+
+def apply_place_model(arr, rows, xs, pm):
+    """「2着までに来る見込み」「3着までに来る見込み」（place_check.py で学習。効いたときだけ使う）"""
+    pl = (MODEL or {}).get('place')
+    if not pl:
+        return False
+    t2, t3 = market_topk(pm, *pl.get('lam', (0.81, 0.65)))
+    for k, key, tk in ((2, 'p2', t2), (3, 'p3', t3)):
+        M = pl.get(f'k{k}')
+        if not M:
+            continue
+        for h, x, t in zip(arr, xs, tk):
+            t = min(max(t, 1e-4), 1 - 1e-4)
+            z = math.log(t / (1 - t)) + M['b'] + sum(w * (v - m) / s for w, v, m, s in zip(M['w'], x, M['mu'], M['sd']))
+            h[key] = 1 / (1 + math.exp(-z))
+    return True
 
 
 JK_RATE_AVG = 0.21        # 騎手の複勝率の平均くらい
@@ -1031,10 +1085,16 @@ def apply_model(race, arr, odds):
             h['jkRatePrev'] = jr.get(jk_key(prev), JK_RATE_AVG) if prev else None
         rows.append(model_row(race, h, N))
     add_relative(rows)
-    zs = []
+    zs, xs = [], []
     for h, row in zip(arr, rows):
         x = [math.log(inv[h['n']] / tot)] + [row.get(n, 0.0) for n in names[1:]]
+        xs.append(x)
         zs.append(sum(b * (v - m) / s for b, v, m, s in zip(beta, x, mean, std)))
+    try:
+        if (MODEL.get('place') or {}).get('names') == names:
+            apply_place_model(arr, rows, xs, [inv[h['n']] / tot for h in arr])
+    except Exception as e:
+        print(f"[place] 2着・3着の見込みを計算できず: {e}", flush=True)
     zmax = max(zs)
     ex = [math.exp(z - zmax) for z in zs]
     tot2 = sum(ex)
@@ -1248,9 +1308,29 @@ def sanren_shape(arr):
     return 'hard' if p0 >= 0.40 else 'mid' if p0 >= 0.25 else 'open'
 
 
-def sanren_combos(arr, kind):
+def place_order(arr):
+    """3連の並び：1頭目＝勝つ見込みが一番の馬（◎）、2頭目と相手は「2着まで」「3着まで」の見込みの順。
+    着順ごとの見込みが使えないとき（学習していない・効かなかった）は、勝つ見込みの順のまま"""
     n = [h['n'] for h in arr]
+    if not ((MODEL or {}).get('place') or {}).get('use') or not all(h.get('p2') and h.get('p3') for h in arr):
+        return n
+    rest = arr[1:]
+    second = max(rest, key=lambda h: h['p2'])
+    mates = sorted([h for h in rest if h is not second], key=lambda h: -h['p3'])
+    return [arr[0]['n'], second['n']] + [h['n'] for h in mates]
+
+
+def place_order_open(arr):
+    """混戦の◎軸：相手は「3着まで」の見込みの順"""
+    n = [h['n'] for h in arr]
+    if not ((MODEL or {}).get('place') or {}).get('use') or not all(h.get('p3') for h in arr):
+        return n
+    return [arr[0]['n']] + [h['n'] for h in sorted(arr[1:], key=lambda h: -h['p3'])]
+
+
+def sanren_combos(arr, kind):
     shape = sanren_shape(arr)
+    n = place_order_open(arr) if shape == 'open' else place_order(arr)
     if kind == '3連複':
         if shape == 'open':   # 混戦：◎軸 相手5頭（10点）
             mates = n[1:6]
@@ -1264,8 +1344,8 @@ def sanren_combos(arr, kind):
 
 def sanren_plan(arr):
     """3連複・3連単の本線。どれも◎を含む。安い組み合わせも外さない（実際の配当は人気どうしほど推定より高いため）"""
-    n = [h['n'] for h in arr]
     shape = sanren_shape(arr)
+    n = place_order_open(arr) if shape == 'open' else place_order(arr)
     p0 = arr[0]['p'] * 100
     tag = {'hard': f'◎勝率{p0:.0f}%の堅いレース', 'mid': f'◎勝率{p0:.0f}%', 'open': f'◎勝率{p0:.0f}%の混戦'}[shape]
     out = []

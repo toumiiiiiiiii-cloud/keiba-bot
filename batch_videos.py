@@ -15,6 +15,7 @@
   DAYS_AHEAD    … 何日先まで見るか（既定 3）
 """
 import os
+import re
 import sys
 import json
 import time
@@ -30,7 +31,18 @@ import sim_video as SV                       # noqa: E402
 
 PUBLIC = os.environ['R2_PUBLIC_URL'].rstrip('/')
 BUCKET = os.environ['R2_BUCKET']
-s3 = boto3.client('s3', endpoint_url=f"https://{os.environ['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
+def r2_endpoint():
+    """R2の接続先。Account ID だけでなく、URLを丸ごと入れた場合や、前後に空白・改行が入った場合も読めるようにする"""
+    raw = os.environ['R2_ACCOUNT_ID'].strip()
+    m = re.search(r'[0-9a-fA-F]{32}', raw)
+    acct = m.group(0).lower() if m else re.sub(r'^https?://|\.r2\.cloudflarestorage\.com.*$', '', raw).strip('/ ')
+    same_as_key = acct == os.environ.get('R2_ACCESS_KEY_ID', '').strip().lower()
+    print(f"[r2] Account ID：{len(acct)}文字・{'32桁の英数字でOK' if m else '32桁の英数字が見つからない（Cloudflareの右側にある Account ID を入れてください）'}"
+          + ('・※Access Key ID と同じ値になっています（Account ID を入れてください）' if same_as_key else ''), flush=True)
+    return f"https://{acct}.r2.cloudflarestorage.com"
+
+
+s3 = boto3.client('s3', endpoint_url=r2_endpoint(),
                   aws_access_key_id=os.environ['R2_ACCESS_KEY_ID'],
                   aws_secret_access_key=os.environ['R2_SECRET_ACCESS_KEY'], region_name='auto')
 T0 = time.time()
