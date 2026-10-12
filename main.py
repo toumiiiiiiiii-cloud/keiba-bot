@@ -606,7 +606,7 @@ def auto_heuristics(race, horses):
             avg = sum(w_ * mv(l) for w_, l in zip(ws, same)) / sum(ws)
             fit = (5 if t3w >= 1.5 else 4) if (t3w >= 0.6 and avg <= 1.0) else 3 if avg <= 1.5 else 2
         elif cs and all(l['dist'][:1] != race['surf'] for l in cs):
-            fit = 1
+            fit = 3      # 初めての芝・ダート：マイナスにせず「普通」（分からないものは0扱い）
 
         dw = med - h['wt']
         jk = clamp(3 + (1 if dw >= 2 else 0) + (1 if dw >= 4 else 0) - (1 if dw <= -2 else 0), 1, 5)
@@ -959,9 +959,9 @@ def model_row(race, h, N):
     # ── 芝⇔ダート替わり：向き（ダ→芝／芝→ダ）、初めての馬場か、その馬場での実績 ──
     same = [l for l in car if l['dist'][:1] == race['surf']]
     last_s = car[0]['dist'][:1] if car else None
-    f['toTurf'] = 1.0 if last_s == 'ダ' and race['surf'] == '芝' else 0.0
-    f['toDirt'] = 1.0 if last_s == '芝' and race['surf'] == 'ダ' else 0.0
-    f['surfFirst'] = 1.0 if car and not same else 0.0
+    # 初めての馬場の馬は、替わりの材料をすべて0（マイナスにしない）。前に走ったことのある馬場へ戻るときだけ向きを見る
+    f['toTurf'] = 1.0 if same and last_s == 'ダ' and race['surf'] == '芝' else 0.0
+    f['toDirt'] = 1.0 if same and last_s == '芝' and race['surf'] == 'ダ' else 0.0
     if same:
         t3 = sum(1 for l in same if l['pos'] <= 3)
         f['surfTop3'] = (t3 + 0.25 * 3) / (len(same) + 3) - 0.25
@@ -1133,6 +1133,10 @@ def apply_model(race, arr, odds):
             h['jkRatePrev'] = jr.get(jk_key(prev), JK_RATE_AVG) if prev else None
         rows.append(model_row(race, h, N))
     add_relative(rows)
+    bst = MODEL.get('boost') or {}
+    if bst.get('k', 1) != 1:
+        bset = set(bst.get('names', []))
+        beta = [b * bst['k'] if n in bset else b for n, b in zip(names, beta)]
     zs, xs = [], []
     for h, row in zip(arr, rows):
         x = [math.log(inv[h['n']] / tot)] + [row.get(n, 0.0) for n in names[1:]]
