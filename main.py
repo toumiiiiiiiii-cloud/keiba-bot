@@ -945,6 +945,54 @@ def model_row(race, h, N):
     else:
         f['bwdRestPlus'] = f['bwdRestMinus'] = f['bwdPlusBig'] = f['bwdMinusBig'] = f['bwdYoung'] = 0.0
     f['bwKg'] = clamp((h['bwNow'] - 470) / 30, -3, 3) if h.get('bwNow') else 0.0
+
+    car = [l for l in (h.get('career') or h.get('lines') or []) if is_flat(l) and l.get('pos', 0) > 0]
+    # ── 新馬（初めて走る馬）：過去走が無いので、調教・騎手・厩舎・馬体重・枠・血統だけが頼り。新馬専用の効き方を学習させる ──
+    debut = 0.0 if car else 1.0
+    f['debut'] = debut
+    f['debutTrain'] = debut * f['trainScore']
+    f['debutJk'] = debut * f['jkRate']
+    f['debutTr'] = debut * f['trBias']
+    f['debutBw'] = debut * f['bwKg']
+    f['debutDraw'] = debut * (dp - 0.5)
+    f['debutSire'] = debut * (f['sireSurf'] + f['dsireSurf'])
+    # ── 芝⇔ダート替わり：向き（ダ→芝／芝→ダ）、初めての馬場か、その馬場での実績 ──
+    same = [l for l in car if l['dist'][:1] == race['surf']]
+    last_s = car[0]['dist'][:1] if car else None
+    f['toTurf'] = 1.0 if last_s == 'ダ' and race['surf'] == '芝' else 0.0
+    f['toDirt'] = 1.0 if last_s == '芝' and race['surf'] == 'ダ' else 0.0
+    f['surfFirst'] = 1.0 if car and not same else 0.0
+    if same:
+        t3 = sum(1 for l in same if l['pos'] <= 3)
+        f['surfTop3'] = (t3 + 0.25 * 3) / (len(same) + 3) - 0.25
+        f['surfBest'] = max(1 - (l['pos'] - 1) / max(1, (l.get('f') or 16) - 1) for l in same) - 0.5
+    else:
+        f['surfTop3'] = f['surfBest'] = 0.0
+    chg = f['toTurf'] + f['toDirt']
+    f['chgSurfBack'] = chg * f['surfTop3']                    # 前に走って好走した馬場へ戻る
+    f['toTurfSire'] = f['toTurf'] * f['sireSurf']             # 血統の芝向き・ダート向き（血統がそろってから効く）
+    f['toDirtSire'] = f['toDirt'] * f['sireSurf']
+    # ── 堅実型か、勝ち切り型か（直近10走） ──
+    r10 = car[:10]
+    n10 = len(r10)
+    if n10:
+        w_ = sum(1 for l in r10 if l['pos'] == 1)
+        t2_ = sum(1 for l in r10 if l['pos'] <= 2)
+        t3_ = sum(1 for l in r10 if l['pos'] <= 3)
+        f['winRate'] = (w_ + 0.08 * 3) / (n10 + 3) - 0.08
+        f['top2Rate'] = (t2_ + 0.16 * 3) / (n10 + 3) - 0.16
+        f['top3Rate'] = (t3_ + 0.24 * 3) / (n10 + 3) - 0.24
+        f['winShare'] = ((w_ + 0.33) / (t3_ + 1) - 0.33) if t3_ else 0.0     # 3着内のうち勝った割合（低い＝勝ち切れない）
+        f['bigLoss'] = sum(1 for l in r10 if (l['pos'] - 1) / max(1, (l.get('f') or 16) - 1) > 0.7) / n10 - 0.3
+        k = 0
+        for l in r10:
+            if 2 <= l['pos'] <= 3:
+                k += 1
+            else:
+                break
+        f['placeStreak'] = float(min(k, 4))
+    else:
+        f['winRate'] = f['top2Rate'] = f['top3Rate'] = f['winShare'] = f['bigLoss'] = f['placeStreak'] = 0.0
     return f
 
 
@@ -992,7 +1040,7 @@ JK_RATE_AVG = 0.21        # 騎手の複勝率の平均くらい
 WT_RATIO_AVG = 0.117      # 斤量÷馬体重の平均くらい（55kg÷470kg）
 JK_RATE_K = 50            # 騎乗数が少ない騎手は平均に寄せる強さ
 REL_KEYS = ['si', 'lv', 'form', 'fit', 'bTime', 'bAgari', 'careerLog', 'age', 'hlMax', 'trainScore', 'offLog',
-            'sireSurf', 'sireDist', 'jkRate', 'jkUpgrade', 'wtRatio', 'early']
+            'sireSurf', 'sireDist', 'jkRate', 'jkUpgrade', 'wtRatio', 'early', 'top3Rate', 'winRate', 'surfTop3']
 
 
 def jk_key(name):
