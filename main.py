@@ -775,6 +775,15 @@ def ranked(race, horses, odds):
             r_ = h['p'] * N
             h['rank'] = 'S' if r_ >= 2.0 else 'A' if r_ >= 1.3 else 'B' if r_ >= 0.8 else 'C' if r_ >= 0.5 else 'D'
             h['anaFlag'] = h['rk'] >= 4 and h['anaScore'] >= 0.02
+    if MANUAL_BOOST and not os.environ.get('SYH_BACKTEST'):
+        try:
+            if manual_boost(race, arr):
+                arr.sort(key=lambda h: -h['p'])
+                for i, h in enumerate(arr):
+                    h['rk'] = i + 1
+        except Exception as e:
+            traceback.print_exc()
+            print(f"[boost] 重点補正を計算できず: {e}", flush=True)
     # AI推し：オッズ＋AIの期待値が1.1以上（2025・2026年のバックテストで、2年とも単勝の回収率が100%を超えた条件）
     for h in arr:
         h['aiPush'] = bool(race.get('model') and h.get('ev') and h['ev'] >= AI_PUSH_EV)
@@ -1133,6 +1142,8 @@ def apply_model(race, arr, odds):
             h['jkRatePrev'] = jr.get(jk_key(prev), JK_RATE_AVG) if prev else None
         rows.append(model_row(race, h, N))
     add_relative(rows)
+    for h, row in zip(arr, rows):
+        h['_row'] = row
     bst = MODEL.get('boost') or {}
     if bst.get('k', 1) != 1:
         bset = set(bst.get('names', []))
@@ -1156,6 +1167,109 @@ def apply_model(race, arr, odds):
         h['ev'] = h['p'] * h['o'] if h.get('o') else None
     race['model'] = True
     race['modelNote'] = f"勝率＝オッズ＋AI（{MODEL.get('trained_range', '過去データ')}で学習）"
+    return True
+
+
+# ═════════════════════════════════════════
+# 重点補正（Tomiさんの指定で強めた5つ。バックテストでの確かめはまだ。止めるときは MANUAL_BOOST = False）
+#   ① レースレベル ② 騎手（人気の割に勝つ・鞍上強化・差し追込の成績・その馬との好走歴）
+#   ③ 当日の馬場 ④ 馬場適性（初めての馬場は0・好走回数で加点） ⑤ 展開不向き・不利のレースは度外視
+#   勝率を exp(補正) 倍してレース内で合計100%に直す。1頭の補正は ±0.30 まで（勝率がおよそ0.75〜1.35倍）
+# ═════════════════════════════════════════
+MANUAL_BOOST = True
+BOOST_CAP = 0.30
+
+
+def _first_ratio(l):
+    mm = re.match(r'(\d+)', l.get('ps') or '')
+    n_ = l.get('f') or 0
+    return (int(mm.group(1)) - 1) / (n_ - 1) if mm and n_ > 1 else None
+
+
+def excused(l, usual):
+    """度外視してよいレースか（理由を返す。普通なら空）"""
+    r0 = _first_ratio(l)
+    if r0 is not None and usual is not None and r0 - usual >= 0.35 and usual <= 0.5:
+        return '出遅れ'
+    pf, pb = l.get('pf'), l.get('pb')
+    if pf and pb and r0 is not None:
+        if pf < pb - 1.0 and r0 <= 0.3:
+            return 'ハイペースを前で'
+        if pf > pb + 1.0 and r0 >= 0.6:
+            return 'スローを後ろから'
+    return ''
+
+
+def manual_boost(race, arr):
+    if not arr:
+        return False
+    N = len(arr)
+    jst = (MODEL or {}).get('jockey_style', {})
+    any_ = False
+    for h in arr:
+        row = h.get('_row') or model_row(race, h, N)
+        notes, adj = [], 0.0
+        # ① レースレベル
+        lv = clamp(0.05 * clamp(row.get('hlMax', 0), -1, 3) + 0.08 * row.get('hlLowGood', 0), -0.15, 0.15)
+        if abs(lv) >= 0.02:
+            notes.append(f"レースレベル{'＋' if lv > 0 else '－'}")
+        adj += lv
+        # ② 騎手
+        jk = 0.1 * float(h.get('jkBias') or 0) + 0.4 * row.get('jkUpgrade', 0)
+        car = [l for l in (h.get('career') or h.get('lines') or []) if is_flat(l) and l.get('pos', 0) > 0]
+        me = jk_key(h.get('jockey'))
+        with_me = sum(1 for l in car[:15] if l.get('j') and jk_key(l['j']) == me and l['pos'] <= 3)
+        if with_me:
+            jk += 0.03 * min(with_me, 3)
+            notes.append(f"この騎手で好走{with_me}回")
+        er = h.get('earlyRatio')
+        style = '追' if er is not None and er >= 0.75 else '差' if er is not None and er >= 0.4 else None
+        if style and jst:
+            sv = float(jst.get(f"{me}|{style}", 0.0))
+            jk += 0.5 * sv
+            if abs(sv) >= 0.03:
+                notes.append(f"騎手の{'差し' if style == '差' else '追い込み'}成績{'◎' if sv > 0 else '△'}")
+        if row.get('jkUpgrade', 0) >= 0.05:
+            notes.append('鞍上強化')
+        adj += clamp(jk, -0.12, 0.12)
+        # ③ 当日の馬場
+        tb = clamp(0.15 * (row.get('tbInner', 0) + row.get('tbFront', 0)), -0.08, 0.08)
+        if abs(tb) >= 0.02:
+            notes.append(f"当日の馬場{'向く' if tb > 0 else '向かない'}")
+        adj += tb
+        # ④ 馬場適性（初めての馬場は0）
+        same = [l for l in car if l['dist'][:1] == race['surf']]
+        if same:
+            good = sum(1 for l in same if l['pos'] <= 3)
+            sf = 0.15 * row.get('surfTop3', 0) + 0.02 * min(good, 5)
+            adj += clamp(sf, -0.06, 0.12)
+            if good:
+                notes.append(f"{'芝' if race['surf'] == '芝' else 'ダート'}で好走{good}回")
+        # ⑤ 展開不向き・不利は度外視
+        recent = car[:5]
+        if len(recent) >= 2:
+            usual_l = [x for x in (_first_ratio(l) for l in car[1:6]) if x is not None]
+            usual = sum(usual_l) / len(usual_l) if usual_l else None
+            sc = lambda l: 1 - (l['pos'] - 1) / max(1, (l.get('f') or 16) - 1)
+            why = [(l, excused(l, usual)) for l in recent]
+            kept = [sc(l) for l, w in why if not w]
+            if kept and len(kept) < len(recent):
+                ex = 0.3 * (sum(kept) / len(kept) - sum(sc(l) for l in recent) / len(recent))
+                adj += clamp(ex, 0.0, 0.10)
+                if ex >= 0.01:
+                    notes.append('度外視：' + '・'.join(sorted({w for _, w in why if w})))
+        adj = clamp(adj, -BOOST_CAP, BOOST_CAP)
+        h['boostAdj'] = adj
+        h['boostNotes'] = notes
+        any_ = any_ or abs(adj) > 1e-6
+    if not any_:
+        return False
+    w = [h['p'] * math.exp(h['boostAdj']) for h in arr]
+    tot = sum(w)
+    for h, x in zip(arr, w):
+        h['p'] = x / tot
+        h['ev'] = h['p'] * h['o'] if h.get('o') else None
+    race['modelNote'] = (race.get('modelNote') or '') + '・重点補正あり'
     return True
 
 
@@ -3708,6 +3822,8 @@ def make_reasons(race, h):
         R.append(('コース特性', f"{race['venue']}：{P['note']}。脚質{st_}・{h['n']}番の条件で"
                   f"{'有利' if h['bCourse'] > 0 else '不利'}"
                   + (f"。{h['courseNote']}" if h.get('courseNote') else '') + sgn(h['bCourse'])))
+    if h.get('boostNotes') and abs(h.get('boostAdj', 0)) >= 0.01:
+        R.append(('重点補正', '・'.join(h['boostNotes']) + f"（勝率×{math.exp(h['boostAdj']):.2f}）"))
     if h.get('sim'):
         hs = h['sim']
         R.append(('シミュレーション', f"{race['simulation']['runs']}回走らせて平均{hs['avg']:.1f}着（{hs['rank']}位）・"
@@ -3728,7 +3844,7 @@ def sgn(v):
 SHORT_HEAD = {'総合評価': '総合評価', '過去レースのレベル': 'レース格', '対戦相手のその後': '対戦相手',
               '近走': '近走', 'コース・距離適性': '適性', '脚質・展開': '展開', '騎手・条件': '騎手・斤量',
               '道悪適性': '道悪', '穴馬チェック': '穴馬', '血統・厩舎': '血統', 'タイム': 'タイム',
-              '上がり': '上がり', '枠順': '枠順', '当日の馬場': '当日馬場', '騎手データ': '騎手成績', '状態': '状態', '全成績から': '全成績', '近走の中身': '近走の中身', 'コース特性': 'コース', '格付け': '格付け', '海外レース': '海外', 'ハイレベル戦': 'ハイレベル', '調教': '調教', 'シミュレーション': 'シミュ'}
+              '上がり': '上がり', '枠順': '枠順', '当日の馬場': '当日馬場', '騎手データ': '騎手成績', '状態': '状態', '全成績から': '全成績', '近走の中身': '近走の中身', 'コース特性': 'コース', '格付け': '格付け', '海外レース': '海外', 'ハイレベル戦': 'ハイレベル', '調教': '調教', 'シミュレーション': 'シミュ', '重点補正': '重点'}
 
 
 _cw_cache = {}
