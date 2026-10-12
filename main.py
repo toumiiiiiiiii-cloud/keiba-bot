@@ -1853,6 +1853,7 @@ def parse_result_full(race_id):
         soup = fetch_soup(f"{site_of(race_id)}/race/result.html?race_id={race_id}", timeout=8)
         d1 = soup.select_one('.RaceData01')
         sm = re.search(r'(芝|ダ)', d1.get_text()) if d1 else None
+        dm_ = re.search(r'(?:芝|ダ|障)\D{0,6}?(\d{3,4})\s*m', d1.get_text()) if d1 else None
         table = soup.select_one('table#All_Result_Table') or soup.select_one('table.RaceTable01')
         if not table:
             return None
@@ -1875,7 +1876,8 @@ def parse_result_full(race_id):
         if not rows or not any(r['pos'] == 1 for r in rows):
             return None
         pm = re.search(r'ペース\s*[:：]?\s*([HMS])(?![a-zA-Z])', soup.get_text(' '))
-        return {'surf': sm.group(1) if sm else None, 'N': len(rows), 'rows': rows, 'pace': pm.group(1) if pm else None}
+        return {'surf': sm.group(1) if sm else None, 'dist': int(dm_.group(1)) if dm_ else None,
+                'N': len(rows), 'rows': rows, 'pace': pm.group(1) if pm else None}
     return cached(('res', race_id), 7 * 86400, load)
 
 
@@ -4530,6 +4532,117 @@ def pedigree_text(race, arr):
     return '\n'.join(out)
 
 
+# ═════════════════════════════════════════
+# 今日の馬場の傾向（「馬場」と送ったとき）：競馬場ごと・芝ダート×距離ごとに、終わったレースの3着内の馬から読む
+# ═════════════════════════════════════════
+DIST_BANDS = [('短距離', 0, 1400), ('中距離', 1401, 1800), ('中長距離', 1801, 2200), ('長距離', 2201, 9999)]
+
+
+def _style_of(c4, N):
+    if not c4:
+        return None
+    if c4 == 1:
+        return '逃げ'
+    r = (c4 - 1) / max(1, N - 1)
+    return '先行' if r <= 0.3 else '差し' if r <= 0.65 else '追込'
+
+
+def venue_results_today(prefix):
+    """その日・その競馬場の、終わったレースの結果（1Rから順に、まだ終わっていないレースで止める）"""
+    out = []
+    for r_ in range(1, 13):
+        rid = f"{prefix}{r_:02d}"
+        res = _safe(parse_result_full, rid)
+        if not res:
+            break
+        if res.get('surf') in ('芝', 'ダ'):
+            out.append((r_, res))
+    return out
+
+
+def band_verdict(results):
+    """結果のリスト → 文章（脚質と内外の傾向）"""
+    st = {'逃げ': 0, '先行': 0, '差し': 0, '追込': 0}
+    inner = tot = 0
+    for _, r in results:
+        for x in r['rows']:
+            if x['pos'] <= 3:
+                s_ = _style_of(x.get('c4'), r['N'])
+                if s_:
+                    st[s_] += 1
+                tot += 1
+                inner += 1 if x['n'] <= r['N'] / 2 else 0
+    if not tot:
+        return None
+    front = (st['逃げ'] + st['先行']) / tot
+    words = []
+    if front >= 0.65:
+        words.append('前残り（逃げ・先行が有利）' if st['逃げ'] / tot < 0.25 else '逃げ馬が粘る（逃げ・先行が有利）')
+    elif front <= 0.3:
+        words.append('差し・追い込みが届く' if st['追込'] / tot < 0.3 else '追い込みまで届く（後ろの馬が有利）')
+    else:
+        words.append('脚質の偏りは小さい')
+    ir = inner / tot
+    if ir >= 0.68:
+        words.append('内枠有利')
+    elif ir <= 0.32:
+        words.append('外枠有利')
+    shares = '・'.join(f"{k}{v}" for k, v in st.items() if v)
+    pc = [r.get('pace') for _, r in results if r.get('pace')]
+    pace = ''
+    if pc:
+        h_, s_ = pc.count('H'), pc.count('S')
+        pace = '　ハイペース多め' if h_ > len(pc) / 2 else '　スローペース多め' if s_ > len(pc) / 2 else ''
+    few = '（まだ1レースだけ）' if len(results) == 1 else ''
+    return f"{'、'.join(words)}{few}　［3着内：{shares}］{pace}"
+
+
+def day_track_report(prefixes):
+    """prefixes：レースIDの頭10桁（年・競馬場・回・日）のリスト"""
+    out = []
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        allres = list(ex.map(venue_results_today, prefixes))
+    for pf, res in zip(prefixes, allres):
+        name = JRA_PLACE.get(pf[4:6], pf[4:6])
+        out.append(f"■ {name}（終わった{len(res)}レースから）")
+        if not res:
+            out.append('　まだ終わったレースがありません')
+            continue
+        for surf in ('芝', 'ダ'):
+            sres = [x for x in res if x[1]['surf'] == surf]
+            if not sres:
+                continue
+            out.append(f"【{'芝' if surf == '芝' else 'ダート'}】全体：{band_verdict(sres)}")
+            for bname, lo, hi in DIST_BANDS:
+                b = [x for x in sres if x[1].get('dist') and lo <= x[1]['dist'] <= hi]
+                if b:
+                    rs = '・'.join(f"{r_}R" for r_, _ in b)
+                    out.append(f"　{bname}（{rs}）：{band_verdict(b)}")
+        out.append('')
+    return out
+
+
+def today_prefixes(race=None):
+    if race and race.get('id') and re.match(r'^\d{12}$', race['id']) and race['id'][4:6] in JRA_PLACE:
+        return [race['id'][:10]]
+    today = (datetime.datetime.utcnow() + datetime.timedelta(hours=9)).date()
+    try:
+        ids = race_ids_on(today)
+    except Exception:
+        ids = []
+    return sorted({i[:10] for i in ids if re.match(r'^\d{12}$', i) and i[4:6] in JRA_PLACE})
+
+
+def track_report_text(race=None):
+    pfs = today_prefixes(race)
+    if not pfs:
+        return '今日は中央競馬の開催がないか、開催の情報を読めませんでした'
+    out = ['🏇 今日の馬場の傾向（終わったレースの3着内の馬から）', '']
+    out += day_track_report(pfs)
+    out.append('※逃げ＝4コーナー先頭、先行＝前から3割、差し＝前から3〜6.5割、追込＝それより後ろ。内枠＝馬番が頭数の半分以下')
+    return '\n'.join(out).strip()
+
+
 def going_text(race, arr):
     g = race.get('going') or '良'
     icon = '☀️' if g == '良' else '⛅' if g.startswith('稍') else '🌧'
@@ -4707,13 +4820,21 @@ def command_reply(text, uid):
     if not cmd:
         return None
     sess = get_session(uid)
+    if not sess and cmd == '馬場':
+        return track_report_text()
     if not sess:
         return "先にレースのURLを送ってください。予想のあと30分間は「血統」「馬場」「3000円」「ハイレベル」で詳しく答えます"
     race, arr = sess
     if cmd == '血統':
         return pedigree_text(race, arr)
     if cmd == '馬場':
-        return going_text(race, arr)
+        txt = going_text(race, arr)
+        try:
+            if not race.get('abroad') and re.match(r'^\d{12}$', race.get('id') or '') and race['id'][4:6] in JRA_PLACE:
+                txt += '\n\n' + track_report_text(race)
+        except Exception as e:
+            print(f"[track] 今日の馬場の傾向を作れず: {e}", flush=True)
+        return txt
     if cmd == 'ハイレベル':
         return highlevel_text(race, arr)
     return budget_text(race, arr, bv, parse_budget_unit(t)[1], bool(re.search(r'期待値|ケリー', t)))
