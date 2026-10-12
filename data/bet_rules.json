@@ -1,0 +1,11 @@
+{
+ "note": "穴と3連単の学習（2025年で選び2026年で確認）。数字は 2025年／2026年 の回収率",
+ "ana": {"max_rank": 18, "min_odds": 8, "min_edge": 1.2, "max_n": 1},
+ "ana_bets": [
+  {"bet": "ワイド◎-穴", "max_rank": 18, "min_odds": 8, "min_edge": 1.2, "max_n": 1, "roi": "104.9／110.1"},
+  {"bet": "複勝", "max_rank": 18, "min_odds": 8, "min_edge": 1.2, "max_n": 1, "roi": "96.3／85.8"},
+  {"bet": "3連複◎○-穴", "max_rank": 8, "min_odds": 8, "min_edge": 1.2, "max_n": 2, "roi": "107.4／110.7"}
+ ],
+ "sanren_tan": {"a": 2, "b": 2, "c": 4, "h3": 1, "h2": 0, "skip": 0.25,
+                "ana": {"max_rank": 8, "min_odds": 8, "min_edge": 1.2, "max_n": 2}, "roi": "88.4／79.8"}
+}

@@ -775,6 +775,8 @@ def ranked(race, horses, odds):
             r_ = h['p'] * N
             h['rank'] = 'S' if r_ >= 2.0 else 'A' if r_ >= 1.3 else 'B' if r_ >= 0.8 else 'C' if r_ >= 0.5 else 'D'
             h['anaFlag'] = h['rk'] >= 4 and h['anaScore'] >= 0.02
+    for h in arr:
+        h['pBase'] = h['p']      # 重点補正の前の勝率（穴の決め方はこの勝率で学習したので、穴選びにはこちらを使う）
     if MANUAL_BOOST and not os.environ.get('SYH_BACKTEST'):
         try:
             if manual_boost(race, arr):
@@ -1540,11 +1542,12 @@ def ana_horses(arr, rule=None):
         return [h for h in arr if h.get('anaFlag')][:2]
     pa, pm = prob_tables(arr)
     out = []
-    for r_, h in enumerate(arr, 1):
+    pb = lambda h: h.get('pBase', h['p'])
+    for r_, h in enumerate(sorted(arr, key=lambda h: -pb(h)), 1):
         o = h.get('o') or 0
         if r_ < 4 or r_ > rule.get('max_rank', 10) or o < rule.get('min_odds', 12):
             continue
-        e = h['p'] / max(pm.get(h['n'], 0) or h.get('pm') or 1e-9, 1e-9)
+        e = pb(h) / max(pm.get(h['n'], 0) or h.get('pm') or 1e-9, 1e-9)
         if e >= rule.get('min_edge', 1.2):
             out.append((e, h))
     out.sort(key=lambda x: -x[0])
@@ -1557,16 +1560,21 @@ ANA_BET_JP = {'単勝': '単勝', '複勝': '複勝', 'ワイド◎-穴': 'ワ�
 def ana_plan(arr):
     """穴の買い目（学習で2年とも回収率が良かった買い方だけ）"""
     n = [h['n'] for h in arr]
-    anas = ana_horses(arr)
-    bets = (BET_RULES.get('ana') or {}).get('bets')
-    if not anas or len(n) < 6:
+    if len(n) < 6:
         return []
-    if not bets:      # 学習していない・どれも良くなかった → 今まで通り ◎-穴 のワイドを1点
+    # 買い方ごとに穴の決め方を変えられる（ana_bets：[{'bet': 買い方, 穴の決め方…}]）。無ければ共通の決め方（ana.bets）
+    spec = BET_RULES.get('ana_bets') or [{'bet': k} for k in ((BET_RULES.get('ana') or {}).get('bets') or [])]
+    if not spec:      # 学習していない・どれも良くなかった → 今まで通り ◎-穴 のワイドを1点
+        anas = ana_horses(arr)
+        if not anas:
+            return []
         pa, pm = prob_tables(arr)
         aw, _ = _keep('ワイド', [(n[0], anas[0]['n'])], pm)
         return [{'label': '穴', 'text': "ワイド " + ', '.join(f"{a}-{b}" for a, b in aw), 'parts': [('ワイド', aw)]}] if aw else []
     out = []
-    for k in bets:
+    for sp in spec:
+        k = sp['bet']
+        anas = ana_horses(arr, {x: v for x, v in sp.items() if x != 'bet'} or None)
         parts = []
         for h in anas:
             a = h['n']
@@ -1671,7 +1679,7 @@ def sanren_combos(arr, kind):
         return sorted({tuple(sorted((n[0], n[1], x))) for x in n[2:2 + k]})
     tr = BET_RULES.get('sanren_tan')
     if tr:      # 学習した形：1着 上位a頭 → 2着 上位b頭（＋穴h2）→ 3着 上位c頭（＋穴h3）、◎の勝率がskip未満なら見送り
-        if arr[0]['p'] < tr.get('skip', 0.25):
+        if arr[0].get('pBase', arr[0]['p']) < tr.get('skip', 0.25):    # 学習と同じ、重点補正の前の勝率で判定
             return []
         cols = tan_cols(arr, n, tr)
         return [(x, y, z) for x in cols[0] for y in cols[1] for z in cols[2] if len({x, y, z}) == 3]
@@ -1681,7 +1689,7 @@ def sanren_combos(arr, kind):
 
 
 def tan_cols(arr, n, tr):
-    an = [h['n'] for h in ana_horses(arr)]
+    an = [h['n'] for h in ana_horses(arr, tr.get('ana'))] if (tr.get('h2') or tr.get('h3')) else []
     c1 = n[:tr['a']]
     c2 = n[:tr['b']] + [x for x in an[:tr.get('h2', 0)] if x not in n[:tr['b']]]
     c3 = n[:tr['c']] + [x for x in an[:tr.get('h3', 0)] if x not in n[:tr['c']]]
