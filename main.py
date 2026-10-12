@@ -5395,7 +5395,9 @@ def parse_bet_request(text, arr):
         am = re.search(r'(\d)頭軸', seg)
         k = 3 if kind in ('3連単', '3連複') else 2 if kind in ('馬単', '馬連', 'ワイド') else 1
         fixed = _parse_pos_fix(seg, n, k) if k >= 2 else {}
-        ax_n = [int(x) for x in re.findall(r'(\d+)番', re.sub(POS_RE, ' ', seg)) if int(x) in n]
+        ax_n = []
+        for grp in re.findall(r'((?:\d+\s*[・]\s*)*\d+)番', re.sub(POS_RE, ' ', seg)):
+            ax_n += [int(x) for x in re.findall(r'\d+', grp) if int(x) in n and int(x) not in ax_n]
         if k == 1:
             ax_n += [int(x) for x in re.findall(r'(\d+)番', seg) if int(x) in n and int(x) not in ax_n]
         per_m = re.search(r'各\s*(\d[\d,]*)円', seg) or re.search(r'各\s*(\d[\d,]*)円', t)
