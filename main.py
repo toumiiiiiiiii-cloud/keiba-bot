@@ -4493,7 +4493,12 @@ def record_prediction(race, arr):
         'marks': marks,
         'odds': arr[0]['o'] or '',
         'bets': '\n'.join(f"{b['label']} {b['text']}" for b in plan),
-        'plan': json.dumps([{'label': b['label'], 'parts': b['parts']} for b in plan], ensure_ascii=False),
+        'plan': json.dumps([{'label': b['label'], 'parts': b['parts']} for b in plan]
+                           # あとで学習に使うため、全馬の [馬番, AIの勝率, オッズから見た勝率, 単勝オッズ, 重点補正] も残す
+                           #（parts が空なので、投資・払戻の計算には入らない）
+                           + [{'label': '_ai', 'parts': [],
+                               'ai': [[h['n'], round(h['p'], 4), round(h.get('pm') or 0, 4), h.get('o') or 0,
+                                       round(h.get('boostAdj') or 0, 3)] for h in arr]}], ensure_ascii=False),
         'site': race.get('base', ''),
     }
     try:
@@ -4578,7 +4583,8 @@ def settle_one(row):
             if b['label'] not in (VERIFY_LABEL, BEST_LABEL, SHOUBU_LABEL):
                 cost += c
                 ret += got
-    return {'race_id': row['race_id'], 'result': '-'.join(map(str, top3)), 'honmei_pos': order.get(hm, ''),
+    # 「12-3-6」だとスプレッドシートが日付（2012/3/6）に変えてしまうので「→」でつなぐ
+    return {'race_id': row['race_id'], 'result': '→'.join(map(str, top3)), 'honmei_pos': order.get(hm, ''),
             'cost': cost, 'ret': ret, 'detail': json.dumps(detail, ensure_ascii=False)}
 
 
