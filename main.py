@@ -1163,8 +1163,11 @@ def apply_model(race, arr, odds):
         xs.append(x)
         zs.append(sum(b * (v - m) / s for b, v, m, s in zip(beta, x, mean, std)))
     try:
-        if (MODEL.get('place') or {}).get('names') == names:
-            apply_place_model(arr, rows, xs, [inv[h['n']] / tot for h in arr])
+        pn = (MODEL.get('place') or {}).get('names')
+        if pn:      # 2・3着の見込みは、勝つ見込みとは別の材料（堅実度など）も使える
+            xp = xs if pn == names else [[math.log(inv[h['n']] / tot)] + [row.get(n, 0.0) for n in pn[1:]]
+                                         for h, row in zip(arr, rows)]
+            apply_place_model(arr, rows, xp, [inv[h['n']] / tot for h in arr])
     except Exception as e:
         print(f"[place] 2着・3着の見込みを計算できず: {e}", flush=True)
     zmax = max(zs)
