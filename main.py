@@ -946,7 +946,7 @@ def model_row(race, h, N):
     # ── 鞍上：今回の騎手の複勝率、前走の騎手からの強化・弱化（名前で引く表。バックテストとBotで共通） ──
     rn, rp = h.get('jkRateNow'), h.get('jkRatePrev')
     prev = next((l.get('j') for l in (h.get('lines') or []) if l.get('j')), '')
-    chg = bool(prev) and jk_key(prev) != jk_key(h.get('jockey'))
+    chg = bool(prev) and not same_jk(prev, h.get('jockey'))
     f['jkRate'] = (rn - JK_RATE_AVG) if rn is not None else 0.0
     f['jkChange'] = 1.0 if chg else 0.0
     f['jkUpgrade'] = (rn - rp) if chg and rn is not None and rp is not None else 0.0
@@ -1068,6 +1068,26 @@ REL_KEYS = ['si', 'lv', 'form', 'fit', 'bTime', 'bAgari', 'careerLog', 'age', 'h
             'sireSurf', 'sireDist', 'jkRate', 'jkUpgrade', 'wtRatio', 'early', 'top3Rate', 'winRate', 'surfTop3']
 
 
+def same_jk(a, b):
+    """同じ騎手か（「岩田望」と「岩田望来」のように、出馬表と過去走で名前の長さが違っても同じとみなす）"""
+    ka, kb = jk_key(a), jk_key(b)
+    if not ka or not kb:
+        return False
+    if ka == kb:
+        return True
+    short, long_ = sorted((ka, kb), key=len)
+    return len(short) >= 2 and long_.startswith(short)
+
+
+def jr_get(jr, name):
+    """騎手の複勝率の表を引く（名前の長さが違っても、頭がそろう騎手が1人だけならその騎手）"""
+    k = jk_key(name)
+    if k in jr:
+        return jr[k]
+    hits = [v for kk, v in jr.items() if len(min(k, kk, key=len)) >= 2 and (kk.startswith(k) or k.startswith(kk))]
+    return hits[0] if len(hits) == 1 else JK_RATE_AVG
+
+
 def jk_key(name):
     """騎手名をそろえる（減量記号・空白・点を取って、頭4文字）"""
     s = unicodedata.normalize('NFKC', name or '')
@@ -1154,8 +1174,8 @@ def apply_model(race, arr, odds):
         h['sireTab'] = sire_tab(race, h, lambda k: stab.get(k, 0.0))
         if jr:
             prev = next((l.get('j') for l in (h.get('lines') or []) if l.get('j')), '')
-            h['jkRateNow'] = jr.get(jk_key(h.get('jockey')), JK_RATE_AVG)
-            h['jkRatePrev'] = jr.get(jk_key(prev), JK_RATE_AVG) if prev else None
+            h['jkRateNow'] = jr_get(jr, h.get('jockey'))
+            h['jkRatePrev'] = jr_get(jr, prev) if prev else None
         rows.append(model_row(race, h, N))
     add_relative(rows)
     for h, row in zip(arr, rows):
@@ -1310,7 +1330,7 @@ def manual_boost(race, arr):
         jk = 0.1 * float(h.get('jkBias') or 0) + 0.4 * row.get('jkUpgrade', 0)
         me = jk_key(h.get('jockey'))
         prev = next((l.get('j') for l in car if l.get('j')), '')
-        with_me = sum(1 for l in car[:15] if l.get('j') and jk_key(l['j']) == me and l['pos'] <= 3)
+        with_me = sum(1 for l in car[:15] if l.get('j') and same_jk(l['j'], h.get('jockey')) and l['pos'] <= 3)
         jtxt = None
         if row.get('jkUpgrade', 0) >= 0.05 and prev:
             jtxt = f"鞍上強化（{re.sub(r'[▲△☆★◇]', '', prev)}→{h.get('jockey')}）"
@@ -1352,7 +1372,7 @@ def manual_boost(race, arr):
             if kept and len(kept) < len(recent):
                 ex = 0.3 * (sum(kept) / len(kept) - sum(sc_(l) for l in recent) / len(recent))
                 bad = next(((l, w) for l, w in why if w), None)
-                adj += add(ex, f"{short_date(bad[0]['d'])}の{bad[0]['pos']}着は{bad[1]}で度外視" if bad else '', 0.0, 0.10)
+                adj += add(ex, f"{short_date(bad[0]['d'])}の{bad[0]['pos']}着は{bad[1]}{'' if bad[1].endswith('で') else 'で'}度外視" if bad else '', 0.0, 0.10)
         # ⑥ 今日の展開（予想ペース×位置取り）
         if er is not None and pace in ('fast', 'slow'):
             pv = 0.16 * (er - 0.5) * (1 if pace == 'fast' else -1)
