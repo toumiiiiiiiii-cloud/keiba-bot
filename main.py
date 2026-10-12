@@ -4531,7 +4531,9 @@ def pedigree_text(race, arr):
 
 
 def going_text(race, arr):
-    out = [f"🌧 馬場の見立て（{race['venue']}{race['R']}R）", "",
+    g = race.get('going') or '良'
+    icon = '☀️' if g == '良' else '⛅' if g.startswith('稍') else '🌧'
+    out = [f"{icon} 馬場の見立て（{race['venue']}{race['R']}R）", "",
            f"馬場：{race['going']}" + ('（あなたが指定）' if race.get('going_manual') else '' if race['going_known'] else '（未発表のため良で計算）')]
     tb = race.get('trackBias')
     if tb:
@@ -4542,7 +4544,8 @@ def going_text(race, arr):
         out.append("欧州の馬場は雨で急に重くなります。URLの後ろに「重」などと付けて送ると、その馬場で計算し直します")
     mud = sorted([h for h in arr if h.get('mudM')], key=lambda h: -h['mudM'])[:5]
     if mud:
-        out += ["", "道悪が得意そうな馬（血統・馬格・実績から）"]
+        out += ["", "道悪が得意そうな馬（血統・馬格・実績から）" if g != '良' else
+                "【参考】雨で馬場が悪くなった場合に浮上しそうな馬（今は良馬場なので予想には影響なし）"]
         for h in mud:
             out.append(f"・{h['n']}番 {h['name']}：{'、'.join(h.get('mudParts') or ['馬格から判定'])}")
     bw = [h for h in arr if h.get('bwDiff') is not None and abs(h['bwDiff']) >= 10]
