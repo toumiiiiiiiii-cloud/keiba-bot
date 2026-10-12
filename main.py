@@ -1682,6 +1682,8 @@ def ana_plan(arr):
 def bet_plan(arr):
     """おすすめ買い目。各要素は {'label','text','parts':[(券種, [組み合わせ,...]), ...]}
     予想配当が安すぎる組み合わせは外し、人気馬ばかりのときは妙味のある相手を入れる"""
+    # 買い目は「勝つ見込みの順」で組む（学習で確かめた組み方。印の並べ替え（役割どおり）は表示用）
+    arr = sorted(arr, key=lambda h: -h['p'])
     n = [h['n'] for h in arr]
     plan = []
     if not n:
