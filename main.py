@@ -1962,7 +1962,10 @@ def parse_result_full(race_id):
                 continue
             rk = clean(tds[0].get_text())
             n = to_float(tds[i_n].get_text())
-            corners = [int(x) for x in re.findall(r'\d+', tds[i_c].get_text())] if i_c is not None and i_c < len(tds) else []
+            # 通過順（例「3-3-2-1」）。列の位置がずれていても読めるよう、形で探す
+            cands = ([tds[i_c]] if i_c is not None and i_c < len(tds) else []) + tr.select('td.PassageRate') + tds
+            ctext_ = next((clean(td.get_text()) for td in cands if re.fullmatch(r'\d{1,2}(?:-\d{1,2})+', clean(td.get_text()))), '')
+            corners = [int(x) for x in ctext_.split('-')] if ctext_ else []
             l3 = to_float(tds[i_l3].get_text()) if i_l3 is not None and i_l3 < len(tds) else None
             if n and rk not in ('取消', '除外'):
                 rows.append({'pos': int(rk) if rk.isdigit() else 99, 'n': int(n),
@@ -4679,11 +4682,14 @@ def band_stats(results):
                 inner += 1 if x['n'] <= r['N'] / 2 else 0
     if not tot:
         return None
-    front = (st['逃げ'] + st['先行']) / tot
-    if front >= 0.65:
-        kind, word = 'front', ('逃げ馬が粘る' if st['逃げ'] / tot >= 0.25 else '前残り')
+    ts = sum(st.values())
+    front = (st['逃げ'] + st['先行']) / ts if ts else 0.5
+    if not ts:
+        kind, word = 'flat', '位置データなし'
+    elif front >= 0.65:
+        kind, word = 'front', ('逃げ馬が粘る' if st['逃げ'] / ts >= 0.25 else '前残り')
     elif front <= 0.3:
-        kind, word = 'back', ('追い込みが届く' if st['追込'] / tot >= 0.3 else '差しが届く')
+        kind, word = 'back', ('追い込みが届く' if st['追込'] / ts >= 0.3 else '差しが届く')
     else:
         kind, word = 'flat', '偏りは小さい'
     ir = inner / tot
@@ -4765,7 +4771,7 @@ def render_track_image(data):
             cnt = bs['counts'][nm]
             if not cnt:
                 continue
-            w_ = (bx1 - bx0) * cnt / bs['tot']
+            w_ = (bx1 - bx0) * cnt / max(1, sum(bs['counts'].values()))
             d.rectangle((x, by0, x + w_, by1), fill=c)
             if w_ >= 26:
                 ctext(d, x + w_ / 2, by0 + (by1 - by0) / 2 - 15, str(cnt), F('sans_b', 24), (20, 20, 20))
@@ -4866,39 +4872,13 @@ def render_highlevel_image(race, arr):
 
 def band_verdict(results):
     """結果のリスト → 文章（脚質と内外の傾向）"""
-    st = {'逃げ': 0, '先行': 0, '差し': 0, '追込': 0}
-    inner = tot = 0
-    for _, r in results:
-        for x in r['rows']:
-            if x['pos'] <= 3:
-                s_ = _style_of(x.get('c4'), r['N'])
-                if s_:
-                    st[s_] += 1
-                tot += 1
-                inner += 1 if x['n'] <= r['N'] / 2 else 0
-    if not tot:
+    bs = band_stats(results)
+    if not bs:
         return None
-    front = (st['逃げ'] + st['先行']) / tot
-    words = []
-    if front >= 0.65:
-        words.append('前残り（逃げ・先行が有利）' if st['逃げ'] / tot < 0.25 else '逃げ馬が粘る（逃げ・先行が有利）')
-    elif front <= 0.3:
-        words.append('差し・追い込みが届く' if st['追込'] / tot < 0.3 else '追い込みまで届く（後ろの馬が有利）')
-    else:
-        words.append('脚質の偏りは小さい')
-    ir = inner / tot
-    if ir >= 0.68:
-        words.append('内枠有利')
-    elif ir <= 0.32:
-        words.append('外枠有利')
-    shares = '・'.join(f"{k}{v}" for k, v in st.items() if v)
-    pc = [r.get('pace') for _, r in results if r.get('pace')]
-    pace = ''
-    if pc:
-        h_, s_ = pc.count('H'), pc.count('S')
-        pace = '　ハイペース多め' if h_ > len(pc) / 2 else '　スローペース多め' if s_ > len(pc) / 2 else ''
-    few = '（まだ1レースだけ）' if len(results) == 1 else ''
-    return f"{'、'.join(words)}{few}　［3着内：{shares}］{pace}"
+    shares = '・'.join(f"{k}{v}" for k, v in bs['counts'].items() if v)
+    few = '（まだ1レースだけ）' if len(bs['races']) == 1 else ''
+    words = '、'.join(x for x in (bs['word'], bs['io']) if x)
+    return f"{words}{few}" + (f"　［3着内：{shares}］" if shares else '') + (f"　{bs['pace']}" if bs['pace'] else '')
 
 
 def day_track_report(prefixes):
