@@ -5599,10 +5599,186 @@ def bet_request_messages(text, uid, base):
     return msgs[:5]
 
 
+# ═════════════════════════════════════════
+# WIN5（LINEで「WIN5 3000円」と送ると、今週のWIN5の5レースを全部予想して、予算内で一番当たりやすい買い方を返す）
+# ═════════════════════════════════════════
+WIN5_RE = r'(?i)win\s*5|ウィン\s*5|ウイン\s*5'
+
+
+def is_win5_request(text):
+    return bool(re.search(WIN5_RE, unicodedata.normalize('NFKC', text)))
+
+
+def win5_budget(text):
+    t = re.sub(WIN5_RE, ' ', unicodedata.normalize('NFKC', text))
+    m = re.search(r'(\d[\d,]*万?\d*千?\d*)\s*円', t) or re.search(r'(\d[\d,]*)\s*点', t)
+    if not m:
+        return 1000, False
+    if '点' in m.group(0) and '円' not in m.group(0):
+        return int(m.group(1).replace(',', '')) * 100, True
+    v = _yen(m.group(1) + '円')
+    return (v or 1000), True
+
+
+def fetch_win5():
+    """netkeibaの「今週のWIN5」→ 5レースのID（1レース目から順に）と、結果が出ているか"""
+    html = http_get('https://race.netkeiba.com/top/win5.html', timeout=15).text
+    ids = []
+    for rid in re.findall(r'race_id=(\d{12})', html):
+        if rid not in ids:
+            ids.append(rid)
+    done = bool(re.search(r'的中馬番(?:\s|<[^>]+>)*\d', html))
+    return ids[:5], done
+
+
+def win5_plan(legs, P):
+    """各レースの勝率（高い順）から、点数P以内で5つとも当たる見込みが一番高い頭数の組み合わせ"""
+    from itertools import product as _prod
+    cum = []
+    for arr in legs:
+        ps = sorted((max(0.0, h['p']) for h in arr), reverse=True)
+        c, s = [0.0], 0.0
+        for x in ps[:10]:
+            s += x
+            c.append(s)
+        cum.append(c)
+    best = None
+    rngs = [range(1, len(c)) for c in cum]
+    for ks in _prod(*rngs):
+        pts = 1
+        for k in ks:
+            pts *= k
+        if pts > P:
+            continue
+        pr = 1.0
+        for k, c in zip(ks, cum):
+            pr *= c[k]
+        if not best or pr > best[0] + 1e-12 or (abs(pr - best[0]) < 1e-12 and pts < best[2]):
+            best = (pr, ks, pts)
+    return best
+
+
+def _leg_label(h):
+    return '堅い' if h['p'] >= 0.4 else '本命有力' if h['p'] >= 0.28 else '混戦' if h['p'] >= 0.18 else '大混戦'
+
+
+def render_win5_image(legs, ks, pts, hit, budget):
+    """WIN5の買い目カード（実際の馬券ではないことを明記）"""
+    W, H = 1280, 860
+    BG_, LINE_, INK, ACC = (244, 248, 255), (176, 196, 236), (24, 24, 24), (40, 90, 190)
+    img = Image.new('RGB', (W, H), BG_)
+    d = ImageDraw.Draw(img)
+    for x in range(0, W, 10):
+        d.line((x, 0, x, H), fill=(232, 238, 252), width=4)
+    d.rectangle((0, 0, W - 1, H - 1), outline=LINE_, width=6)
+    d.rectangle((30, 24, 330, 110), fill=INK)
+    ctext(d, 180, 30, 'WIN5', F('sans_b', 64), (255, 255, 255))
+    d.text((360, 30), 'シェイクユアハート AI推奨', font=F('sans_b', 40), fill=INK)
+    dt = legs[0][0].get('date')
+    if hasattr(dt, 'month'):
+        d.text((360, 80), f"{dt.month}月{dt.day}日（{'月火水木金土日'[dt.weekday()]}）", font=F('sans_r', 26), fill=(80, 90, 110))
+    colw = (W - 60 - 4 * 16) / 5
+    top = 140
+    for i, ((race, arr), k) in enumerate(zip(legs, ks)):
+        x0 = 30 + i * (colw + 16)
+        d.rectangle((x0, top, x0 + colw, top + 540), fill=(255, 255, 255), outline=INK, width=3)
+        d.rectangle((x0, top, x0 + colw, top + 44), fill=INK)
+        ctext(d, x0 + colw / 2, top + 4, f'{i + 1}レース', F('sans_b', 28), (255, 255, 255))
+        ctext(d, x0 + colw / 2, top + 54, f"{race['venue']}{race['R']}R", F('sans_b', 32), INK)
+        ctext(d, x0 + colw / 2, top + 96, fit_text(d, race['name'], F('sans_r', 22), colw - 16), F('sans_r', 22), INK)
+        picks = sorted(arr, key=lambda h: -h['p'])[:k]
+        per_row = 1 if k == 1 else 2 if k <= 6 else 3
+        bsz = 110 if k == 1 else 64 if k <= 6 else 54
+        gx = x0 + (colw - (per_row * (bsz + 10) - 10)) / 2
+        for j, h in enumerate(picks[:12]):
+            bx = gx + (j % per_row) * (bsz + 10)
+            by = top + 140 + (j // per_row) * (bsz + 10)
+            d.rectangle((bx, by, bx + bsz, by + bsz), fill=(255, 255, 255), outline=INK, width=4 if k == 1 else 3)
+            fs = 80 if k == 1 else 44 if k <= 6 else 36
+            ctext(d, bx + bsz / 2, by + (bsz - fs) / 2 - 8, str(h['n']), F('sans_b', fs), INK)
+        cov = sum(h['p'] for h in picks)
+        ctext(d, x0 + colw / 2, top + 452, f'{k}頭・カバー{cov * 100:.0f}%', F('sans_b', 24), ACC)
+        ctext(d, x0 + colw / 2, top + 490, _leg_label(picks[0]), F('sans_r', 24), (90, 100, 120))
+    yb = top + 570
+    f2, f3 = F('sans_b', 34), F('sans_b', 40)
+    d.text((40, yb), '組合せ数', font=f2, fill=INK)
+    d.text((240, yb - 4), f'{pts}', font=f3, fill=INK)
+    d.text((40, yb + 52), '合計', font=f2, fill=INK)
+    d.text((240, yb + 48), f'{pts * 100:,}円', font=f3, fill=INK)
+    d.text((620, yb), f'5つとも当たる見込み 約{hit * 100:.1f}%', font=f2, fill=ACC)
+    d.text((620, yb + 52), f'予算 {budget:,}円（1点100円）', font=F('sans_r', 30), fill=INK)
+    d.text((40, H - 40), '※AIの推奨買い目です（実際の馬券ではありません）', font=F('sans_r', 22), fill=(90, 100, 120))
+    return img
+
+
+def win5_text(legs, ks, pts, hit, budget, done):
+    L = [f"🎯 WIN5　{pts}点×100円＝{pts * 100:,}円（予算{budget:,}円）",
+         f"5つとも当たる見込み 約{hit * 100:.1f}%（AIの勝率から）"]
+    if done:
+        L.append('※今週のWIN5はもう結果が出ています（予想は参考に）')
+    pay = 1.0
+    for i, ((race, arr), k) in enumerate(zip(legs, ks)):
+        picks = sorted(arr, key=lambda h: -h['p'])[:k]
+        top = picks[0]
+        mk = {h['n']: MARKS[j] for j, h in enumerate(arr[:len(MARKS)])}
+        L.append('')
+        L.append(f"{i + 1}レース {race['venue']}{race['R']}R {race['name']}（{race['surf']}{race['dist']}m・{len(arr)}頭）"
+                 f"…{_leg_label(top)}")
+        L.append('　' + '、'.join(f"{mk.get(h['n'], '')}{h['n']}{h['name']}({h['p'] * 100:.0f}%)" for h in picks[:8])
+                 + (' ほか' if k > 8 else ''))
+        if top.get('o'):
+            pay *= top['o']
+    L.append('')
+    L.append('買い目：' + ' ／ '.join(f"{i + 1}レース目 " + ','.join(str(h['n']) for h in sorted(arr, key=lambda h: -h['p'])[:k])
+                                      for i, ((race, arr), k) in enumerate(zip(legs, ks))))
+    if pay > 1:
+        L.append(f"※AIの1番手が5つとも勝った場合の配当の目安：約{pay * 0.7 * 100:,.0f}円（単勝オッズの掛け算×0.7のざっくり計算）")
+    L.append('※「WIN5 5000円」のように予算を変えると、点数を増やして当たりやすくします')
+    return '\n'.join(L)
+
+
+def win5_messages(text, base):
+    budget, _ = win5_budget(text)
+    P = max(1, budget // 100)
+    try:
+        ids, done = fetch_win5()
+    except Exception as e:
+        return [TextSendMessage(text=f"WIN5の対象レースを読み取れませんでした（{e}）")]
+    if len(ids) < 5:
+        return [TextSendMessage(text="今週のWIN5の対象レースがまだ発表されていません（ふつうは金曜に決まります）")]
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        res = list(ex.map(lambda r: _safe(analyze, r) or (None, 'エラー'), ids))
+    legs, bad = [], []
+    for rid, (r, err) in zip(ids, res):
+        if err or not r:
+            bad.append(rid)
+        else:
+            legs.append(r)
+    if bad:
+        return [TextSendMessage(text="WIN5の対象レースのうち、出馬表を読めないレースがありました（枠順の確定前かもしれません）。"
+                                     "レースの前日の夕方以降にもう一度送ってください")]
+    b = win5_plan([arr for _, arr in legs], P)
+    if not b:
+        return [TextSendMessage(text="買い目を作れませんでした")]
+    hit, ks, pts = b
+    msgs = []
+    try:
+        if fonts_ok(20):
+            with _render_lock:
+                key = save_image(render_win5_image(legs, ks, pts, hit, budget))
+            msgs.append(ImageSendMessage(original_content_url=f"{base}/img/{key}.png", preview_image_url=f"{base}/img/{key}_pv.jpg"))
+    except Exception:
+        traceback.print_exc()
+    msgs.append(TextSendMessage(text=win5_text(legs, ks, pts, hit, budget, done)[:4900]))
+    return msgs
+
+
 def build_messages(text, base, uid='anon'):
     """予想を作って、LINEに送るメッセージのリストと、返信後にやる処理を返す"""
     if text in ('成績', '成績確認'):
         return [TextSendMessage(text=stats_text())], None
+    if is_win5_request(text):
+        return win5_messages(text, base), None
     if is_bet_request(text):
         return bet_request_messages(text, uid, base), None
     bv, unit = parse_budget_unit(text)
@@ -5663,6 +5839,7 @@ def _build_prediction(text, base):
     if not ("netkeiba.com" in text or re.fullmatch(r'\d{12}', text) or re.fullmatch(r'\d{4}[A-Z][0-9A-Za-z]{7}(\s+\S+)?', text)):
         return [TextSendMessage(text="netkeibaの出馬表のURL（またはレースID12桁）を送ってください！\n"
                                      "「成績」と送ると、これまでの予想の成績を確認できます。\n"
+                                     "「WIN5 3000円」と送ると、今週のWIN5を予算内で予想します。\n"
                                      "予想のあと30分間は「血統」「馬場」「3000円（予算）」「ハイレベル」「動画」、馬名・馬番（詳しい根拠）でも答えます。")], None
     try:
         result, err = analyze(text)
