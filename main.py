@@ -1538,7 +1538,10 @@ def role_marks(arr):
     """印を「役割どおり」に並べ替える（複勝率の確かめ.py で、2年とも順位どおりより良かった印だけ）
     ◎＝勝つ見込み一番／○＝2着までの見込み一番（連対）／▲＝単穴（期待値・8倍以上で勝つ見込み）／
     △＝3着までの見込みの上位（ヒモ）／☆＝人気より強い穴。印のない馬は勝つ見込みの順"""
-    mk = (MODEL or {}).get('marks') or {}
+    mk = dict((MODEL or {}).get('marks') or {})
+    if BET_RULES.get('ana') and not mk.get('☆'):
+        mk['☆'] = 'ana'      # ☆は、穴の買い目に使う穴馬と同じ馬にする（印と買い目をそろえる）
+        mk.setdefault('ana', BET_RULES['ana'])
     if not mk or all(v == 'rank' for k, v in mk.items() if k != 'ana') or len(arr) < 8:
         return arr
     if any(mk.get(k) in ('p2', 'p3') for k in mk) and not all(h.get('p2') and h.get('p3') for h in arr):
@@ -1567,7 +1570,9 @@ def role_marks(arr):
     if r_:
         if mk.get('☆') == 'ana':
             an = [h for h in ana_horses(arr, mk.get('ana')) if h not in used]
-            used.append(an[0] if an else (sorted(r_, key=lambda h: -h.get('p3', h['p']))[0]))
+            used.append(an[0] if an else r_[0])
+            if an:
+                an[0]['star'] = True
         else:
             used.append(r_[0])
     for h in used:
