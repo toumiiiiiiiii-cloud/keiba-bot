@@ -1148,7 +1148,7 @@ def apply_model(race, arr, odds):
     if bst.get('k', 1) != 1:
         bset = set(bst.get('names', []))
         beta = [b * bst['k'] if n in bset else b for n, b in zip(names, beta)]
-    beta = [b * ODDS_W if n == 'log_market' else b for n, b in zip(names, beta)]   # オッズの効きを少し弱める（Tomiさんの指定）
+    beta = [b * ODDS_W if n == 'log_market' else b * AI_W for n, b in zip(names, beta)]   # オッズ・AIの材料の効き（Tomiさんの指定の割合）
     for h in arr:
         h['pm'] = inv[h['n']] / tot
     zs, xs = [], []
@@ -1180,8 +1180,12 @@ def apply_model(race, arr, odds):
 #   勝率を exp(補正) 倍してレース内で合計100%に直す。1頭の補正は ±0.30 まで（勝率がおよそ0.75〜1.35倍）
 # ═════════════════════════════════════════
 MANUAL_BOOST = True
-BOOST_CAP = 0.45            # 1頭の補正の上限（勝率およそ0.64〜1.57倍）
-ODDS_W = 0.85               # オッズの効きの強さ（学習した値を1として。小さいほどAIの見立てが強く出る）
+# ── 効きの割合（Tomiさんの指定：オッズ50%・重点補正30%・AIの材料20%）──
+#    1レースの中で各馬の評価を動かす大きさが、およそ オッズ0.68：重点補正0.40：AIの材料0.27 になるように調整
+ODDS_W = 0.65               # オッズ（学習した重み1.045 × 0.65 ≒ 0.68）
+AI_W = 1.8                  # AIの材料（学習した重み × 1.8。動かす大きさ 約0.15 → 約0.27）
+BOOST_W = 2.7               # 重点補正（各項目の点数 × 2.7。動かす大きさ 約0.15 → 約0.40）
+BOOST_CAP = 1.0             # 1頭の補正の上限（勝率およそ0.37〜2.7倍）
 
 
 def _first_ratio(l):
@@ -1351,7 +1355,7 @@ def manual_boost(race, arr):
                 t_ = ''
             adj += add(dv, t_, -0.08, 0.08)
             h['diverge'] = ratio
-        adj = clamp(adj, -BOOST_CAP, BOOST_CAP)
+        adj = clamp(adj * BOOST_W, -BOOST_CAP, BOOST_CAP)
         h['boostAdj'] = adj
         h['boostParts'] = parts
         h['boostNotes'] = [t for v, t in sorted(parts, key=lambda x: -abs(x[0])) if t][:5]
