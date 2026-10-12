@@ -5308,7 +5308,7 @@ def _prune_cols(kind, cols, combos):
     cols = [list(c) for c in cols]
     for i in range(1, len(cols)):
         for x in list(cols[i]):
-            if x not in cols[0]:
+            if x not in cols[0] and not any(cols[j] == [x] for j in range(1, i)):
                 continue
             trial = cols[:i] + [[y for y in cols[i] if y != x]] + cols[i + 1:]
             if trial[i] and set(_combos_from_cols(kind, trial)) == target:
@@ -5335,6 +5335,49 @@ def _best_form(kind, n, P, pa):
     return best
 
 
+POS_WORDS = {'頭': 0, 'アタマ': 0, '1着': 0, '一着': 0, '2着': 1, '二着': 1, '3着': 2, '三着': 2}
+POS_RE = r'((?:\d+\s*[・,、]\s*)*\d+)番(?:が|を|は)?\s*(頭|アタマ|1着|一着|2着|二着|3着|三着)'
+
+
+def _parse_pos_fix(seg, n, k):
+    """「10番頭」「3番2着」「5・7番3着」→ {列番号: [馬番]}"""
+    fixed = {}
+    for nums, w in re.findall(POS_RE, seg):
+        i = POS_WORDS[w]
+        if i >= k:
+            continue
+        hs = [int(x) for x in re.findall(r'\d+', nums) if int(x) in n]
+        if hs:
+            fixed.setdefault(i, [])
+            fixed[i] += [h for h in hs if h not in fixed[i]]
+    return fixed
+
+
+def _best_form_fixed(kind, n, P, pa, fixed):
+    """指定の着順に馬を固定したまま、残りの列を上位から選んで点数P以内で当たる見込みが一番高い形"""
+    from itertools import product as _prod
+    k = 3 if kind in ('3連単', '3連複') else 2
+    fx = [h for v in fixed.values() for h in v]
+    rest = [x for x in n if x not in fx]
+    free = [i for i in range(k) if i not in fixed]
+    lims = [4, 8, 11]
+    best = None
+    rngs = [range(1, min(lims[i] if len(free) > 1 else 11, len(rest)) + 1) for i in free]
+    for sizes in _prod(*rngs):
+        if any(sizes[j] > sizes[j + 1] for j in range(len(sizes) - 1)):
+            continue
+        cols = []
+        for i in range(k):
+            cols.append(list(fixed[i]) if i in fixed else rest[:sizes[free.index(i)]])
+        cmb = _combos_from_cols(kind, cols)
+        if not cmb or len(cmb) > P:
+            continue
+        pr = sum(combo_prob(kind, x, pa) for x in cmb)
+        if not best or pr > best[0] + 1e-12 or (abs(pr - best[0]) < 1e-12 and len(cmb) < len(best[2])):
+            best = (pr, cols, cmb)
+    return best
+
+
 def parse_bet_request(text, arr):
     """1つの要望 → {'kind','method','cols','labels','combos','per','multi'} のリスト"""
     t = unicodedata.normalize('NFKC', text).replace('　', ' ')
@@ -5350,11 +5393,17 @@ def parse_bet_request(text, arr):
         pm = re.search(r'(\d+)点', seg)
         hm = re.search(r'(\d+)頭(?!軸)', seg)
         am = re.search(r'(\d)頭軸', seg)
-        ax_n = [int(x) for x in re.findall(r'(\d+)番', seg) if int(x) in n]
+        k = 3 if kind in ('3連単', '3連複') else 2 if kind in ('馬単', '馬連', 'ワイド') else 1
+        fixed = _parse_pos_fix(seg, n, k) if k >= 2 else {}
+        ax_n = [int(x) for x in re.findall(r'(\d+)番', re.sub(POS_RE, ' ', seg)) if int(x) in n]
+        if k == 1:
+            ax_n += [int(x) for x in re.findall(r'(\d+)番', seg) if int(x) in n and int(x) not in ax_n]
         per_m = re.search(r'各\s*(\d[\d,]*)円', seg) or re.search(r'各\s*(\d[\d,]*)円', t)
         multi = 'マルチ' in seg
         if re.search(r'ボックス|BOX|box|Box', seg):
             method = 'box'
+        elif fixed and not re.search(r'流し|ながし|軸|マルチ', seg):
+            method = 'form'
         elif re.search(r'流し|ながし|軸|マルチ', seg) or ax_n:
             method = 'nagashi'
         elif re.search(r'フォーメーション|フォメ', seg):
@@ -5406,11 +5455,13 @@ def parse_bet_request(text, arr):
             r.update(method='nagashi', labels=['軸', '相手'], cols=[axes, mates], combos=combos, multi=multi and ordered)
         else:
             P = P or REQ_DEFAULT_PTS[kind]
-            b = _best_form(kind, n, P, pa)
+            b = _best_form_fixed(kind, n, P, pa, fixed) if fixed else _best_form(kind, n, P, pa)
             if not b:
                 continue
             labs = ['1着', '2着', '3着'] if kind == '3連単' else ['1着', '2着'] if kind == '馬単' else ['1頭目', '2頭目', '3頭目'][:k]
             r.update(method='form', labels=labs, cols=_prune_cols(kind, b[1], b[2]), combos=b[2])
+            if fixed:
+                r['note'] = '・'.join(f"{','.join(map(str, v))}番を{labs[i]}に固定" for i, v in sorted(fixed.items()))
         if not r.get('combos'):
             continue
         per = int(per_m.group(1).replace(',', '')) if per_m else None
@@ -5449,6 +5500,9 @@ def render_ticket_image(race, r):
     d.text((60 + 46 * len(rs) + 30, 214), 'レース', font=F('sans_b', 44), fill=INK)
     nm = fit_text(d, race['name'], F('sans_b', 34), 330)
     d.text((30, 610), nm, font=F('sans_b', 34), fill=INK)
+    if r.get('note'):
+        for j, ln in enumerate(r['note'].split('・')[:2]):
+            d.text((30, 330 + j * 46), fit_text(d, ln, F('sans_b', 30), 340), font=F('sans_b', 30), fill=ACC)
     d.text((30, 660), f"{race['surf']}{race['dist']}m", font=F('sans_r', 30), fill=INK)
     # 中央：券種（縦書き）
     x0, x1 = 400, 540
@@ -5510,6 +5564,8 @@ def render_ticket_image(race, r):
 def bet_request_text(race, r):
     lines = [f"🎫 {race['venue']}{race['R']}R {r['kind']} {METHOD_JP[r['method']]}{'（マルチ）' if r.get('multi') else ''}"
              f"　{len(r['combos'])}点×{r['per']:,}円＝{len(r['combos']) * r['per']:,}円"]
+    if r.get('note'):
+        lines.append(f"（{r['note']}）")
     for lab, nums in zip(r['labels'], r['cols']):
         lines.append(f"{lab}：{','.join(map(str, nums))}")
     if r.get('hit'):
@@ -5527,7 +5583,7 @@ def bet_request_messages(text, uid, base):
     race, arr = sess
     reqs = parse_bet_request(text, arr)
     if not reqs:
-        return [TextSendMessage(text="買い目を作れませんでした。例：「3連単フォーメーション10点」「3連複2頭軸6点」「馬単マルチ1番軸4頭」「ワイドBOX4頭 各200円」")]
+        return [TextSendMessage(text="買い目を作れませんでした。例：「3連単フォーメーション10点」「10番頭3連単フォーメーション5点」「3連複2頭軸6点」「馬単マルチ1番軸4頭」「ワイドBOX4頭 各200円」")]
     msgs = []
     for r in reqs[:4]:
         try:
