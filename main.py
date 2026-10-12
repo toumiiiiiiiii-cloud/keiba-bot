@@ -2008,13 +2008,18 @@ def parse_corner_section(soup):
     return out
 
 
+_DB_CORNER_OFF = 0.0
+
+
 def db_corner_map(race_id):
     """予備：db.netkeiba.com の結果ページの「通過」列（例 3-3-2-1）→ {1: {馬番: 最初のコーナー}, 4: {馬番: 最後のコーナー}}"""
-    if not re.match(r'^\d{12}$', race_id or ''):
+    global _DB_CORNER_OFF
+    if not re.match(r'^\d{12}$', race_id or '') or time.time() < _DB_CORNER_OFF:
         return {}
     try:
-        soup = fetch_soup(f"https://db.netkeiba.com/race/{race_id}/", timeout=8)
+        soup = fetch_soup(f"https://db.netkeiba.com/race/{race_id}/", timeout=5)
     except Exception:
+        _DB_CORNER_OFF = time.time() + 1800      # 取れなかったら30分は試さない（予想を遅くしないため）
         return {}
     first, last = {}, {}
     for tr in soup.select('table.race_table_01 tr') or soup.find_all('tr'):
@@ -2026,6 +2031,8 @@ def db_corner_map(race_id):
             xs = [int(x) for x in ps.split('-')]
             first[int(tds[2])], last[int(tds[2])] = xs[0], xs[-1]
     print(f"[result] {race_id} 通過順を db.netkeiba から読み込み：{len(last)}頭", flush=True)
+    if not last:
+        _DB_CORNER_OFF = time.time() + 1800
     return {1: first, 4: last} if last else {}
 
 
