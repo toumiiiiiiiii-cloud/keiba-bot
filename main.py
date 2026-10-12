@@ -802,8 +802,10 @@ def ranked(race, horses, odds):
         print(f"[marks] 印の役割を付けられず: {e}", flush=True)
     # AI推し：オッズ＋AIの期待値が1.1以上（2025・2026年のバックテストで、2年とも単勝の回収率が100%を超えた条件）
     for h in arr:
-        h['aiPush'] = bool(race.get('model') and h.get('ev') and h['ev'] >= AI_PUSH_EV)
-    race['aiPush'] = sorted([h for h in arr if h['aiPush']], key=lambda h: -h['ev'])
+        # 判定は学習と同じ勝率（補正前・効きを変える前）×オッズで（バックテストで2年とも100%超だったのはこの数字）
+        h['evRaw'] = (h['pRaw'] * h['o']) if h.get('pRaw') and h.get('o') else None
+        h['aiPush'] = bool(race.get('model') and h.get('evRaw') and h['evRaw'] >= AI_PUSH_EV)
+    race['aiPush'] = sorted([h for h in arr if h['aiPush']], key=lambda h: -h['evRaw'])
     return arr
 
 
@@ -1916,9 +1918,9 @@ def best_bet(arr, plan=None):
     if not push:
         return {'skip': True, 'kind': '単勝', 'combos': [],
                 'why': f'期待値{AI_PUSH_EV}以上の馬がいないため見送り推奨'}
-    h = max(push, key=lambda x: x['ev'])
+    h = max(push, key=lambda x: x.get('evRaw') or x['ev'])
     return {'skip': False, 'kind': '単勝', 'name': '単勝', 'combos': [(h['n'],)], 'n': 1, 'cost': 100,
-            'horse': h, 'hit': h['p'], 'pay': h['o'], 'ev': h['ev'], 'edge': h['p'] / max(pm[h['n']], 1e-9),
+            'horse': h, 'hit': h['p'], 'pay': h['o'], 'ev': h.get('evRaw') or h['ev'], 'edge': h['p'] / max(pm[h['n']], 1e-9),
             'why': f"期待値{AI_PUSH_EV}以上（2年分のバックテストで単勝回収率180%台）の中で期待値が最も高い"}
 
 
@@ -3799,9 +3801,32 @@ SUB_W = {'本線': {'馬連': 0.30, 'ワイド': 0.30, '3連複': 0.25, '3連単
          '妙味': {'単勝': 0.5, '複勝': 0.5}}
 
 
+SHOW_ALL_BETS = False     # 予想画像の買い目：False＝推奨の買い目だけ（ほかは「買い目」と送ると全部）
+
+
 def bet_rows_for(arr):
     """bet_plan を、画像に描くための行（1行＝1券種）に直す。先頭はイチ推しの1点"""
     rows = []
+    if not SHOW_ALL_BETS:
+        try:
+            recs = recommended_tickets(arr)
+        except Exception:
+            traceback.print_exc()
+            recs = []
+        if recs:
+            for r in recs:
+                if r['method'] == 'normal':
+                    body = ('→' if r['kind'] in ORDERED_K else '-').join(map(str, r['cols'][0]))
+                elif r['method'] == 'form':
+                    body = ' → '.join(','.join(map(str, c)) for c in r['cols'])
+                elif r['method'] == 'nagashi':
+                    body = f"軸{'-'.join(map(str, r['cols'][0]))} 相手{','.join(map(str, r['cols'][1]))}"
+                else:
+                    body = ','.join(map(str, r['cols'][0]))
+                rows.append({'label': r['badge'] if r['badge'] != 'イチ推し' else BEST_LABEL, 'kind': r['kind'],
+                             'combos': r['combos'], 'body': body, 'note': r.get('note', ''), 'n': len(r['combos']),
+                             'per': None, 'amount': None})
+            return rows
     plan = bet_plan(arr)
     bb = best_bet(arr, plan)
     if bb and bb.get('skip'):
@@ -5593,90 +5618,200 @@ def _best_form_fixed(kind, n, P, pa, fixed):
     return best
 
 
+KANJI_NUM = str.maketrans({'一': '1', '二': '2', '三': '3', '四': '4', '五': '5', '六': '6', '七': '7', '八': '8', '九': '9'})
+SEP_RE = r'[,、・.\s/／]+'
+
+
+def _bet_segments(t):
+    """券種の言葉ごとに区切る（「3連単フォーメーション10点と馬連流し5点」→ 2つ）。数字の区切りのカンマでは切らない"""
+    pos = []
+    for k, r in REQ_KINDS:
+        for m in re.finditer(r, t):
+            if not any(a <= m.start() < b for a, b, _ in pos):
+                pos.append((m.start(), m.end(), k))
+    pos.sort()
+    segs = []
+    for i, (st, en, k) in enumerate(pos):
+        nxt = pos[i + 1][0] if i + 1 < len(pos) else len(t)
+        segs.append((k, (t[:st] if i == 0 else '') + ' ' + t[en:nxt]))
+    return segs
+
+
+def _num_list(s, valid):
+    out = []
+    for x in re.findall(r'\d+', s):
+        v = int(x)
+        if v in valid and v not in out:
+            out.append(v)
+    return out
+
+
+def _uniq_combos(kind, cols):
+    return _combos_from_cols(kind, cols)
+
+
 def parse_bet_request(text, arr):
-    """1つの要望 → {'kind','method','cols','labels','combos','per','multi'} のリスト"""
-    t = unicodedata.normalize('NFKC', text).replace('　', ' ')
+    """1つの要望 → {'kind','method','title','cols','labels','combos','per','multi'} のリスト
+    書き方の例：3連単フォーメーション10点／3連単 9→15→1,2,3／3連複 9-15-1,2,3／3連複2頭軸 9,15 相手1,2,3
+               3連複 軸9-15 6点／3連単 9番1着ながし 相手5頭／3連単2着ながし 9番／3連単 1・2着ながし 9,15 相手4頭
+               馬単マルチ 9番軸 4頭／馬連 9-15,1,2（9軸）／ワイドBOX 4頭 各200円／単勝 9番 500円"""
+    t = unicodedata.normalize('NFKC', text).translate(KANJI_NUM).replace('　', ' ')
+    t = re.sub(r'[ー−–—=]', '-', t).replace('>', '→').replace('⇒', '→')
     n = [h['n'] for h in arr]
+    valid = set(n)
     pa = {h['n']: max(1e-6, h['p']) for h in arr}
-    segs = [x for x in re.split(r'[、,\n]|(?<=[点頭円])と|(?<=[点頭円])\+|\s{2,}', t) if x.strip()]
+    segs = _bet_segments(t)
     tot_m = re.search(r'(?<!各)(\d[\d,]*)円', t)
     out = []
-    for seg in segs:
-        kind = next((k for k, r in REQ_KINDS if re.search(r, seg)), None)
-        if not kind:
-            continue
-        pm = re.search(r'(\d+)点', seg)
-        hm = re.search(r'(\d+)頭(?!軸)', seg)
-        am = re.search(r'(\d)頭軸', seg)
+    for kind, seg in segs:
         k = 3 if kind in ('3連単', '3連複') else 2 if kind in ('馬単', '馬連', 'ワイド') else 1
-        fixed = _parse_pos_fix(seg, n, k) if k >= 2 else {}
-        ax_n = []
-        for grp in re.findall(r'((?:\d+\s*[・]\s*)*\d+)番', re.sub(POS_RE, ' ', seg)):
-            ax_n += [int(x) for x in re.findall(r'\d+', grp) if int(x) in n and int(x) not in ax_n]
-        if k == 1:
-            ax_n += [int(x) for x in re.findall(r'(\d+)番', seg) if int(x) in n and int(x) not in ax_n]
+        ordered = kind in ORDERED_K
         per_m = re.search(r'各\s*(\d[\d,]*)円', seg) or re.search(r'各\s*(\d[\d,]*)円', t)
-        multi = 'マルチ' in seg
-        if re.search(r'ボックス|BOX|box|Box', seg):
-            method = 'box'
-        elif fixed and not re.search(r'流し|ながし|軸|マルチ', seg):
-            method = 'form'
-        elif re.search(r'流し|ながし|軸|マルチ', seg) or ax_n:
-            method = 'nagashi'
-        elif re.search(r'フォーメーション|フォメ', seg):
-            method = 'form'
-        else:
-            method = 'form' if kind in ('3連単', '3連複', '馬単') else ('single' if kind in ('単勝', '複勝') else 'nagashi')
-        P = int(pm.group(1)) if pm else None
+        s_ = re.sub(r'各?\s*\d[\d,]*円', ' ', seg)
+        pm_ = re.search(r'(\d+)点', s_)
+        P = int(pm_.group(1)) if pm_ else None
+        s_ = re.sub(r'\d+点', ' ', s_)
+        am = re.search(r'(\d)頭軸|軸([12])頭', s_)
+        n_ax = int(am.group(1) or am.group(2)) if am else None
+        s_ = re.sub(r'(\d)頭軸|軸([12])頭', ' 軸 ', s_)
+        hm = re.search(r'(\d+)頭', s_)
         heads = int(hm.group(1)) if hm else None
-        k = 3 if kind in ('3連単', '3連複') else 2 if kind in ('馬単', '馬連', 'ワイド') else 1
+        s_ = re.sub(r'\d+頭', ' ', s_)
+        multi = 'マルチ' in s_
+        fixed = _parse_pos_fix(s_, n, k) if k >= 2 else {}
+        s_ = re.sub(POS_RE, ' ', s_)
+        # 着順の言葉（「1着ながし」「2着流し」「1・2着」）。馬番と混ざらないように取り除く
+        npos = []
+        pw = re.search(r'([123])\s*[・,-]?\s*([123])?\s*着\s*(?:ながし|流し|軸)?', s_)
+        if pw:
+            npos = [int(x) for x in pw.groups() if x]
+            s_ = s_[:pw.start()] + ' ' + s_[pw.end():]
+        is_box = bool(re.search(r'ボックス|BOX|box|Box', s_))
+        is_form = bool(re.search(r'フォーメーション|フォメ', s_)) or '→' in s_
+        is_nag = bool(re.search(r'流し|ながし|軸|相手|マルチ', s_)) or bool(npos)
+        if fixed and is_nag:
+            npos = []
+        # 馬番の取り出し
+        axes, mates, groups = [], [], []
+        if '相手' in s_:
+            before, after = s_.split('相手', 1)
+            mates = _num_list(after, valid)
+            axes = _num_list(before, valid)
+        elif '軸' in s_:
+            before, after = s_.split('軸', 1)
+            nb, na_ = _num_list(before, valid), _num_list(after, valid)
+            if nb and na_:             # 「9-15軸 1,2,3」→ 軸 9,15 相手 1,2,3
+                axes, mates = nb, na_
+            else:
+                axes = nb or na_
+                if na_ and not nb and '-' in after:   # 「軸9-15」
+                    axes = na_
+        elif '→' in s_:
+            groups = [_num_list(g, valid) for g in s_.split('→')]
+            groups = [g for g in groups if g]
+        elif '-' in s_ and not is_box:
+            groups = [_num_list(g, valid) for g in s_.split('-')]
+            groups = [g for g in groups if g]
+        else:
+            axes = _num_list(s_, valid)
         r = {'kind': kind, 'multi': False}
-        if k == 1 or method == 'single':
-            m = P or heads or 1
-            picks = (ax_n or n)[:m]
-            r.update(method='single', labels=['馬番'], cols=[picks], combos=[(x,) for x in picks])
-        elif method == 'box':
-            ordered = kind in ORDERED_K
+        # ── 単勝・複勝 ──
+        if k == 1:
+            picks = (axes or [g[0] for g in groups]) or n[:(P or heads or 1)]
+            r.update(method='single', title='通常', labels=['馬番'], cols=[picks], combos=[(x,) for x in picks])
+        # ── 「9-15」「9-15-1」のように1頭ずつ ＝ 1点買い ──
+        elif groups and len(groups) == k and all(len(g) == 1 for g in groups) and not is_form:
+            c = tuple(g[0] for g in groups)
+            if len(set(c)) == k:
+                r.update(method='normal', title='通常', labels=['馬番'], cols=[list(c)], combos=[c if ordered else tuple(sorted(c))])
+        # ── 「馬連 9-15,1,2」＝ 9軸ながし ──
+        elif groups and k == 2 and len(groups) == 2 and len(groups[0]) == 1 and not is_form:
+            axes, mates, is_nag = groups[0], [x for x in groups[1] if x != groups[0][0]], True
+            groups = []
+        # ── フォーメーション（数字で指定）──
+        if 'method' not in r and groups and len(groups) >= k:
+            cols = groups[:k]
+            cmb = _uniq_combos(kind, cols)
+            labs = ['1着', '2着', '3着'][:k] if ordered else ['1頭目', '2頭目', '3頭目'][:k]
+            if cmb:
+                r.update(method='form', title='フォーメーション', labels=labs, cols=cols, combos=cmb)
+        if 'method' in r:
+            pass
+        elif is_box:
             def cnt(x):
                 return math.perm(x, k) if ordered else math.comb(x, k)
-            if heads is None:
-                heads = k
-                while heads + 1 <= len(n) and cnt(heads + 1) <= (P or REQ_DEFAULT_PTS[kind]):
-                    heads += 1
-            picks = (ax_n + [x for x in n if x not in ax_n])[:max(k, heads)]
-            r.update(method='box', labels=['ボックス'], cols=[picks], combos=_combos_from_cols(kind, [picks] * k))
-        elif method == 'nagashi':
-            na = int(am.group(1)) if am else (len(ax_n) if ax_n else 1)
+            picks = axes + mates
+            if len(picks) < k:
+                hh = heads
+                if hh is None:
+                    hh = k
+                    while hh + 1 <= len(n) and cnt(hh + 1) <= (P or REQ_DEFAULT_PTS[kind]):
+                        hh += 1
+                picks = (picks + [x for x in n if x not in picks])[:max(k, hh)]
+            r.update(method='box', title='ボックス', labels=['ボックス'], cols=[picks], combos=_combos_from_cols(kind, [picks] * k))
+        elif is_nag:
+            # 軸の頭数
+            na = n_ax or (len(axes) if axes else (2 if len(npos) == 2 else 1))
             na = max(1, min(na, k - 1))
-            axes = (ax_n + [x for x in n if x not in ax_n])[:na]
+            axes = (axes + [x for x in n if x not in axes])[:na] if len(axes) < na else axes[:na]
             rest = [x for x in n if x not in axes]
-            ordered = kind in ORDERED_K
-
-            def build(m):
-                mates = rest[:m]
-                if k == 3:
-                    cols = [axes, mates, mates] if na == 1 else [axes, axes, mates]
+            if ordered:
+                if na == 1:
+                    ap = npos[:1] or [1]
                 else:
-                    cols = [axes, mates]
-                cmb = _combos_from_cols(kind, cols)
-                if ordered and multi:
-                    cmb = sorted({p_ for c in cmb for p_ in itertools.permutations(c)})
-                return mates, cmb
-            if heads:
-                m = heads
+                    ap = npos[:2] if len(npos) == 2 else [1, 2]
             else:
-                m = 1
-                while m + 1 <= len(rest) and len(build(m + 1)[1]) <= (P or REQ_DEFAULT_PTS[kind]):
-                    m += 1
-            mates, combos = build(min(m, len(rest)))
-            r.update(method='nagashi', labels=['軸', '相手'], cols=[axes, mates], combos=combos, multi=multi and ordered)
+                ap = []
+            if ordered and fixed:     # 「9番1着 15番2着 流し」→ 書いた着順に軸を置く
+                fx = sorted((i, v[0]) for i, v in fixed.items() if v)[:k - 1]
+                axes = [h_ for _, h_ in fx]
+                ap = [i + 1 for i, _ in fx]
+                na = len(axes)
+                rest = [x for x in n if x not in axes]
+
+            def build(ms):
+                if not ordered:
+                    if k == 3 and na == 1:
+                        cols = [axes, ms, ms]
+                    else:
+                        cols = [axes] + ([ms] if k == 2 else [axes, ms])
+                    cmb = _combos_from_cols(kind, cols)
+                    return cmb, cols
+                # 馬単・3連単：軸の着順に置く
+                cols = [None] * k
+                for a_, p_ in zip(axes, ap):
+                    cols[p_ - 1] = [a_]
+                cols = [c_ if c_ is not None else ms for c_ in cols]
+                cmb = _combos_from_cols(kind, cols)
+                if multi:
+                    cmb = sorted({pp for c_ in cmb for pp in itertools.permutations(c_)
+                                  if all(x in c_ for x in axes)})
+                return cmb, cols
+            if mates:
+                ms = [x for x in mates if x not in axes]
+            else:
+                lim = P or REQ_DEFAULT_PTS[kind]
+                m = heads or 1
+                if not heads:
+                    while m + 1 <= len(rest) and len(build(rest[:m + 1])[0]) <= lim:
+                        m += 1
+                ms = rest[:m]
+            cmb, cols = build(ms)
+            if ordered:
+                labs = [f"{i + 1}着" + ('（軸）' if any(p_ == i + 1 for p_ in ap) else '') for i in range(k)]
+                title = ('・'.join(map(str, ap)) + '着ながし') + ('（マルチ）' if multi else '')
+            else:
+                labs = ['軸', '相手']
+                cols = [axes, ms]
+                title = f'軸{na}頭ながし'
+            r.update(method='nagashi', title=title, labels=labs, cols=cols, combos=cmb, multi=multi and ordered)
         else:
-            P = P or REQ_DEFAULT_PTS[kind]
-            b = _best_form_fixed(kind, n, P, pa, fixed) if fixed else _best_form(kind, n, P, pa)
+            PP = P or REQ_DEFAULT_PTS[kind]
+            b = _best_form_fixed(kind, n, PP, pa, fixed) if fixed else _best_form(kind, n, PP, pa)
             if not b:
                 continue
-            labs = ['1着', '2着', '3着'] if kind == '3連単' else ['1着', '2着'] if kind == '馬単' else ['1頭目', '2頭目', '3頭目'][:k]
-            r.update(method='form', labels=labs, cols=_prune_cols(kind, b[1], b[2]), combos=b[2])
+            labs = ['1着', '2着', '3着'][:k] if ordered else ['1頭目', '2頭目', '3頭目'][:k]
+            r.update(method='form', title='フォーメーション', labels=labs, cols=_prune_cols(kind, b[1], b[2]), combos=b[2])
             if fixed:
                 r['note'] = '・'.join(f"{','.join(map(str, v))}番を{labs[i]}に固定" for i, v in sorted(fixed.items()))
         if not r.get('combos'):
@@ -5690,7 +5825,7 @@ def parse_bet_request(text, arr):
     return out
 
 
-METHOD_JP = {'form': 'フォーメーション', 'box': 'ボックス', 'nagashi': 'ながし', 'single': '通常'}
+METHOD_JP = {'form': 'フォーメーション', 'box': 'ボックス', 'nagashi': 'ながし', 'single': '通常', 'normal': '通常'}
 
 
 def render_ticket_image(race, r):
@@ -5734,31 +5869,63 @@ def render_ticket_image(race, r):
         yy += 120
     d.rectangle((x0, H - 90, x1, H - 20), fill=INK)
     ctext(d, (x0 + x1) / 2, H - 80, 'AI予想', F('sans_b', 30), (255, 255, 255))
-    # 右：買い方の名前
+    # 右：買い方の名前（実際の馬券と同じ「通常／ボックス／ながし／フォーメーション」）
     rx0 = 580
-    title = METHOD_JP[r['method']] + ('（マルチ）' if r.get('multi') else '')
+    title = r.get('title') or (METHOD_JP[r['method']] + ('（マルチ）' if r.get('multi') else ''))
     d.rectangle((rx0, 24, W - 30, 104), fill=(255, 255, 255), outline=INK, width=4)
-    ctext(d, (rx0 + W - 30) / 2, 30, title, F('sans_b', 54), INK)
-    # 右：馬番の列
+    ft = F('sans_b', 54 if len(title) <= 8 else 44 if len(title) <= 11 else 36)
+    ctext(d, (rx0 + W - 30) / 2, 30 + (54 - ft.size) // 2, title, ft, INK)
+    # 右：馬番
     cols, labels = r['cols'], r['labels']
-    ncol = len(cols)
-    area_x0, area_x1, area_y0 = rx0 + 10, W - 40, 140
-    colw = (area_x1 - area_x0 - 40 * (ncol - 1)) / ncol
-    box = 64
-    for i, (lab, nums) in enumerate(zip(labels, cols)):
-        cx0 = area_x0 + i * (colw + 40)
-        ctext(d, cx0 + colw / 2, area_y0, lab, F('sans_b', 28), ACC)
-        per_row = 1 if len(nums) == 1 else 2 if len(nums) <= 8 or colw < 220 else 3
-        bsz = 120 if len(nums) == 1 else box
-        gx = cx0 + (colw - (per_row * (bsz + 10) - 10)) / 2
-        for k, num in enumerate(nums[:15]):
-            bx = gx + (k % per_row) * (bsz + 10)
-            by = area_y0 + 44 + (k // per_row) * (bsz + 10)
-            d.rectangle((bx, by, bx + bsz, by + bsz), fill=(255, 255, 255), outline=INK, width=4 if bsz > 100 else 3)
-            ctext(d, bx + bsz / 2, by + (bsz - (88 if bsz > 100 else 50)) / 2 - 8, str(num), F('sans_b', 88 if bsz > 100 else 46), INK)
-        if i < ncol - 1:
-            ax = cx0 + colw + 8
-            d.polygon([(ax, area_y0 + 120), (ax + 22, area_y0 + 140), (ax, area_y0 + 160)], fill=INK)
+    area_x0, area_x1, area_y0, area_y1 = rx0 + 10, W - 40, 140, H - 205
+    if r['method'] == 'normal':
+        # 1点買い：組番を大きく（例：9-15、9→15→1）
+        sep = '→' if r['kind'] in ORDERED_K else '-'
+        nums = cols[0]
+        bsz = 120 if len(nums) <= 2 else 100
+        gap = 80
+        tot_w = len(nums) * bsz + (len(nums) - 1) * gap
+        gx = (area_x0 + area_x1 - tot_w) / 2
+        ctext(d, (area_x0 + area_x1) / 2, area_y0, '組番', F('sans_b', 28), ACC)
+        for k_, num in enumerate(nums):
+            bx = gx + k_ * (bsz + gap)
+            by = area_y0 + 70
+            d.rectangle((bx, by, bx + bsz, by + bsz), fill=(255, 255, 255), outline=INK, width=4)
+            ctext(d, bx + bsz / 2, by + (bsz - 88) / 2 - 8, str(num), F('sans_b', 84), INK)
+            if k_ < len(nums) - 1:
+                ctext(d, bx + bsz + gap / 2, by + bsz / 2 - 34, sep, F('sans_b', 52), INK)
+    else:
+        ncol = len(cols)
+        gapc = 44
+        colw = (area_x1 - area_x0 - gapc * (ncol - 1)) / ncol
+        avail_h = area_y1 - (area_y0 + 44)
+        mx = max(len(c_) for c_ in cols)
+        # 列の幅と高さに収まるいちばん大きい四角
+        best = None
+        for per_row in range(1, 7):
+            rows_ = math.ceil(mx / per_row)
+            bsz = min((colw + 10) / per_row - 10, avail_h / rows_ - 10, 120 if mx == 1 else 72)
+            if bsz >= 30 and (best is None or bsz > best[1]):
+                best = (per_row, bsz)
+        per_row, bsz = best or (3, 30)
+        bsz = int(bsz)
+        fnum = F('sans_b', max(18, int(bsz * (0.70 if bsz > 100 else 0.66))))
+        show_arrow = r['method'] in ('form', 'nagashi') and ncol > 1
+        for i, (lab, nums) in enumerate(zip(labels, cols)):
+            cx0 = area_x0 + i * (colw + gapc)
+            axis = '軸' in lab
+            ctext(d, cx0 + colw / 2, area_y0, lab, F('sans_b', 28), (200, 60, 50) if axis else ACC)
+            pr = min(per_row, max(1, len(nums)))
+            gx = cx0 + (colw - (pr * (bsz + 10) - 10)) / 2
+            for k_, num in enumerate(nums):
+                bx = gx + (k_ % pr) * (bsz + 10)
+                by = area_y0 + 44 + (k_ // pr) * (bsz + 10)
+                d.rectangle((bx, by, bx + bsz, by + bsz), fill=(255, 248, 230) if axis else (255, 255, 255),
+                            outline=INK, width=4 if bsz > 100 else 3)
+                ctext(d, bx + bsz / 2, by + (bsz - fnum.size) / 2 - fnum.size * 0.12, str(num), fnum, INK)
+            if show_arrow and i < ncol - 1:
+                ax = cx0 + colw + gapc / 2 - 10
+                d.polygon([(ax, area_y0 + 120), (ax + 22, area_y0 + 140), (ax, area_y0 + 160)], fill=INK)
     # 右下：合計
     n_c = len(r['combos'])
     f2, f3 = F('sans_b', 34), F('sans_b', 40)
@@ -5772,10 +5939,100 @@ def render_ticket_image(race, r):
     t2 = f"{r['per'] * n_c:,}円"
     d.text((W - 60 - tw(d, t2, f3), yb + 108), t2, font=f3, fill=INK)
     if r.get('hit'):
-        d.text((rx0 + 260, yb + 60), f"的中見込み 約{r['hit'] * 100:.0f}%", font=F('sans_r', 28), fill=ACC)
+        hp = r['hit'] * 100
+        d.text((rx0 + 260, yb + 60), f"的中見込み 約{hp:.1f}%" if hp < 10 else f"的中見込み 約{hp:.0f}%", font=F('sans_r', 28), fill=ACC)
     d.text((30, H - 74), '※AIの推奨買い目です', font=F('sans_r', 22), fill=(90, 100, 90))
     d.text((30, H - 44), '（実際の馬券ではありません）', font=F('sans_r', 22), fill=(90, 100, 90))
     return img
+
+
+def _roi_short(roi):
+    """「106.0／120.4」→「106／120」"""
+    try:
+        return '／'.join(str(round(float(x))) for x in str(roi).split('／'))
+    except ValueError:
+        return roi
+
+
+def recommended_tickets(arr):
+    """本当に推奨する買い目だけ（2年分の確かめで回収率が良かった順）。馬券の画像にして送る
+    ①イチ推し（期待値1.1以上の単勝）②ワイド◎-穴 ③3連複◎○-穴 ④3連単（本線）。①〜③が無いときは本線を1つ"""
+    a = sorted(arr, key=lambda h: -h['p'])
+    if len(a) < 3:
+        return []
+    n = [h['n'] for h in a]
+    name = {h['n']: h for h in a}
+    plan = bet_plan(arr)
+    pa = {h['n']: max(1e-6, h['p']) for h in a}
+    recs = []
+    bb = best_bet(arr, plan)
+    if bb and not bb.get('skip'):
+        h = bb['horse']
+        recs.append({'kind': '単勝', 'method': 'single', 'title': '通常', 'labels': ['馬番'], 'cols': [[h['n']]],
+                     'combos': [(h['n'],)], 'badge': 'イチ推し', 'hit': h['p'],
+                     'note': f"イチ推し：{h['n']}番 {h['o']}倍・期待値{bb['ev']:.2f}",
+                     'why': f"単勝 {h['n']} {h['name']}（{h['o']}倍・期待値{bb['ev']:.2f}。期待値1.1以上の単勝は2年とも回収率100%超）"})
+    for b in plan:
+        if b['label'] != '穴':
+            continue
+        for kind, combos in b['parts']:
+            if not combos:
+                continue
+            spec = next((sp for sp in BET_RULES.get('ana_bets') or [] if ANA_BET_JP.get(sp['bet']) == kind
+                         and (kind != '3連複' or '◎○' in sp['bet'])), {})
+            if kind == 'ワイド':
+                c = combos[0]
+                ana = c[1] if c[0] == n[0] else c[0]
+                cols = [[n[0], ana]]
+                why = f"ワイド {n[0]}-{ana}（◎{name[n[0]]['name']}と穴{name[ana]['name']} {name[ana].get('o')}倍）"
+            elif kind == '3連複' and len(combos) == 1:
+                c = combos[0]
+                ana = next(x for x in c if x not in n[:2])
+                cols = [[n[0], n[1], ana]]
+                why = f"3連複 {n[0]}-{n[1]}-{ana}（◎○と穴{name[ana]['name']} {name[ana].get('o')}倍）"
+            else:
+                continue
+            roi = _roi_short(spec.get('roi', ''))
+            recs.append({'kind': kind, 'method': 'normal', 'title': '通常', 'labels': ['馬番'], 'cols': cols,
+                         'combos': [tuple(sorted(cols[0]))], 'badge': '穴', 'hit': combo_prob(kind, tuple(sorted(cols[0])), pa)
+                         if kind != 'ワイド' else None,
+                         'note': f"穴：{ana}番（{name[ana].get('o')}倍）" + (f"・2年の回収 {roi}%" if roi else ''),
+                         'why': why + (f"。2年の回収率 {roi}%" if roi else '')})
+    tan = sanren_combos(a, '3連単')
+    tr = BET_RULES.get('sanren_tan')
+    if tan and tr:
+        cols = _prune_cols('3連単', tan_cols(a, n, tr), tan)
+        recs.append({'kind': '3連単', 'method': 'form', 'title': 'フォーメーション', 'labels': ['1着', '2着', '3着'],
+                     'cols': cols, 'combos': tan, 'badge': '本線', 'hit': sum(combo_prob('3連単', c, pa) for c in tan),
+                     'note': f"本線・2年の回収 {_roi_short(tr.get('roi', ''))}%" if tr.get('roi') else '本線',
+                     'why': f"3連単 {','.join(map(str, cols[0]))} → {','.join(map(str, cols[1]))} → {','.join(map(str, cols[2]))}"
+                            f"（{len(tan)}点）" + (f"。2年の回収率 {_roi_short(tr['roi'])}%" if tr.get('roi') else '')})
+    if not recs:
+        fuku = sanren_combos(a, '3連複')
+        if fuku:
+            two = sanren_shape(a) != 'open'
+            axes = n[:2] if two else n[:1]
+            mates = sorted({x for c in fuku for x in c} - set(axes), key=n.index)
+            recs.append({'kind': '3連複', 'method': 'nagashi', 'title': f"軸{len(axes)}頭ながし", 'labels': ['軸', '相手'],
+                         'cols': [axes, mates], 'combos': fuku, 'badge': '本線',
+                         'hit': sum(combo_prob('3連複', c, pa) for c in fuku),
+                         'note': '強く推せる買い目なし・本線のみ',
+                         'why': f"3連複 軸{'-'.join(map(str, axes))} 相手{','.join(map(str, mates))}（{len(fuku)}点）。"
+                                "回収率100%を超える条件の買い目が無いレースなので、買うならこれ（見送りも可）"})
+    for r in recs:
+        r['per'] = 100
+        r['multi'] = False
+    return recs
+
+
+def recommend_text(race, arr, recs):
+    out = [f"{race['venue']}{race['R']}R {race['name']}", f"【推奨の買い目】◎{arr[0]['n']} {arr[0]['name']}", ""]
+    for r in recs:
+        out.append(f"🎫{r['badge']}　{r['why']}")
+        out.append("")
+    out.append("ほかの買い目は「買い目」と送ると全部出します。「3連単フォーメーション10点」「3連複2頭軸 9,15 相手1,2,3」"
+               "「馬連 9-15」のように送れば、その馬券も作ります（予想のあと30分間）")
+    return "\n".join(out)
 
 
 def bet_request_text(race, r):
@@ -6086,6 +6343,11 @@ def build_messages(text, base, uid='anon'):
             traceback.print_exc()
         msgs.append(TextSendMessage(text=budget_text(race, arr, budget, unit, ev_mode)[:4900]))
         return msgs, None
+    if text.strip() in ('買い目', '買い目全部', '全部の買い目', 'かいめ'):
+        sess = get_session(uid)
+        if not sess:
+            return [TextSendMessage(text="先にレースのURLを送ってください。予想のあと30分間は「買い目」で全部の買い目を出します")], None
+        return [TextSendMessage(text=bets_text(*sess)[:4900])], None
     if text.strip() in ('動画', '展開動画'):
         sess = get_session(uid)
         if not sess:
@@ -6145,16 +6407,28 @@ def _build_prediction(text, base):
         if not fonts_ok(20):
             raise RuntimeError('サーバー起動直後で画像用の文字データを準備中です。1〜2分後にもう一度送ってください')
         messages = []
+        try:
+            recs = recommended_tickets(arr)[:2]
+        except Exception:
+            traceback.print_exc()
+            recs = []
         with _render_lock:  # 画像づくりは1件ずつ（フォントの同時使用でサーバーが落ちるのを防ぐ）
-            imgs = [render_image(race, arr), render_short_image(race, arr)]
-            try:   # 3枚目：展開図（動画と同じ「予想どおりの展開になった代表の1回」から）
-                if SV:
+            # 送る順：予想 → 推奨の馬券（最大2枚）→ 短評 → 展開図（LINEの返信は1回5件まで。最後は文字）
+            imgs = [render_image(race, arr)]
+            for r in recs:
+                try:
+                    imgs.append(render_ticket_image(race, r))
+                except Exception:
+                    traceback.print_exc()
+            imgs.append(render_short_image(race, arr))
+            try:   # 展開図（動画と同じ「予想どおりの展開になった代表の1回」から）
+                if SV and len(imgs) < 4:
                     sim = SV.simulate(race, arr)
                     if sim:
                         imgs.append(render_tenkai_image(race, arr, sim))
             except Exception:
                 traceback.print_exc()
-            keys = [save_image(im) for im in imgs]
+            keys = [save_image(im) for im in imgs[:4]]
         for key in keys:
             messages.append(ImageSendMessage(original_content_url=f"{base}/img/{key}.png",
                                              preview_image_url=f"{base}/img/{key}_pv.jpg"))
@@ -6164,7 +6438,7 @@ def _build_prediction(text, base):
                 messages.append(vm)
         except Exception:
             traceback.print_exc()
-        messages.append(TextSendMessage(text=bets_text(race, arr)))
+        messages.append(TextSendMessage(text=(recommend_text(race, arr, recs) if recs else bets_text(race, arr))[:4900]))
         return messages, (race, arr)
     except Exception as e:
         # 画像づくりに失敗したら、今までどおり文章で送る（原因も添える）
