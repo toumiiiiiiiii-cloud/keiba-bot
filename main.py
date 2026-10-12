@@ -1148,6 +1148,9 @@ def apply_model(race, arr, odds):
     if bst.get('k', 1) != 1:
         bset = set(bst.get('names', []))
         beta = [b * bst['k'] if n in bset else b for n, b in zip(names, beta)]
+    beta = [b * ODDS_W if n == 'log_market' else b for n, b in zip(names, beta)]   # オッズの効きを少し弱める（Tomiさんの指定）
+    for h in arr:
+        h['pm'] = inv[h['n']] / tot
     zs, xs = [], []
     for h, row in zip(arr, rows):
         x = [math.log(inv[h['n']] / tot)] + [row.get(n, 0.0) for n in names[1:]]
@@ -1177,7 +1180,8 @@ def apply_model(race, arr, odds):
 #   勝率を exp(補正) 倍してレース内で合計100%に直す。1頭の補正は ±0.30 まで（勝率がおよそ0.75〜1.35倍）
 # ═════════════════════════════════════════
 MANUAL_BOOST = True
-BOOST_CAP = 0.30
+BOOST_CAP = 0.45            # 1頭の補正の上限（勝率およそ0.64〜1.57倍）
+ODDS_W = 0.85               # オッズの効きの強さ（学習した値を1として。小さいほどAIの見立てが強く出る）
 
 
 def _first_ratio(l):
@@ -1200,67 +1204,157 @@ def excused(l, usual):
     return ''
 
 
+def _close(l):
+    """着差から「どれだけ勝ち馬に迫ったか」（1＝勝ち〜0.1＝大敗）"""
+    if l['pos'] == 1:
+        return 1.0
+    m = l.get('m')
+    if m is None or l.get('mEst'):
+        return 0.7 if l['pos'] <= 2 else 0.45 if l['pos'] <= 3 else 0.15
+    return 0.9 if m <= 0.2 else 0.65 if m <= 0.5 else 0.35 if m <= 1.0 else 0.1
+
+
+def _today_band(race):
+    """今日の同じ競馬場・同じ芝ダ・同じ距離帯の、終わったレースの傾向（2レース以上のときだけ）"""
+    rid = race.get('id') or ''
+    if not re.match(r'^\d{12}$', rid) or rid[4:6] not in JRA_PLACE:
+        return None
+    def load():
+        res = []
+        for r_ in range(1, int(rid[-2:])):
+            x = _safe(parse_result_full, f"{rid[:10]}{r_:02d}")
+            if x and x.get('surf') == race['surf']:
+                res.append((r_, x))
+        band = next(((n, lo, hi) for n, lo, hi in DIST_BANDS if lo <= race['dist'] <= hi), None)
+        b = [x for x in res if x[1].get('dist') and band and band[1] <= x[1]['dist'] <= band[2]]
+        if len(b) >= 2:
+            return (band[0], band_stats(b))
+        if len(res) >= 3:
+            return ('全体', band_stats(res))
+        return None
+    return cached(('band', rid), 300, load)
+
+
 def manual_boost(race, arr):
     if not arr:
         return False
     N = len(arr)
     jst = (MODEL or {}).get('jockey_style', {})
+    surf_jp = '芝' if race['surf'] == '芝' else 'ダート'
+    try:
+        tband = _today_band(race)
+    except Exception:
+        tband = None
+    pace = race.get('pace')
+    pops = {h['n']: k for k, h in enumerate(sorted(arr, key=lambda h: h.get('o') or 9999), 1)}
+    ai_rank = {h['n']: k for k, h in enumerate(sorted(arr, key=lambda h: -(h.get('pAI') or h['p'])), 1)}
     any_ = False
     for h in arr:
         row = h.get('_row') or model_row(race, h, N)
-        notes, adj = [], 0.0
-        # ① レースレベル
-        lv = clamp(0.05 * clamp(row.get('hlMax', 0), -1, 3) + 0.08 * row.get('hlLowGood', 0), -0.15, 0.15)
-        if abs(lv) >= 0.02:
-            notes.append(f"レースレベル{'＋' if lv > 0 else '－'}")
-        adj += lv
+        parts = []          # (補正, 短評に使う文)
+
+        def add(v, txt, lo, hi):
+            v = clamp(v, lo, hi)
+            if txt and abs(v) >= 0.015:
+                parts.append((v, txt))
+            return v
+        adj = 0.0
+        car = [l for l in (h.get('career') or h.get('lines') or []) if is_flat(l) and l.get('pos', 0) > 0]
+        # ① レースレベル：強いメンバー相手に、どれだけ迫ったか（勝ち・僅差ほど大きく）
+        wts = [1.0, 0.85, 0.7, 0.55, 0.45]
+        plus = minus = 0.0
+        best = None
+        for i, l in enumerate(car[:5]):
+            sc = HL_SCORES.get(l.get('rid') or '')
+            if sc is None:
+                continue
+            if sc > 0:
+                v = (sc ** 1.4) * _close(l) * wts[i]
+                plus += v
+                if not best or v > best[0]:
+                    best = (v, l, sc)
+            elif sc < 0 and l['pos'] <= 3:
+                minus += sc * 0.5 * wts[i]
+        txt = None
+        if best and best[0] >= 0.3:
+            l = best[1]
+            how = '勝利' if l['pos'] == 1 else (f"{l['m']:.1f}秒差{l['pos']}着" if l.get('m') is not None and not l.get('mEst') else f"{l['pos']}着")
+            txt = (f"{short_date(l['d'])}{l['p']}の強豪相手に{how}" if _close(l) >= 0.6 else
+                   f"{short_date(l['d'])}{l['p']}のハイレベル戦で揉まれた経験")
+        adj += add(0.07 * plus, txt, 0.0, 0.30)
+        adj += add(0.05 * minus, '低レベル戦の好走は割引', -0.15, 0.0)
         # ② 騎手
         jk = 0.1 * float(h.get('jkBias') or 0) + 0.4 * row.get('jkUpgrade', 0)
-        car = [l for l in (h.get('career') or h.get('lines') or []) if is_flat(l) and l.get('pos', 0) > 0]
         me = jk_key(h.get('jockey'))
+        prev = next((l.get('j') for l in car if l.get('j')), '')
         with_me = sum(1 for l in car[:15] if l.get('j') and jk_key(l['j']) == me and l['pos'] <= 3)
-        if with_me:
-            jk += 0.03 * min(with_me, 3)
-            notes.append(f"この騎手で好走{with_me}回")
+        jtxt = None
+        if row.get('jkUpgrade', 0) >= 0.05 and prev:
+            jtxt = f"鞍上強化（{re.sub(r'[▲△☆★◇]', '', prev)}→{h.get('jockey')}）"
+        elif with_me:
+            jtxt = f"{h.get('jockey')}騎手と好走{with_me}回"
+        jk += 0.03 * min(with_me, 3)
         er = h.get('earlyRatio')
         style = '追' if er is not None and er >= 0.75 else '差' if er is not None and er >= 0.4 else None
         if style and jst:
-            sv = float(jst.get(f"{me}|{style}", 0.0))
-            jk += 0.5 * sv
-            if abs(sv) >= 0.03:
-                notes.append(f"騎手の{'差し' if style == '差' else '追い込み'}成績{'◎' if sv > 0 else '△'}")
-        if row.get('jkUpgrade', 0) >= 0.05:
-            notes.append('鞍上強化')
-        adj += clamp(jk, -0.12, 0.12)
-        # ③ 当日の馬場
-        tb = clamp(0.15 * (row.get('tbInner', 0) + row.get('tbFront', 0)), -0.08, 0.08)
-        if abs(tb) >= 0.02:
-            notes.append(f"当日の馬場{'向く' if tb > 0 else '向かない'}")
+            jk += 0.5 * float(jst.get(f"{me}|{style}", 0.0))
+        adj += add(jk, jtxt or ('騎手の成績◎' if jk > 0 else '騎手の割引'), -0.12, 0.15)
+        # ③ 当日の馬場（内外×枠・前残り×位置）＋今日の同じ距離帯の傾向
+        tb = add(0.35 * (row.get('tbInner', 0) + row.get('tbFront', 0)),
+                 '今日の馬場が向く' if row.get('tbInner', 0) + row.get('tbFront', 0) > 0 else '今日の馬場が向かない', -0.15, 0.15)
         adj += tb
-        # ④ 馬場適性（初めての馬場は0）
+        if tband and tband[1] and er is not None:
+            kind = tband[1]['kind']
+            fit = (1 if er <= 0.35 else -1 if er >= 0.6 else 0) if kind == 'front' else \
+                  (1 if er >= 0.55 else -1 if er <= 0.25 else 0) if kind == 'back' else 0
+            if fit:
+                tw_ = f"今日の{surf_jp}{'' if tband[0] == '全体' else tband[0]}は{tband[1]['word']}"
+                adj += add(0.07 * fit, tw_ + ('で脚質が合う' if fit > 0 else 'で脚質が合わない'), -0.07, 0.07)
+        # ④ 馬場適性（初めての馬場は0・好走回数で加点）
         same = [l for l in car if l['dist'][:1] == race['surf']]
         if same:
             good = sum(1 for l in same if l['pos'] <= 3)
-            sf = 0.15 * row.get('surfTop3', 0) + 0.02 * min(good, 5)
-            adj += clamp(sf, -0.06, 0.12)
-            if good:
-                notes.append(f"{'芝' if race['surf'] == '芝' else 'ダート'}で好走{good}回")
-        # ⑤ 展開不向き・不利は度外視
+            adj += add(0.15 * row.get('surfTop3', 0) + 0.02 * min(good, 5),
+                       f"{surf_jp}で好走{good}回" if good else f"{surf_jp}で好走なし", -0.06, 0.12)
+        elif car:
+            parts.append((0.0, f"初{surf_jp}（評価は0）"))
+        # ⑤ 展開不向き・不利の度外視
         recent = car[:5]
         if len(recent) >= 2:
             usual_l = [x for x in (_first_ratio(l) for l in car[1:6]) if x is not None]
             usual = sum(usual_l) / len(usual_l) if usual_l else None
-            sc = lambda l: 1 - (l['pos'] - 1) / max(1, (l.get('f') or 16) - 1)
+            sc_ = lambda l: 1 - (l['pos'] - 1) / max(1, (l.get('f') or 16) - 1)
             why = [(l, excused(l, usual)) for l in recent]
-            kept = [sc(l) for l, w in why if not w]
+            kept = [sc_(l) for l, w in why if not w]
             if kept and len(kept) < len(recent):
-                ex = 0.3 * (sum(kept) / len(kept) - sum(sc(l) for l in recent) / len(recent))
-                adj += clamp(ex, 0.0, 0.10)
-                if ex >= 0.01:
-                    notes.append('度外視：' + '・'.join(sorted({w for _, w in why if w})))
+                ex = 0.3 * (sum(kept) / len(kept) - sum(sc_(l) for l in recent) / len(recent))
+                bad = next(((l, w) for l, w in why if w), None)
+                adj += add(ex, f"{short_date(bad[0]['d'])}の{bad[0]['pos']}着は{bad[1]}で度外視" if bad else '', 0.0, 0.10)
+        # ⑥ 今日の展開（予想ペース×位置取り）
+        if er is not None and pace in ('fast', 'slow'):
+            pv = 0.16 * (er - 0.5) * (1 if pace == 'fast' else -1)
+            adj += add(pv, f"{PACE_LABEL[pace]}ペース想定で{'差し' if er >= 0.5 else '先行'}が{'向く' if pv > 0 else '不利'}", -0.08, 0.08)
+        if h.get('bPos', 0) > 0:
+            adj += add(0.04, '単騎で逃げられそう', 0, 0.04)
+        elif h.get('bPos', 0) < 0:
+            adj += add(-0.04, 'ハナ争いで苦しい', -0.04, 0)
+        # ⑦ オッズとの食い違い（人気と、オッズ抜きの実力評価がずれていたら疑う）
+        pai, pm = h.get('pAI'), h.get('pm')
+        if pai and pm:
+            ratio = pai / pm
+            dv = 0.08 * clamp(math.log(ratio), -1, 1)
+            if ratio >= 1.6:
+                t_ = f"{pops.get(h['n'])}番人気だが実力は{ai_rank.get(h['n'])}番手評価（人気薄すぎ）"
+            elif ratio <= 0.6 and pops.get(h['n'], 99) <= 4:
+                t_ = f"{pops.get(h['n'])}番人気ほどの根拠なし（実力{ai_rank.get(h['n'])}番手）"
+            else:
+                t_ = ''
+            adj += add(dv, t_, -0.08, 0.08)
+            h['diverge'] = ratio
         adj = clamp(adj, -BOOST_CAP, BOOST_CAP)
         h['boostAdj'] = adj
-        h['boostNotes'] = notes
+        h['boostParts'] = parts
+        h['boostNotes'] = [t for v, t in sorted(parts, key=lambda x: -abs(x[0])) if t][:5]
         any_ = any_ or abs(adj) > 1e-6
     if not any_:
         return False
@@ -3971,6 +4065,14 @@ def short_comment(race, h):
         f.append((min(g('distSum'), 2.5) * 0.012, '距離実績', ''))
     if g('cl'):
         f.append((g('cl')['gap'] * 0.02, '格上相手に実績', '相手強化'))
+    # その馬だけの理由（重点補正で出た具体的な文）を、点数をそろえて一緒に並べる
+    for v, t in (g('boostParts') or []):
+        if v > 0:
+            f.append((v * 0.25, t, ''))
+        elif v < 0:
+            f.append((v * 0.25, '', t))
+        elif t:
+            f.append((0.0001, t, ''))
     pos = [x[1] for x in sorted([x for x in f if x[0] >= 0.004 and x[1]], key=lambda x: -x[0])[:2]]
     neg = [x[2] for x in sorted([x for x in f if x[0] <= -0.004 and x[2]], key=lambda x: x[0])[:1]]
     s = ''
@@ -3981,7 +4083,10 @@ def short_comment(race, h):
     if pos:
         s += '＋'.join(pos) + '。'
     if neg:
-        s += f'{neg[0]}が課題。'
+        s += f'{neg[0]}。' if neg[0].endswith(('割引', 'なし', '不利', '苦しい', '合わない', '向かない')) or '根拠なし' in neg[0] else f'{neg[0]}が課題。'
+    first = [t for v, t in (g('boostParts') or []) if v == 0 and t]
+    if first and first[0] not in s:
+        s += first[0] + '。'
     if g('o'):
         ev = h['p'] * h['o']
         s += '妙味大。' if ev >= 1.3 else '過剰人気気味。' if ev < 0.7 else ''
