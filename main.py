@@ -824,6 +824,15 @@ except Exception as _e:
     print(f"[model] 重みのファイルなし（今までのAIだけで計算）: {_e}", flush=True)
 
 
+ANA_MODEL = None     # 穴を見つける判定に使う別の重み（data/model_weights_ana.json があるときだけ）
+try:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'model_weights_ana.json'), encoding='utf-8') as _f:
+        ANA_MODEL = json.load(_f)
+    print(f"[model] 穴の判定用の重みを読み込み：材料{len(ANA_MODEL['names'])}個", flush=True)
+except Exception:
+    ANA_MODEL = None
+
+
 def model_row(race, h, N):
     """新方式の材料（オッズ以外）を作る。値はすべて数字。バックテストとBotで共通"""
     f = {}
@@ -1200,6 +1209,23 @@ def apply_model(race, arr, odds):
             apply_place_model(arr, rows, xp, [inv[h['n']] / tot for h in arr])
     except Exception as e:
         print(f"[place] 2着・3着の見込みを計算できず: {e}", flush=True)
+    # 学習そのままの勝率（オッズ・AIの効きを変える前）。穴の判定と3連単の見送りは、学習と同じこの勝率で行う
+    def _soft(z_):
+        m_ = max(z_)
+        e_ = [math.exp(v - m_) for v in z_]
+        t_ = sum(e_)
+        return [v / t_ for v in e_]
+    raw = _soft([sum(b * (v - m) / s for b, v, m, s in zip(MODEL['beta'], x, mean, std)) for x in xs])
+    for h, v in zip(arr, raw):
+        h['pRaw'] = v
+    if ANA_MODEL:     # 穴の判定用の別の重み（98材料）
+        an_ = ANA_MODEL
+        za = []
+        for h, row in zip(arr, rows):
+            xa = [math.log(inv[h['n']] / tot)] + [row.get(n, 0.0) for n in an_['names'][1:]]
+            za.append(sum(b * (v - m) / (s or 1) for b, v, m, s in zip(an_['beta'], xa, an_['mean'], an_['std'])))
+        for h, v in zip(arr, _soft(za)):
+            h['pAna'] = v
     zmax = max(zs)
     ex = [math.exp(z - zmax) for z in zs]
     tot2 = sum(ex)
@@ -1621,10 +1647,13 @@ def ana_horses(arr, rule=None):
         return [h for h in arr if h.get('anaFlag')][:2]
     pa, pm = prob_tables(arr)
     out = []
-    pb = lambda h: h.get('pBase', h['p'])
+    main = lambda h: h.get('pRaw', h.get('pBase', h['p']))                # 印・本線の重み（学習そのまま）
+    use_ana = BET_RULES.get('ana_model') and all('pAna' in h for h in arr)
+    pb = (lambda h: h['pAna']) if use_ana else main                      # 穴の判定に使う勝率
+    top3 = {h['n'] for h in sorted(arr, key=lambda h: -main(h))[:3]}
     for r_, h in enumerate(sorted(arr, key=lambda h: -pb(h)), 1):
         o = h.get('o') or 0
-        if r_ < 4 or r_ > rule.get('max_rank', 10) or o < rule.get('min_odds', 12):
+        if r_ < 4 or r_ > rule.get('max_rank', 10) or o < rule.get('min_odds', 12) or h['n'] in top3:
             continue
         e = pb(h) / max(pm.get(h['n'], 0) or h.get('pm') or 1e-9, 1e-9)
         if e >= rule.get('min_edge', 1.2):
@@ -1760,7 +1789,7 @@ def sanren_combos(arr, kind):
         return sorted({tuple(sorted((n[0], n[1], x))) for x in n[2:2 + k]})
     tr = BET_RULES.get('sanren_tan')
     if tr:      # 学習した形：1着 上位a頭 → 2着 上位b頭（＋穴h2）→ 3着 上位c頭（＋穴h3）、◎の勝率がskip未満なら見送り
-        if arr[0].get('pBase', arr[0]['p']) < tr.get('skip', 0.25):    # 学習と同じ、重点補正の前の勝率で判定
+        if max(h.get('pRaw', h.get('pBase', h['p'])) for h in arr) < tr.get('skip', 0.25):    # 学習と同じ勝率（補正前・効きを変える前）で判定
             return []
         cols = tan_cols(arr, n, tr)
         return [(x, y, z) for x in cols[0] for y in cols[1] for z in cols[2] if len({x, y, z}) == 3]
@@ -1797,7 +1826,7 @@ def sanren_plan(arr):
         out.append({'label': '本線', 'text': f"3連単 {','.join(map(str, c1))} → {','.join(map(str, c2))} → {','.join(map(str, c3))}"
                                              f"（フォーメーション・{len(tan)}点）", 'parts': [('3連単', tan)]})
     elif tr:
-        pb0 = arr[0].get('pBase', arr[0]['p']) * 100
+        pb0 = max(h.get('pRaw', h.get('pBase', h['p'])) for h in arr) * 100
         out.append({'label': '本線', 'text': f"3連単 見送り（◎の勝率が補正前{pb0:.0f}%で{tr.get('skip', 0.25) * 100:.0f}%未満＝3連単の回収率が低い混戦）",
                     'parts': [('3連単', [])]})
     elif tan:
