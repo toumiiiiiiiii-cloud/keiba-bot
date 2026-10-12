@@ -787,7 +787,12 @@ def ranked(race, horses, odds):
             traceback.print_exc()
             print(f"[boost] 重点補正を計算できず: {e}", flush=True)
     if BET_RULES.get('ana') and race.get('model'):   # 穴の印：学習した決め方（AIの順位・オッズ・人気より強い度合い）
-        ana_ids = {h['n'] for h in ana_horses(arr)}
+        ana_ids = {h['n'] for h in ana_horses(arr)}      # 穴の買い目に使う馬すべてに「穴」マーク
+        for sp in BET_RULES.get('ana_bets') or []:
+            ana_ids |= {h['n'] for h in ana_horses(arr, {x: v for x, v in sp.items() if x not in ('bet', 'roi')})}
+        tr_ = BET_RULES.get('sanren_tan') or {}
+        if tr_.get('h3') or tr_.get('h2'):
+            ana_ids |= {h['n'] for h in ana_horses(arr, tr_.get('ana'))[:max(tr_.get('h3', 0), tr_.get('h2', 0))]}
         for h in arr:
             h['anaFlag'] = h['n'] in ana_ids
     try:
@@ -1628,7 +1633,7 @@ def ana_plan(arr):
     out = []
     for sp in spec:
         k = sp['bet']
-        anas = ana_horses(arr, {x: v for x, v in sp.items() if x != 'bet'} or None)
+        anas = ana_horses(arr, {x: v for x, v in sp.items() if x not in ('bet', 'roi')} or None)
         parts = []
         for h in anas:
             a = h['n']
@@ -1770,7 +1775,9 @@ def sanren_plan(arr):
         out.append({'label': '本線', 'text': f"3連単 {','.join(map(str, c1))} → {','.join(map(str, c2))} → {','.join(map(str, c3))}"
                                              f"（フォーメーション・{len(tan)}点）", 'parts': [('3連単', tan)]})
     elif tr:
-        out.append({'label': '本線', 'text': f"3連単 見送り（◎勝率{p0:.0f}%は3連単の回収率が低いため）", 'parts': [('3連単', [])]})
+        pb0 = arr[0].get('pBase', arr[0]['p']) * 100
+        out.append({'label': '本線', 'text': f"3連単 見送り（◎の勝率が補正前{pb0:.0f}%で{tr.get('skip', 0.25) * 100:.0f}%未満＝3連単の回収率が低い混戦）",
+                    'parts': [('3連単', [])]})
     elif tan:
         out.append({'label': '本線', 'text': f"3連単 {n[0]},{n[1]} → {n[0]},{n[1]} → {','.join(map(str, n[2:7]))}（◎○1・2着マルチ・{len(tan)}点）",
                     'parts': [('3連単', tan)]})
