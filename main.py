@@ -5245,7 +5245,30 @@ def handle_message(event):
     print(f'[recv] {text[:80]}', flush=True)
     base = public_base_url()
     uid = getattr(event.source, 'user_id', None) or 'anon'
-    threading.Thread(target=process_message, args=(event.reply_token, text, base, uid), daemon=True).start()
+    threading.Thread(target=_tracked, args=(event.reply_token, text, base, uid), daemon=True).start()
+
+
+_ACTIVE = [0]
+_ACTIVE_LOCK = threading.Lock()
+
+
+def _tracked(*a):
+    """処理中の件数を数える（更新で再起動するときに、処理中の予想を最後まで送ってから終わるため）"""
+    with _ACTIVE_LOCK:
+        _ACTIVE[0] += 1
+    try:
+        process_message(*a)
+    finally:
+        with _ACTIVE_LOCK:
+            _ACTIVE[0] -= 1
+
+
+def wait_active(limit=25):
+    """処理中の予想が終わるまで待つ（最大 limit 秒）"""
+    t = time.time()
+    while _ACTIVE[0] > 0 and time.time() - t < limit:
+        time.sleep(0.5)
+    print(f"[shutdown] 処理中の予想 {_ACTIVE[0]}件で終了（{time.time() - t:.1f}秒待った）", flush=True)
 
 
 # ═════════════════════════════════════════
