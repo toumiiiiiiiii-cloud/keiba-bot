@@ -1648,7 +1648,7 @@ def ana_horses(arr, rule=None):
     pa, pm = prob_tables(arr)
     out = []
     main = lambda h: h.get('pRaw', h.get('pBase', h['p']))                # 印・本線の重み（学習そのまま）
-    use_ana = BET_RULES.get('ana_model') and all('pAna' in h for h in arr)
+    use_ana = (rule.get('model') or BET_RULES.get('ana_model')) == '98' and all('pAna' in h for h in arr)
     pb = (lambda h: h['pAna']) if use_ana else main                      # 穴の判定に使う勝率
     top3 = {h['n'] for h in sorted(arr, key=lambda h: -main(h))[:3]}
     for r_, h in enumerate(sorted(arr, key=lambda h: -pb(h)), 1):
