@@ -1972,10 +1972,57 @@ def parse_result_full(race_id):
                              'c1': corners[0] if corners else None, 'c4': corners[-1] if corners else None, 'l3': l3})
         if not rows or not any(r['pos'] == 1 for r in rows):
             return None
+        if any(r['c4'] is None for r in rows):      # 表に通過順が無いときは「コーナー通過順位」の欄から
+            cmap = parse_corner_section(soup) or db_corner_map(race_id)
+            if cmap:
+                first, last = cmap[min(cmap)], cmap[max(cmap)]
+                for r in rows:
+                    if r['c4'] is None:
+                        r['c4'] = last.get(r['n'])
+                    if r['c1'] is None:
+                        r['c1'] = first.get(r['n'])
+        if all(r['c4'] is None for r in rows):
+            print(f"[result] {race_id} 通過順を読めず（見出し：{'/'.join(cols)[:120]}）", flush=True)
         pm = re.search(r'ペース\s*[:：]?\s*([HMS])(?![a-zA-Z])', soup.get_text(' '))
         return {'surf': sm.group(1) if sm else None, 'dist': int(dm_.group(1)) if dm_ else None,
                 'N': len(rows), 'rows': rows, 'pace': pm.group(1) if pm else None}
     return cached(('res', race_id), 7 * 86400, load)
+
+
+def parse_corner_section(soup):
+    """結果ページの「コーナー通過順位」（例：4コーナー「1(4,3)(8,6)(2,5,10)…」）→ {コーナー番号: {馬番: 位置}}"""
+    out = {}
+    for cell in soup.find_all(['th', 'td']):
+        m = re.fullmatch(r'([1-4])コーナー', clean(cell.get_text()))
+        if not m:
+            continue
+        val = cell.find_next_sibling(['td', 'th'])
+        txt = clean(val.get_text()) if val else ''
+        nums = [int(x) for x in re.findall(r'\d+', txt)]
+        if len(nums) >= 2:
+            out[int(m.group(1))] = {n: k + 1 for k, n in enumerate(nums)}
+    return out
+
+
+def db_corner_map(race_id):
+    """予備：db.netkeiba.com の結果ページの「通過」列（例 3-3-2-1）→ {1: {馬番: 最初のコーナー}, 4: {馬番: 最後のコーナー}}"""
+    if not re.match(r'^\d{12}$', race_id or ''):
+        return {}
+    try:
+        soup = fetch_soup(f"https://db.netkeiba.com/race/{race_id}/", timeout=8)
+    except Exception:
+        return {}
+    first, last = {}, {}
+    for tr in soup.select('table.race_table_01 tr') or soup.find_all('tr'):
+        tds = [clean(td.get_text()) for td in tr.find_all('td')]
+        if len(tds) < 5 or not tds[2].isdigit():
+            continue
+        ps = next((t for t in tds if re.fullmatch(r'\d{1,2}(?:-\d{1,2})+', t)), None)
+        if ps:
+            xs = [int(x) for x in ps.split('-')]
+            first[int(tds[2])], last[int(tds[2])] = xs[0], xs[-1]
+    print(f"[result] {race_id} 通過順を db.netkeiba から読み込み：{len(last)}頭", flush=True)
+    return {1: first, 4: last} if last else {}
 
 
 def parse_result_brief(race_id):
