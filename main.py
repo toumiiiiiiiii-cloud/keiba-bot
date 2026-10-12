@@ -784,6 +784,10 @@ def ranked(race, horses, odds):
         except Exception as e:
             traceback.print_exc()
             print(f"[boost] 重点補正を計算できず: {e}", flush=True)
+    if BET_RULES.get('ana') and race.get('model'):   # 穴の印：学習した決め方（AIの順位・オッズ・人気より強い度合い）
+        ana_ids = {h['n'] for h in ana_horses(arr)}
+        for h in arr:
+            h['anaFlag'] = h['n'] in ana_ids
     # AI推し：オッズ＋AIの期待値が1.1以上（2025・2026年のバックテストで、2年とも単勝の回収率が100%を超えた条件）
     for h in arr:
         h['aiPush'] = bool(race.get('model') and h.get('ev') and h['ev'] >= AI_PUSH_EV)
@@ -1520,6 +1524,74 @@ def _note(dropped):
     return f"・配当の安い{dropped}点を除外" if dropped else ''
 
 
+# 穴と3連単の買い方（パソコンの「穴と3連単の学習.py」が2025・2026年の成績で選んだ形。ファイルが無ければ今までの形）
+try:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'bet_rules.json'), encoding='utf-8') as _f:
+        BET_RULES = json.load(_f)
+    print(f"[rules] 穴と3連単の買い方を読み込み：{BET_RULES}", flush=True)
+except Exception:
+    BET_RULES = {}
+
+
+def ana_horses(arr, rule=None):
+    """穴馬：AIの4番手以下・単勝オッズが高め・AIの勝率がオッズの勝率より十分高い馬（強い順に最大 max_n 頭）"""
+    rule = rule or BET_RULES.get('ana') or {}
+    if not rule:
+        return [h for h in arr if h.get('anaFlag')][:2]
+    pa, pm = prob_tables(arr)
+    out = []
+    for r_, h in enumerate(arr, 1):
+        o = h.get('o') or 0
+        if r_ < 4 or r_ > rule.get('max_rank', 10) or o < rule.get('min_odds', 12):
+            continue
+        e = h['p'] / max(pm.get(h['n'], 0) or h.get('pm') or 1e-9, 1e-9)
+        if e >= rule.get('min_edge', 1.2):
+            out.append((e, h))
+    out.sort(key=lambda x: -x[0])
+    return [h for _, h in out[:rule.get('max_n', 2)]]
+
+
+ANA_BET_JP = {'単勝': '単勝', '複勝': '複勝', 'ワイド◎-穴': 'ワイド', '3連複◎○-穴': '3連複', '3連複◎-穴 2頭軸': '3連複'}
+
+
+def ana_plan(arr):
+    """穴の買い目（学習で2年とも回収率が良かった買い方だけ）"""
+    n = [h['n'] for h in arr]
+    anas = ana_horses(arr)
+    bets = (BET_RULES.get('ana') or {}).get('bets')
+    if not anas or len(n) < 6:
+        return []
+    if not bets:      # 学習していない・どれも良くなかった → 今まで通り ◎-穴 のワイドを1点
+        pa, pm = prob_tables(arr)
+        aw, _ = _keep('ワイド', [(n[0], anas[0]['n'])], pm)
+        return [{'label': '穴', 'text': "ワイド " + ', '.join(f"{a}-{b}" for a, b in aw), 'parts': [('ワイド', aw)]}] if aw else []
+    out = []
+    for k in bets:
+        parts = []
+        for h in anas:
+            a = h['n']
+            if k in ('単勝', '複勝'):
+                parts.append((k, [(a,)]))
+            elif k == 'ワイド◎-穴':
+                parts.append(('ワイド', [tuple(sorted((n[0], a)))]))
+            elif k == '3連複◎○-穴':
+                parts.append(('3連複', [tuple(sorted((n[0], n[1], a)))]))
+            elif k == '3連複◎-穴 2頭軸':
+                parts.append(('3連複', [tuple(sorted((n[0], a, m))) for m in n[1:6] if m != a]))
+        if not parts:
+            continue
+        kind = parts[0][0]
+        combos = [c for _, cs in parts for c in cs]
+        txt = {'単勝': '単勝 ', '複勝': '複勝 ', 'ワイド◎-穴': 'ワイド ', '3連複◎○-穴': '3連複 ◎○-穴 ',
+               '3連複◎-穴 2頭軸': '3連複 ◎-穴 2頭軸→相手5頭 '}[k]
+        if k == '3連複◎-穴 2頭軸':
+            txt += '／'.join(f"{n[0]}-{h['n']}→{','.join(str(m) for m in n[1:6] if m != h['n'])}" for h in anas)
+        else:
+            txt += ', '.join('-'.join(map(str, c)) for c in combos)
+        out.append({'label': '穴', 'text': f"{txt}（{len(combos)}点）", 'parts': [(kind, combos)]})
+    return out
+
+
 def bet_plan(arr):
     """おすすめ買い目。各要素は {'label','text','parts':[(券種, [組み合わせ,...]), ...]}
     予想配当が安すぎる組み合わせは外し、人気馬ばかりのときは妙味のある相手を入れる"""
@@ -1548,11 +1620,7 @@ def bet_plan(arr):
         b = max(evs, key=lambda h: h['ev'])
         plan.append({'label': '妙味', 'text': f"単複 {b['n']}（期待値{b['ev']:.2f}）",
                      'parts': [('単勝', [(b['n'],)]), ('複勝', [(b['n'],)])]})
-    anas = [h for h in arr if h['anaFlag']][:1]   # 穴のワイドも1点
-    if anas:
-        aw, _ = _keep('ワイド', [(n[0], h['n']) for h in anas], pm)
-        if aw:
-            plan.append({'label': '穴', 'text': "ワイド " + ', '.join(f"{a}-{b}" for a, b in aw), 'parts': [('ワイド', aw)]})
+    plan += ana_plan(arr)
     plan += shoubu_plan(arr, {'model': any('pAI' in h for h in arr)})
     # 検証枠：新方式（オッズ＋AI）で期待値1.1以上の単勝。本当に効くかを記録で確かめるためのもの（買わない）
     if any('pAI' in h for h in arr):
@@ -1601,9 +1669,23 @@ def sanren_combos(arr, kind):
             return sorted({tuple(sorted((n[0], a, b))) for i, a in enumerate(mates) for b in mates[i + 1:]})
         k = 5 if shape == 'hard' else 6   # 堅い：2頭軸 相手5頭／中間：相手6頭
         return sorted({tuple(sorted((n[0], n[1], x))) for x in n[2:2 + k]})
+    tr = BET_RULES.get('sanren_tan')
+    if tr:      # 学習した形：1着 上位a頭 → 2着 上位b頭（＋穴h2）→ 3着 上位c頭（＋穴h3）、◎の勝率がskip未満なら見送り
+        if arr[0]['p'] < tr.get('skip', 0.25):
+            return []
+        cols = tan_cols(arr, n, tr)
+        return [(x, y, z) for x in cols[0] for y in cols[1] for z in cols[2] if len({x, y, z}) == 3]
     if shape == 'open':
         return []
     return [(a, b, c) for a, b in ((n[0], n[1]), (n[1], n[0])) for c in n[2:7]]   # ◎○ 1・2着マルチ→相手5頭（10点）
+
+
+def tan_cols(arr, n, tr):
+    an = [h['n'] for h in ana_horses(arr)]
+    c1 = n[:tr['a']]
+    c2 = n[:tr['b']] + [x for x in an[:tr.get('h2', 0)] if x not in n[:tr['b']]]
+    c3 = n[:tr['c']] + [x for x in an[:tr.get('h3', 0)] if x not in n[:tr['c']]]
+    return [c1, c2, c3]
 
 
 def sanren_plan(arr):
@@ -1620,7 +1702,14 @@ def sanren_plan(arr):
         t = f"3連複 軸{n[0]}-{n[1]} 相手{','.join(map(str, n[2:2 + (5 if shape == 'hard' else 6)]))}（◎○2頭軸・{len(fuku)}点・{tag}）"
     out.append({'label': '本線', 'text': t, 'parts': [('3連複', fuku)]})
     tan = sanren_combos(arr, '3連単')
-    if tan:
+    tr = BET_RULES.get('sanren_tan')
+    if tan and tr:
+        c1, c2, c3 = _prune_cols('3連単', tan_cols(arr, n, tr), tan)
+        out.append({'label': '本線', 'text': f"3連単 {','.join(map(str, c1))} → {','.join(map(str, c2))} → {','.join(map(str, c3))}"
+                                             f"（フォーメーション・{len(tan)}点）", 'parts': [('3連単', tan)]})
+    elif tr:
+        out.append({'label': '本線', 'text': f"3連単 見送り（◎勝率{p0:.0f}%は3連単の回収率が低いため）", 'parts': [('3連単', [])]})
+    elif tan:
         out.append({'label': '本線', 'text': f"3連単 {n[0]},{n[1]} → {n[0]},{n[1]} → {','.join(map(str, n[2:7]))}（◎○1・2着マルチ・{len(tan)}点）",
                     'parts': [('3連単', tan)]})
     else:
