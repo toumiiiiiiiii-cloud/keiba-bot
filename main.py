@@ -790,6 +790,11 @@ def ranked(race, horses, odds):
         ana_ids = {h['n'] for h in ana_horses(arr)}
         for h in arr:
             h['anaFlag'] = h['n'] in ana_ids
+    try:
+        arr = role_marks(arr)
+    except Exception as e:
+        traceback.print_exc()
+        print(f"[marks] 印の役割を付けられず: {e}", flush=True)
     # AI推し：オッズ＋AIの期待値が1.1以上（2025・2026年のバックテストで、2年とも単勝の回収率が100%を超えた条件）
     for h in arr:
         h['aiPush'] = bool(race.get('model') and h.get('ev') and h['ev'] >= AI_PUSH_EV)
@@ -1527,6 +1532,47 @@ def pair_pick(arr, kind, pm, vh=None):
 
 def _note(dropped):
     return f"・配当の安い{dropped}点を除外" if dropped else ''
+
+
+def role_marks(arr):
+    """印を「役割どおり」に並べ替える（複勝率の確かめ.py で、2年とも順位どおりより良かった印だけ）
+    ◎＝勝つ見込み一番／○＝2着までの見込み一番（連対）／▲＝単穴（期待値・8倍以上で勝つ見込み）／
+    △＝3着までの見込みの上位（ヒモ）／☆＝人気より強い穴。印のない馬は勝つ見込みの順"""
+    mk = (MODEL or {}).get('marks') or {}
+    if not mk or all(v == 'rank' for k, v in mk.items() if k != 'ana') or len(arr) < 8:
+        return arr
+    if any(mk.get(k) in ('p2', 'p3') for k in mk) and not all(h.get('p2') and h.get('p3') for h in arr):
+        return arr
+    by_p = sorted(arr, key=lambda h: -h['p'])
+    prank = {h['n']: i for i, h in enumerate(by_p)}
+    used = [by_p[0]]
+    rest = lambda: [h for h in by_p if h not in used]
+    # ○
+    used.append(max(rest(), key=lambda h: h['p2']) if mk.get('○') == 'p2' else rest()[0])
+    # ▲
+    r_ = rest()
+    if mk.get('▲') == 'ev':
+        c6 = [h for h in r_ if prank[h['n']] < 6 and h.get('o')] or r_
+        used.append(max(c6, key=lambda h: h['p'] * (h.get('o') or 0)))
+    elif mk.get('▲') == 'hi8':
+        c8 = [h for h in r_ if (h.get('o') or 0) >= 8] or r_
+        used.append(max(c8, key=lambda h: h['p']))
+    else:
+        used.append(r_[0])
+    # △×3
+    r_ = rest()
+    used += sorted(r_, key=lambda h: -h['p3'])[:3] if mk.get('△') == 'p3' else r_[:3]
+    # ☆
+    r_ = rest()
+    if r_:
+        if mk.get('☆') == 'ana':
+            an = [h for h in ana_horses(arr, mk.get('ana')) if h not in used]
+            used.append(an[0] if an else (sorted(r_, key=lambda h: -h.get('p3', h['p']))[0]))
+        else:
+            used.append(r_[0])
+    for h in used:
+        h['roleMark'] = True
+    return used + rest()
 
 
 # 穴と3連単の買い方（パソコンの「穴と3連単の学習.py」が2025・2026年の成績で選んだ形。ファイルが無ければ今までの形）
