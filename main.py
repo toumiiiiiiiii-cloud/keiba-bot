@@ -5301,6 +5301,21 @@ def _combos_from_cols(kind, cols):
     return out
 
 
+def _prune_cols(kind, cols, combos):
+    """表示用：1列目（1着・1頭目）の馬を後ろの列から外しても買い目が変わらないなら外す
+    （例：1着11 → 2着11,1,10 は 2着1,10 と同じなので、1着の馬を2着・3着に並べない）"""
+    target = set(combos)
+    cols = [list(c) for c in cols]
+    for i in range(1, len(cols)):
+        for x in list(cols[i]):
+            if x not in cols[0]:
+                continue
+            trial = cols[:i] + [[y for y in cols[i] if y != x]] + cols[i + 1:]
+            if trial[i] and set(_combos_from_cols(kind, trial)) == target:
+                cols = trial
+    return cols
+
+
 def _best_form(kind, n, P, pa):
     """点数P以内で、当たる見込みが一番高いフォーメーション（上位からの入れ子の列）"""
     best = None
@@ -5395,7 +5410,7 @@ def parse_bet_request(text, arr):
             if not b:
                 continue
             labs = ['1着', '2着', '3着'] if kind == '3連単' else ['1着', '2着'] if kind == '馬単' else ['1頭目', '2頭目', '3頭目'][:k]
-            r.update(method='form', labels=labs, cols=b[1], combos=b[2])
+            r.update(method='form', labels=labs, cols=_prune_cols(kind, b[1], b[2]), combos=b[2])
         if not r.get('combos'):
             continue
         per = int(per_m.group(1).replace(',', '')) if per_m else None
