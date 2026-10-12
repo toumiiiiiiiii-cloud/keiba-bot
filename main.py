@@ -4560,6 +4560,205 @@ def venue_results_today(prefix):
     return out
 
 
+def band_stats(results):
+    """結果のリスト → 脚質・内外・ペースの集計"""
+    st = {'逃げ': 0, '先行': 0, '差し': 0, '追込': 0}
+    inner = tot = 0
+    for _, r in results:
+        for x in r['rows']:
+            if x['pos'] <= 3:
+                s_ = _style_of(x.get('c4'), r['N'])
+                if s_:
+                    st[s_] += 1
+                tot += 1
+                inner += 1 if x['n'] <= r['N'] / 2 else 0
+    if not tot:
+        return None
+    front = (st['逃げ'] + st['先行']) / tot
+    if front >= 0.65:
+        kind, word = 'front', ('逃げ馬が粘る' if st['逃げ'] / tot >= 0.25 else '前残り')
+    elif front <= 0.3:
+        kind, word = 'back', ('追い込みが届く' if st['追込'] / tot >= 0.3 else '差しが届く')
+    else:
+        kind, word = 'flat', '偏りは小さい'
+    ir = inner / tot
+    io = '内枠有利' if ir >= 0.68 else '外枠有利' if ir <= 0.32 else ''
+    pc = [r.get('pace') for _, r in results if r.get('pace')]
+    pace = ''
+    if pc:
+        pace = 'ハイペース多め' if pc.count('H') > len(pc) / 2 else 'スローペース多め' if pc.count('S') > len(pc) / 2 else ''
+    return {'counts': st, 'tot': tot, 'kind': kind, 'word': word, 'io': io, 'pace': pace,
+            'races': [r_ for r_, _ in results], 'front': front, 'inner': ir}
+
+
+def track_report_data(race=None):
+    pfs = today_prefixes(race)
+    if not pfs:
+        return []
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        allres = list(ex.map(venue_results_today, pfs))
+    data = []
+    for pf, res in zip(pfs, allres):
+        v = {'name': JRA_PLACE.get(pf[4:6], pf[4:6]), 'n': len(res), 'surfs': []}
+        for surf in ('芝', 'ダ'):
+            sres = [x for x in res if x[1]['surf'] == surf]
+            if not sres:
+                continue
+            bands = []
+            for bname, lo, hi in DIST_BANDS:
+                b = [x for x in sres if x[1].get('dist') and lo <= x[1]['dist'] <= hi]
+                if b:
+                    bands.append((bname, band_stats(b)))
+            v['surfs'].append({'surf': '芝' if surf == '芝' else 'ダート', 'all': band_stats(sres), 'bands': bands})
+        data.append(v)
+    return data
+
+
+def render_track_image(data):
+    """今日の馬場の傾向の画像"""
+    W, PAD = 1080, 32
+    COL = {'逃げ': (230, 92, 80), '先行': (240, 170, 60), '差し': (90, 170, 240), '追込': (150, 120, 230)}
+    KIND_C = {'front': (230, 92, 80), 'back': (90, 170, 240), 'flat': (120, 130, 150)}
+    rows_h = 0
+    for v in data:
+        rows_h += 80 + (70 if not v['surfs'] else 0)
+        for sf in v['surfs']:
+            rows_h += 66 + 96 + 86 * len(sf['bands']) + 14
+        rows_h += 20
+    H = 300 + rows_h + 120
+    img = gradient_bg(W, H)
+    d = ImageDraw.Draw(img)
+    gold_frame(d, (14, 14, W - 14, H - 14), r=24, w=3)
+    now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
+    ctext(d, W / 2, 36, f"{now:%m/%d} {now:%H:%M}時点", F('sans_b', 30), SILVER)
+    ctext(d, W / 2, 80, '今日の馬場の傾向', F('serif_b', 64), GOLD)
+    ctext(d, W / 2, 168, '終わったレースの3着内の馬の位置（4コーナー）から', F('sans_r', 26), MUTED)
+    # 凡例
+    y = 214
+    lx = PAD + 40
+    for k, (nm, c) in enumerate(COL.items()):
+        x = lx + k * 150
+        d.rounded_rectangle((x, y + 10, x + 34, y + 38), radius=6, fill=c)
+        d.text((x + 44, y + 6), nm, font=F('sans_b', 26), fill=SILVER)
+    d.text((lx + 620, y + 6), '数字＝3着内の頭数', font=F('sans_r', 24), fill=MUTED)
+    y += 70
+
+    def band_row(y, label, races, bs, big=False):
+        h_ = 96 if big else 86
+        d.rounded_rectangle((PAD + 10, y, W - PAD - 10, y + h_ - 10), radius=12, fill=(16, 24, 46) if big else (12, 18, 36))
+        f_lab = F('sans_b', 30 if big else 28)
+        d.text((PAD + 30, y + 10), label, font=f_lab, fill=GOLD if big else SILVER)
+        if races:
+            d.text((PAD + 30, y + (50 if big else 46)), races, font=F('sans_r', 20), fill=MUTED)
+        if not bs:
+            return y + h_
+        # 帯グラフ
+        bx0, bx1 = PAD + 230, PAD + 600
+        by0, by1 = y + 22, y + h_ - 32
+        x = bx0
+        for nm, c in COL.items():
+            cnt = bs['counts'][nm]
+            if not cnt:
+                continue
+            w_ = (bx1 - bx0) * cnt / bs['tot']
+            d.rectangle((x, by0, x + w_, by1), fill=c)
+            if w_ >= 26:
+                ctext(d, x + w_ / 2, by0 + (by1 - by0) / 2 - 15, str(cnt), F('sans_b', 24), (20, 20, 20))
+            x += w_
+        d.rectangle((bx0, by0, bx1, by1), outline=(70, 70, 90), width=1)
+        # 判定
+        kc = KIND_C[bs['kind']]
+        t = bs['word'] + ('（1R）' if len(bs['races']) == 1 else '')
+        ft = F('sans_b', 28)
+        tx = PAD + 630
+        d.rounded_rectangle((tx, y + 12, tx + tw(d, t, ft) + 28, y + 54), radius=21, fill=kc)
+        d.text((tx + 14, y + 16), t, font=ft, fill=(255, 255, 255))
+        sub = '・'.join(x_ for x_ in (bs['io'], bs['pace']) if x_)
+        if sub:
+            d.text((tx + 4, y + 58), sub, font=F('sans_r', 22), fill=SILVER)
+        return y + h_
+
+    for v in data:
+        d.rounded_rectangle((PAD, y, W - PAD, y + 62), radius=14, fill=(40, 34, 20), outline=GOLD_D, width=2)
+        d.text((PAD + 24, y + 10), f"■ {v['name']}", font=F('serif_b', 38), fill=GOLD)
+        d.text((PAD + 260, y + 18), f"終わった{v['n']}レースから", font=F('sans_r', 26), fill=SILVER)
+        y += 80
+        if not v['surfs']:
+            d.text((PAD + 30, y), 'まだ終わったレースがありません', font=F('sans_r', 28), fill=MUTED)
+            y += 70
+        for sf in v['surfs']:
+            d.text((PAD + 20, y + 10), f"【{sf['surf']}】", font=F('sans_b', 34), fill=(250, 236, 200))
+            y += 66
+            y = band_row(y, '全体', f"{len(sf['all']['races'])}レース" if sf['all'] else '', sf['all'], big=True)
+            for bname, bs in sf['bands']:
+                y = band_row(y, bname, '・'.join(f"{r_}R" for r_ in bs['races']) if bs else '', bs)
+            y += 14
+        y += 20
+    d.text((PAD + 10, H - 104), '逃げ＝4角先頭／先行＝前から3割／差し＝3〜6.5割／追込＝それより後ろ', font=F('sans_r', 22), fill=MUTED)
+    d.text((PAD + 10, H - 72), '短距離〜1400m／中距離〜1800m／中長距離〜2200m／長距離2300m〜。（1R）＝まだ1レースだけ', font=F('sans_r', 22), fill=MUTED)
+    return img
+
+
+def render_highlevel_image(race, arr):
+    """特注馬（ハイレベル戦・低レベル戦の経験）の画像"""
+    W, PAD = 1080, 32
+    hs = [h for h in arr if h.get('hlNotes')]
+    hs.sort(key=lambda h: (h['rk'] <= 3, h['rk']))
+    hs = hs[:6]
+    fT = F('sans_r', 26)
+    tmp = ImageDraw.Draw(Image.new('RGB', (10, 10)))
+    blocks = []
+    for h in hs:
+        notes = []
+        for n_ in h['hlNotes'][:3]:
+            low = '低レベル' in n_
+            notes.append((low, wrap(tmp, n_, fT, W - PAD * 2 - 150)[:4]))
+        bh = 84 + sum(14 + 36 * len(ls) for _, ls in notes) + 16
+        blocks.append((h, notes, bh))
+    H = 330 + sum(b[2] + 16 for b in blocks) + (120 if not blocks else 0) + 90
+    img = gradient_bg(W, H)
+    d = ImageDraw.Draw(img)
+    gold_frame(d, (14, 14, W - 14, H - 14), r=24, w=3)
+    date = race.get('date')
+    ctext(d, W / 2, 34, (f"{date:%m/%d} " if hasattr(date, 'strftime') else '') + f"{race['venue']}{race['R']}R", F('sans_b', 32), SILVER)
+    ctext(d, W / 2, 76, fit_text(d, race['name'], F('serif_b', 56), W - 160), F('serif_b', 56), GOLD)
+    ctext(d, W / 2, 152, '特注馬（レースレベル）', F('serif_b', 48), (250, 236, 200))
+    ctext(d, W / 2, 222, '過去に走ったレースの「その後の出走馬の成績」でレベルを判定', F('sans_r', 24), MUTED)
+    y = 262
+    d.rounded_rectangle((PAD + 20, y, PAD + 84, y + 34), radius=8, fill=(214, 60, 70))
+    ctext(d, PAD + 52, y + 2, 'ハイ', F('sans_b', 22), (255, 255, 255))
+    d.text((PAD + 96, y + 2), '強いメンバーと対戦（評価アップ）', font=F('sans_r', 24), fill=SILVER)
+    d.rounded_rectangle((PAD + 540, y, PAD + 604, y + 34), radius=8, fill=(60, 120, 210))
+    ctext(d, PAD + 572, y + 2, '低', F('sans_b', 22), (255, 255, 255))
+    d.text((PAD + 616, y + 2), '弱いメンバー（好走は割引）', font=F('sans_r', 24), fill=SILVER)
+    y += 60
+    if not blocks:
+        ctext(d, W / 2, y + 30, 'ハイレベル戦・低レベル戦を経験した馬はいません', F('sans_b', 32), SILVER)
+    for h, notes, bh in blocks:
+        d.rounded_rectangle((PAD, y, W - PAD, y + bh), radius=16, fill=(16, 24, 46), outline=GOLD_D, width=2)
+        mk = MARKS[h['rk'] - 1] if h['rk'] <= len(MARKS) else ''
+        if mk:
+            draw_mark(d, PAD + 44, y + 40, mk, r=22)
+        bg, fg = WAKU.get(h.get('w') or 0, ((245, 245, 245), (20, 20, 20)))
+        d.rounded_rectangle((PAD + 80, y + 18, PAD + 130, y + 62), radius=8, fill=bg, outline=GOLD_D)
+        ctext(d, PAD + 105, y + 20, str(h['n']), F('sans_b', 30), fg)
+        d.text((PAD + 146, y + 16), fit_text(d, h['name'], F('sans_b', 38), 520), font=F('sans_b', 38), fill=SILVER)
+        info = f"予想{h['rk']}位" + (f"・{h['o']}倍" if h.get('o') else '')
+        d.text((W - PAD - 24 - tw(d, info, F('sans_r', 26)), y + 24), info, font=F('sans_r', 26), fill=MUTED)
+        yy = y + 84
+        for low, ls in notes:
+            c = (60, 120, 210) if low else (214, 60, 70)
+            d.rounded_rectangle((PAD + 24, yy + 2, PAD + 92, yy + 34), radius=8, fill=c)
+            ctext(d, PAD + 58, yy + 3, '低' if low else 'ハイ', F('sans_b', 22), (255, 255, 255))
+            for ln in ls:
+                d.text((PAD + 108, yy), ln, font=fT, fill=SILVER)
+                yy += 36
+            yy += 14
+        y += bh + 16
+    ctext(d, W / 2, H - 70, '※人気（予想の上位）以外の馬を先に並べています', F('sans_r', 22), MUTED)
+    return img
+
+
 def band_verdict(results):
     """結果のリスト → 文章（脚質と内外の傾向）"""
     st = {'逃げ': 0, '先行': 0, '差し': 0, '追込': 0}
@@ -4811,6 +5010,37 @@ def video_message(race, arr, base, allow_make=False):
     return VideoSendMessage(original_content_url=f"{base}/img/{key}.mp4", preview_image_url=f"{base}/img/{key}_pv.jpg")
 
 
+def command_images(cmd, uid, base):
+    """「馬場」「ハイレベル」を画像（＋短い文章）で返す。作れなければ None（文章だけで返す）"""
+    try:
+        if not fonts_ok(20):
+            return None
+        sess = get_session(uid)
+        msgs = []
+        if cmd == '馬場':
+            race = sess[0] if sess else None
+            data = track_report_data(race if race and not race.get('abroad') else None)
+            if data:
+                with _render_lock:
+                    key = save_image(render_track_image(data))
+                msgs.append(ImageSendMessage(original_content_url=f"{base}/img/{key}.png",
+                                             preview_image_url=f"{base}/img/{key}_pv.jpg"))
+            if sess:
+                msgs.append(TextSendMessage(text=going_text(*sess)[:4900]))
+            elif not data:
+                msgs.append(TextSendMessage(text='今日は中央競馬の開催がないか、開催の情報を読めませんでした'))
+            return msgs or None
+        if not sess:
+            return None
+        with _render_lock:
+            key = save_image(render_highlevel_image(*sess))
+        return [ImageSendMessage(original_content_url=f"{base}/img/{key}.png",
+                                 preview_image_url=f"{base}/img/{key}_pv.jpg")]
+    except Exception:
+        traceback.print_exc()
+        return None
+
+
 def command_reply(text, uid):
     """対話型コマンドなら返事の文章を、そうでなければ None"""
     t = text.strip()
@@ -4908,6 +5138,10 @@ def build_messages(text, base, uid='anon'):
         if not vm:
             return [TextSendMessage(text="このレースの展開動画は作れませんでした")], None
         return [vm], None
+    if text.strip() in ('馬場', 'ハイレベル', '特注馬'):
+        img_msgs = command_images(text.strip(), uid, base)
+        if img_msgs:
+            return img_msgs, None
     cr = command_reply(text, uid)
     if not cr and not ('netkeiba.com' in text or re.fullmatch(r'\d{12}', text.strip())):
         sess = get_session(uid)
