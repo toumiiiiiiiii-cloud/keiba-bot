@@ -1157,6 +1157,17 @@ def sire_tab(race, h, lookup):
     return {k: (lookup(v) if v else 0.0) for k, v in sire_keys(race, h).items()}
 
 
+DEBUT_BLOOD_K = 3.0       # 新馬戦の血統の効き（ふだんの何倍か）
+BLOOD_KEYS = {'sireSurf', 'sireDist', 'sireWet', 'dsireSurf', 'sireNewSurf', 'toTurfSire', 'toDirtSire'}
+
+
+def is_debut_race(race, arr):
+    """新馬戦か（レース名に「新馬」、または出走馬がみんな初出走）"""
+    if '新馬' in (race.get('name') or '') or '新馬' in (race.get('condText') or ''):
+        return True
+    return bool(arr) and all(not [l for l in (h.get('career') or h.get('lines') or []) if l.get('pos')] for h in arr)
+
+
 def apply_model(race, arr, odds):
     """オッズ＋AIの勝率に置き換える。置き換えたら True"""
     if not MODEL or os.environ.get('SYH_BACKTEST') or race.get('abroad'):
@@ -1196,6 +1207,9 @@ def apply_model(race, arr, odds):
         bset = set(bst.get('names', []))
         beta = [b * bst['k'] if n in bset else b for n, b in zip(names, beta)]
     beta = [b * ODDS_W if n == 'log_market' else b * AI_W for n, b in zip(names, beta)]   # オッズ・AIの材料の効き（Tomiさんの指定の割合）
+    if is_debut_race(race, arr):   # 新馬戦：走った記録が無いので、血統の効きを大きく上げる（Tomiさんの指定）
+        beta = [b * DEBUT_BLOOD_K if (n[:-2] if n.endswith('_r') else n) in BLOOD_KEYS else b for n, b in zip(names, beta)]
+        race['debutBlood'] = True
     for h in arr:
         h['pm'] = inv[h['n']] / tot
     zs, xs = [], []
@@ -1238,6 +1252,8 @@ def apply_model(race, arr, odds):
         h['ev'] = h['p'] * h['o'] if h.get('o') else None
     race['model'] = True
     race['modelNote'] = f"勝率＝オッズ＋AI（{MODEL.get('trained_range', '過去データ')}で学習）"
+    if race.get('debutBlood'):
+        race['modelNote'] += f"・新馬戦のため血統の効き×{DEBUT_BLOOD_K:g}"
     return True
 
 
