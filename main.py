@@ -3680,7 +3680,7 @@ def gold_frame(d, box, r=14, w=2):
 def render_image(race, arr):
     W, PAD = 1080, 36
     row_h = 96
-    brows = bet_rows_for(arr)
+    brows = bet_rows_for(arr, race)
     bet_h = 92 + bet_section_height(brows, W - PAD * 2 - 120) - 80   # 下の「box_h = 80 + bet_h」に合わせる
     LU_H = lineup_height(race)
     H = 610 + LU_H + 64 + row_h * len(arr) + 40 + 90 + bet_h + 120 + 22
@@ -3847,12 +3847,12 @@ SUB_W = {'本線': {'馬連': 0.30, 'ワイド': 0.30, '3連複': 0.25, '3連単
 SHOW_ALL_BETS = False     # 予想画像の買い目：False＝推奨の買い目だけ（ほかは「買い目」と送ると全部）
 
 
-def bet_rows_for(arr):
+def bet_rows_for(arr, race=None):
     """bet_plan を、画像に描くための行（1行＝1券種）に直す。先頭はイチ推しの1点"""
     rows = []
     if not SHOW_ALL_BETS:
         try:
-            recs = recommended_tickets(arr)
+            recs = recommended_tickets(arr, race)
         except Exception:
             traceback.print_exc()
             recs = []
@@ -6000,7 +6000,7 @@ def _roi_short(roi):
         return roi
 
 
-def recommended_tickets(arr):
+def recommended_tickets(arr, race=None):
     """本当に推奨する買い目だけ（2年分の確かめで回収率が良かった順）。馬券の画像にして送る
     ①イチ推し（期待値1.1以上の単勝）②ワイド◎-穴 ③3連複◎○-穴 ④3連単（本線）。①〜③が無いときは本線を1つ"""
     a = sorted(arr, key=lambda h: -h['p'])
@@ -6046,6 +6046,17 @@ def recommended_tickets(arr):
                          'why': why + (f"。2年の回収率 {roi}%" if roi else '')})
     tan = sanren_combos(a, '3連単')
     tr = BET_RULES.get('sanren_tan')
+    if not all('pRaw' in h for h in a) or 'nar.' in str((race or {}).get('base', '')):
+        # 地方競馬・オッズが無いレース（海外・前日など）：3連単は頭（1着）を◎1頭に固定 → 2着 ○▲△ → 3着 2〜6番手（12点）
+        if len(n) >= 6:
+            cols = [[n[0]], n[1:4], n[1:6]]
+            tan1 = _combos_from_cols('3連単', cols)
+            recs.append({'kind': '3連単', 'method': 'form', 'title': 'フォーメーション', 'labels': ['1着', '2着', '3着'],
+                         'cols': cols, 'combos': tan1, 'badge': '本線', 'hit': sum(combo_prob('3連単', c, pa) for c in tan1),
+                         'note': '地方・オッズ無しは1着◎固定',
+                         'why': f"3連単 {n[0]} → {','.join(map(str, cols[1]))} → {','.join(map(str, cols[2]))}"
+                                f"（{len(tan1)}点・地方／オッズが無いレースは1着を◎1頭に固定）"})
+        tan, tr = [], None
     if tan and tr:
         cols = _prune_cols('3連単', tan_cols(a, n, tr), tan)
         recs.append({'kind': '3連単', 'method': 'form', 'title': 'フォーメーション', 'labels': ['1着', '2着', '3着'],
@@ -6454,7 +6465,7 @@ def _build_prediction(text, base):
             raise RuntimeError('サーバー起動直後で画像用の文字データを準備中です。1〜2分後にもう一度送ってください')
         messages = []
         try:
-            recs = recommended_tickets(arr)[:2]
+            recs = recommended_tickets(arr, race)[:2]
         except Exception:
             traceback.print_exc()
             recs = []
