@@ -1158,6 +1158,14 @@ def sire_tab(race, h, lookup):
 
 
 DEBUT_BLOOD_K = 3.0       # 新馬戦の血統の効き（ふだんの何倍か）
+TWO_YO_BLOOD_K = 2.0      # 2歳戦（新馬戦以外）
+SURF_CHG_BLOOD_K = 3.0    # ダート→芝・芝→ダートに替わる馬
+
+
+def surf_changed(race, h):
+    """前走と今回で芝・ダートが替わる馬か（障害は除く）"""
+    car = [l for l in (h.get('career') or h.get('lines') or []) if l.get('pos') and str(l.get('dist', ''))[:1] in ('芝', 'ダ')]
+    return bool(car) and race.get('surf') in ('芝', 'ダ') and str(car[0]['dist'])[:1] != race['surf']
 BLOOD_KEYS = {'sireSurf', 'sireDist', 'sireWet', 'dsireSurf', 'sireNewSurf', 'toTurfSire', 'toDirtSire'}
 
 
@@ -1207,16 +1215,22 @@ def apply_model(race, arr, odds):
         bset = set(bst.get('names', []))
         beta = [b * bst['k'] if n in bset else b for n, b in zip(names, beta)]
     beta = [b * ODDS_W if n == 'log_market' else b * AI_W for n, b in zip(names, beta)]   # オッズ・AIの材料の効き（Tomiさんの指定の割合）
-    if is_debut_race(race, arr):   # 新馬戦：走った記録が無いので、血統の効きを大きく上げる（Tomiさんの指定）
-        beta = [b * DEBUT_BLOOD_K if (n[:-2] if n.endswith('_r') else n) in BLOOD_KEYS else b for n, b in zip(names, beta)]
-        race['debutBlood'] = True
+    # 血統の効きを上げる場面（Tomiさんの指定）：新馬戦×3／2歳戦×2／ダート→芝・芝→ダートに替わる馬×3（その馬だけ）
+    race_k = 1.0
+    if is_debut_race(race, arr):
+        race_k, race['bloodNote'] = DEBUT_BLOOD_K, f'新馬戦のため血統の効き×{DEBUT_BLOOD_K:g}'
+    elif re.search(r'2歳', (race.get('name') or '') + (race.get('condText') or '')):
+        race_k, race['bloodNote'] = TWO_YO_BLOOD_K, f'2歳戦のため血統の効き×{TWO_YO_BLOOD_K:g}'
+    is_blood = [(n[:-2] if n.endswith('_r') else n) in BLOOD_KEYS for n in names]
     for h in arr:
         h['pm'] = inv[h['n']] / tot
     zs, xs = [], []
     for h, row in zip(arr, rows):
         x = [math.log(inv[h['n']] / tot)] + [row.get(n, 0.0) for n in names[1:]]
         xs.append(x)
-        zs.append(sum(b * (v - m) / s for b, v, m, s in zip(beta, x, mean, std)))
+        k_ = max(race_k, SURF_CHG_BLOOD_K if surf_changed(race, h) else 1.0)
+        h['bloodK'] = k_
+        zs.append(sum((b * k_ if bl else b) * (v - m) / s for b, v, m, s, bl in zip(beta, x, mean, std, is_blood)))
     try:
         pn = (MODEL.get('place') or {}).get('names')
         if pn:      # 2・3着の見込みは、勝つ見込みとは別の材料（堅実度など）も使える
@@ -1252,8 +1266,10 @@ def apply_model(race, arr, odds):
         h['ev'] = h['p'] * h['o'] if h.get('o') else None
     race['model'] = True
     race['modelNote'] = f"勝率＝オッズ＋AI（{MODEL.get('trained_range', '過去データ')}で学習）"
-    if race.get('debutBlood'):
-        race['modelNote'] += f"・新馬戦のため血統の効き×{DEBUT_BLOOD_K:g}"
+    if race.get('bloodNote'):
+        race['modelNote'] += '・' + race['bloodNote']
+    if any(h.get('bloodK', 1) > race_k for h in arr):
+        race['modelNote'] += f'・芝ダ替わりの馬は血統の効き×{SURF_CHG_BLOOD_K:g}'
     return True
 
 
