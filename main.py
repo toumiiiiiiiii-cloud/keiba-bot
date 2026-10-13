@@ -1225,7 +1225,8 @@ def apply_model(race, arr, odds):
         za = []
         for h, row in zip(arr, rows):
             xa = [math.log(inv[h['n']] / tot)] + [row.get(n, 0.0) for n in an_['names'][1:]]
-            za.append(sum(b * (v - m) / (s or 1) for b, v, m, s in zip(an_['beta'], xa, an_['mean'], an_['std'])))
+            za.append(sum(b * (v - m) / s for b, v, m, s in zip(an_['beta'], xa, an_['mean'], an_['std'])
+                          if s and s > 1e-6))      # 学習時に全部同じ値だった材料（血統など）は使わない
         for h, v in zip(arr, _soft(za)):
             h['pAna'] = v
     zmax = max(zs)
