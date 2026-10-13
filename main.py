@@ -1306,6 +1306,37 @@ def _today_band(race):
     return cached(('band', rid), 300, load)
 
 
+TROUBLE = {}
+try:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'trouble.json'), encoding='utf-8') as _f:
+        _tj = json.load(_f)
+    for _nm, _lst in _tj.get('horses', {}).items():
+        for _e in _lst:
+            TROUBLE[(_e['d'], _e['venue'], int(_e['R']), int(_e['n']))] = dict(_e, name=_nm)
+    print(f"[trouble] JRA発表の不利・競走中の疾病：{len(TROUBLE)}件（更新 {_tj.get('updated', '')}）", flush=True)
+except Exception:
+    TROUBLE = {}
+
+
+def trouble_of(h):
+    """前走・2走前がJRA発表の不利（進路が狭くなった等）・競走中の疾病のレースなら (その走, 内容, 何走前)"""
+    if not TROUBLE:
+        return None
+    car = [l for l in (h.get('career') or h.get('lines') or []) if l.get('d')][:2]
+    for k, l in enumerate(car):
+        rid = str(l.get('rid') or '')
+        try:
+            R = int(rid[-2:]) if len(rid) >= 12 else None
+        except ValueError:
+            R = None
+        if R is None or not l.get('n'):
+            continue
+        e = TROUBLE.get((l['d'], l.get('p'), R, int(l['n'])))
+        if e:
+            return l, e, k
+    return None
+
+
 def manual_boost(race, arr):
     if not arr:
         return False
@@ -1409,6 +1440,18 @@ def manual_boost(race, arr):
             adj += add(0.04, '単騎で逃げられそう', 0, 0.04)
         elif h.get('bPos', 0) < 0:
             adj += add(-0.04, 'ハナ争いで苦しい', -0.04, 0)
+        # ⑧ JRA発表の不利（前走・2走前で進路が狭くなった・接触した馬は、その着順を割り引いて見る）
+        tr_ = trouble_of(h)
+        if tr_:
+            l_, e_, k_ = tr_
+            wv = 0.10 if k_ == 0 else 0.05
+            if '心房細動' in e_['type']:
+                wv *= 0.6
+            elif '競走中に' in e_['type']:
+                wv = 0.0          # 鼻出血・骨折などは割り引かない（短評にだけ書く）
+            ago = '前走' if k_ == 0 else '2走前'
+            adj += add(wv, f"{ago}{short_date(l_['d'])}{l_['p']}は{e_['type']}（JRA発表・{l_.get('pos')}着）", 0.0, 0.10)
+            h['troubleNote'] = f"{ago}{short_date(l_['d'])}{l_['p']}{e_.get('R')}R：{e_['type']}（JRA発表）"
         # ⑦ オッズとの食い違い（人気と、オッズ抜きの実力評価がずれていたら疑う）
         pai, pm = h.get('pAI'), h.get('pm')
         if pai and pm:
@@ -4116,6 +4159,9 @@ def make_reasons(race, h):
     R.append(('総合評価', f"ランク{h['rank']}・スコア×{h['a']:.3f}（勝率{h['p'] * 100:.1f}%）。"
               f"過去レース「{LBL['lv'][h['lv'] - 1]}」／近走「{LBL['form'][h['form'] - 1]}」／"
               f"適性「{LBL['fit'][h['fit'] - 1]}」／騎手・条件「{LBL['jk'][h['jk'] - 1]}」"))
+    if h.get('troubleNote'):
+        R.append(('JRA発表の出来事', h['troubleNote'] + ('。着順は割り引いて評価' if '競走中に' not in h['troubleNote']
+                                                          or '心房細動' in h['troubleNote'] else '')))
 
     cls_now = CLS[race['clsIdx']][0]
     if h['isNew']:
