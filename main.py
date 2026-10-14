@@ -6239,10 +6239,24 @@ except Exception:
     WIN5_RULES = {}
 
 
-def win5_leg(arr):
+WIN5_VALUE_MIN = 10000     # 配当重視にするのは予算1万円から（学習：1万円・3万円は3年とも収支が良く、5,000円以下はまちまち）
+
+
+def win5_gamma(text, budget):
+    """配当重視の強さ。「高配当」→いつも配当重視、「堅め」→当たりやすさだけ、ふつうは予算1万円から配当重視"""
+    gm = float(WIN5_RULES.get('gamma') or 0.0)
+    t = unicodedata.normalize('NFKC', text or '')
+    if '高配当' in t or '穴' in t:
+        return gm
+    if re.search(r'堅|かため|カタメ', t):
+        return 0.0
+    return gm if budget >= WIN5_VALUE_MIN else 0.0
+
+
+def win5_leg(arr, gm=None):
     """WIN5用の勝率（温度で補正）と、選ぶ順番（配当重視：勝率×人気薄の分）。h['p5']に入れて、選ぶ順に並べた馬を返す"""
     T = float(WIN5_RULES.get('T') or 1.0)
-    gm = float(WIN5_RULES.get('gamma') or 0.0)
+    gm = float(WIN5_RULES.get('gamma') or 0.0) if gm is None else gm
     w = [max(h['p'], 1e-9) ** (1 / T) for h in arr]
     s = sum(w)
     for h, x in zip(arr, w):
@@ -6254,13 +6268,13 @@ def win5_leg(arr):
     return sorted(arr, key=lambda h: -h['v5'])
 
 
-def win5_plan(legs, P):
+def win5_plan(legs, P, gm=None):
     """点数P以内で、5レースの頭数を決める。学習の結果、当たりやすさ（勝率）に人気薄の配当の分も少し足して選ぶ
     返す：(5つとも当たる見込み, 各レースの頭数, 点数, 各レースで選んだ馬)"""
     from itertools import product as _prod
     orders, cumv = [], []
     for arr in legs:
-        o = win5_leg(arr)[:10]
+        o = win5_leg(arr, gm)[:10]
         orders.append(o)
         c, s = [0.0], 0.0
         for h in o:
@@ -6399,10 +6413,11 @@ def win5_pop(result, i, arr):
     return (wh or {}).get('popNow')
 
 
-def win5_text(legs, ks, pts, hit, budget, result=None, past=False, sel=None):
+def win5_text(legs, ks, pts, hit, budget, result=None, past=False, sel=None, gm=0.0):
     L = [f"🎯 WIN5　{pts}点×100円＝{pts * 100:,}円（予算{budget:,}円）",
          f"5つとも当たる見込み 約{hit * 100:.1f}%（AIの勝率から）",
-         "※過去2年半のWIN5の答え合わせから学んだ買い方（勝率を少し尖らせ、人気薄の配当の分も少し足して選ぶ）"]
+         ("※買い方：配当重視（人気薄の配当の分も少し足して選ぶ。過去のWIN5で予算1万円以上は3年とも収支が良かった形）" if gm else
+          "※買い方：当たりやすさ重視（過去のWIN5で予算5,000円以下はこちらが良かった。「高配当」と付けると配当重視）")]
     if past:
         L.append('※過去のWIN5：そのレースの日より前の成績だけで予想しています（騎手の成績などは今の数字）')
     for i, ((race, arr), k) in enumerate(zip(legs, ks)):
@@ -6440,7 +6455,7 @@ def win5_text(legs, ks, pts, hit, budget, result=None, past=False, sel=None):
                  f"　実際の払戻 {result['pay'] or '―'}（的中{result['votes'] or '―'}）")
         if nh == 5 and result['pay']:
             L.append(f"　→ {pts * 100:,}円が {result['pay']} に")
-    L.append('※「WIN5 5000円」のように予算を変えると、点数を増やして当たりやすくします。'
+    L.append('※「WIN5 5000円」のように予算を変えると、点数を増やして当たりやすくします（1万円からは配当重視。「堅め」「高配当」でも選べます）。'
              '「WIN5 10/4 3000円」のように日付を入れると、過去のWIN5も予想して答え合わせします')
     return '\n'.join(L)
 
@@ -6524,7 +6539,8 @@ def win5_messages(text, base):
             WIN5_LEGS.pop(dkey, None)
         return [TextSendMessage(text="WIN5の対象レースのうち、出馬表を読めないレースがありました（枠順の確定前かもしれません）。"
                                      "レースの前日の夕方以降にもう一度送ってください")]
-    b = win5_plan([arr for _, arr in legs], P)
+    gm = win5_gamma(text, budget)
+    b = win5_plan([arr for _, arr in legs], P, gm)
     if not b:
         return [TextSendMessage(text="買い目を作れませんでした")]
     hit, ks, pts, sel = b
@@ -6536,7 +6552,7 @@ def win5_messages(text, base):
             msgs.append(ImageSendMessage(original_content_url=f"{base}/img/{key}.png", preview_image_url=f"{base}/img/{key}_pv.jpg"))
     except Exception:
         traceback.print_exc()
-    msgs.append(TextSendMessage(text=win5_text(legs, ks, pts, hit, budget, result, past=bool(result), sel=sel)[:4900]))
+    msgs.append(TextSendMessage(text=win5_text(legs, ks, pts, hit, budget, result, past=bool(result), sel=sel, gm=gm)[:4900]))
     return msgs
 
 
