@@ -6225,8 +6225,10 @@ def fetch_win5(date=None):
     if m:
         pay = re.search(r'払戻金 (\S+?円)', txt)
         votes = re.search(r'的中票数 (\S+?票)', txt)
+        pops = re.search(r'的中馬番 (?:\d+ ){5}((?:\d+人気 ?){5})', txt)
         res = {'win': [int(x) for x in m.group(1).split()], 'pay': pay.group(1) if pay else '',
-               'votes': votes.group(1) if votes else ''}
+               'votes': votes.group(1) if votes else '',
+               'pop': [int(x) for x in re.findall(r'(\d+)人気', pops.group(1))] if pops else []}
     return ids[:5], res
 
 
@@ -6355,6 +6357,10 @@ def render_win5_image(legs, ks, pts, hit, budget, result=None, sel=None):
             wn = result['win'][i]
             ok = wn in [h['n'] for h in picks]
             d.rectangle((x0 + 3, top + 486, x0 + colw - 3, top + 537), fill=(214, 60, 70) if ok else (120, 126, 140))
+            pp = win5_pop(result, i, arr)
+            if pp:
+                ctext(d, x0 + colw / 2, top + 414, f"勝ち馬は{pp}番人気", F('sans_b', 24),
+                      (214, 60, 70) if ok else (90, 100, 120))
             ctext(d, x0 + colw / 2, top + 490, f"勝ち{wn}番 {'的中' if ok else 'ハズレ'}", F('sans_b', 28), (255, 255, 255))
         else:
             ctext(d, x0 + colw / 2, top + 490, _leg_label(max(arr, key=lambda h: h['p'])), F('sans_r', 24), (90, 100, 120))
@@ -6384,6 +6390,15 @@ def render_win5_image(legs, ks, pts, hit, budget, result=None, sel=None):
     return img
 
 
+def win5_pop(result, i, arr):
+    """WIN5の勝ち馬が何番人気だったか（netkeibaの結果から。無ければオッズの順）"""
+    pops = (result or {}).get('pop') or []
+    if i < len(pops):
+        return pops[i]
+    wh = next((h for h in arr if h['n'] == result['win'][i]), None)
+    return (wh or {}).get('popNow')
+
+
 def win5_text(legs, ks, pts, hit, budget, result=None, past=False, sel=None):
     L = [f"🎯 WIN5　{pts}点×100円＝{pts * 100:,}円（予算{budget:,}円）",
          f"5つとも当たる見込み 約{hit * 100:.1f}%（AIの勝率から）",
@@ -6403,7 +6418,8 @@ def win5_text(legs, ks, pts, hit, budget, result=None, past=False, sel=None):
             wn = result['win'][i]
             wh = next((h for h in arr if h['n'] == wn), None)
             rk = sorted(arr, key=lambda h: -h['p']).index(wh) + 1 if wh else 0
-            L.append(f"　→ 勝ち {wn}番{wh['name'] if wh else ''}（AIの{rk}番手）"
+            pp = win5_pop(result, i, arr)
+            L.append(f"　→ 勝ち {wn}番{wh['name'] if wh else ''}（{f'{pp}番人気・' if pp else ''}AIの{rk}番手）"
                      f"{'⭕的中' if wn in [h['n'] for h in picks] else '❌ハズレ'}")
     L.append('')
     L.append('買い目：' + ' ／ '.join(f"{i + 1}レース目 " + ','.join(str(h['n']) for h in sel[i]) for i in range(len(legs))))
@@ -6418,6 +6434,8 @@ def win5_text(legs, ks, pts, hit, budget, result=None, past=False, sel=None):
     if result:
         nh = sum(1 for i in range(len(legs)) if result['win'][i] in [h['n'] for h in sel[i]])
         L.append('')
+        L.append('勝ち馬：' + ' → '.join(f"{result['win'][i]}番" + (f"（{win5_pop(result, i, arr)}番人気）" if win5_pop(result, i, arr) else '')
+                                       for i, (_, arr) in enumerate(legs)))
         L.append(f"【答え合わせ】{'🎉WIN5 的中！' if nh == 5 else f'5レース中{nh}レース的中'}"
                  f"　実際の払戻 {result['pay'] or '―'}（的中{result['votes'] or '―'}）")
         if nh == 5 and result['pay']:
