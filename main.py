@@ -6367,29 +6367,71 @@ def win5_text(legs, ks, pts, hit, budget, result=None, past=False):
     return '\n'.join(L)
 
 
+WIN5_LEGS = {}          # {日付キー: (保存時刻, ids, result, legs)}  5レースの予想を覚えておく（予算を変えても作り直さない）
+WIN5_JOBS = {}          # {日付キー: 'running'}
+WIN5_LOCK = threading.Lock()
+WIN5_TTL = 20 * 60
+
+
+def _win5_build(dkey, date):
+    """裏で5レースを予想して覚えておく（同時に重くならないよう、2レースずつ）"""
+    try:
+        ids, result = fetch_win5(date)
+        legs = None
+        if len(ids) >= 5:
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                res = list(ex.map(lambda r: _safe(analyze, r) or (None, 'エラー'), ids))
+            legs = [r for r, err in res if r and not err]
+            if len(legs) < 5:
+                legs = 'bad'
+        with WIN5_LOCK:
+            WIN5_LEGS[dkey] = (time.time(), ids, result, legs)
+    except Exception as e:
+        traceback.print_exc()
+        with WIN5_LOCK:
+            WIN5_LEGS[dkey] = (time.time(), [], None, f'err:{e}')
+    finally:
+        with WIN5_LOCK:
+            WIN5_JOBS.pop(dkey, None)
+        import gc
+        gc.collect()
+
+
 def win5_messages(text, base):
+    """5レースの予想は1〜2分かかり、LINEの返信の期限に間に合わないことがあるので、
+    1回目は「予想中」と返して裏で作る。もう一度同じメッセージを送ると、できた予想を返す"""
     budget, _ = win5_budget(text)
     date, _ = win5_date(text)
     P = max(1, budget // 100)
-    try:
-        ids, result = fetch_win5(date)
-    except Exception as e:
-        return [TextSendMessage(text=f"WIN5の対象レースを読み取れませんでした（{e}）")]
+    dkey = date.isoformat() if date else 'this-week'
+    with WIN5_LOCK:
+        for k in [k for k, v in WIN5_LEGS.items() if time.time() - v[0] > WIN5_TTL]:
+            WIN5_LEGS.pop(k, None)
+        hit_ = WIN5_LEGS.get(dkey)
+        running = dkey in WIN5_JOBS
+        if not hit_ and not running:
+            WIN5_JOBS[dkey] = 'running'
+            threading.Thread(target=_win5_build, args=(dkey, date), daemon=True).start()
+    when = f"{date.month}月{date.day}日の" if date else '今週の'
+    if not hit_:
+        return [TextSendMessage(text=f"🎯 {when}WIN5を予想しています（5レース分で1〜2分かかります）。\n"
+                                     f"1〜2分たったら、もう一度「{text.strip()}」と送ってください。できた予想をお送りします")]
+    _, ids, result, legs = hit_
+    if isinstance(legs, str) and legs.startswith('err:'):
+        with WIN5_LOCK:
+            WIN5_LEGS.pop(dkey, None)
+        return [TextSendMessage(text=f"WIN5の対象レースを読み取れませんでした（{legs[4:]}）。もう一度送ってください")]
     if len(ids) < 5:
+        with WIN5_LOCK:
+            WIN5_LEGS.pop(dkey, None)
         if date:
             sun = date + datetime.timedelta(days=(6 - date.weekday()) % 7)
             return [TextSendMessage(text=f"{date.month}月{date.day}日はWIN5がありません。WIN5はふつう日曜です"
                                          f"（例：「WIN5 {sun.month}/{sun.day} 3000円」）")]
         return [TextSendMessage(text="今週のWIN5の対象レースがまだ発表されていません（ふつうは金曜に決まります）")]
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        res = list(ex.map(lambda r: _safe(analyze, r) or (None, 'エラー'), ids))
-    legs, bad = [], []
-    for rid, (r, err) in zip(ids, res):
-        if err or not r:
-            bad.append(rid)
-        else:
-            legs.append(r)
-    if bad:
+    if legs == 'bad' or not legs:
+        with WIN5_LOCK:
+            WIN5_LEGS.pop(dkey, None)
         return [TextSendMessage(text="WIN5の対象レースのうち、出馬表を読めないレースがありました（枠順の確定前かもしれません）。"
                                      "レースの前日の夕方以降にもう一度送ってください")]
     b = win5_plan([arr for _, arr in legs], P)
