@@ -6230,38 +6230,92 @@ def fetch_win5(date=None):
     return ids[:5], res
 
 
+try:   # WIN5の学習結果（2024〜2026年のWIN5を答えを知らない状態で予想して学んだもの）
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'win5_rules.json'), encoding='utf-8') as _f:
+        WIN5_RULES = json.load(_f)
+except Exception:
+    WIN5_RULES = {}
+
+
+def win5_leg(arr):
+    """WIN5用の勝率（温度で補正）と、選ぶ順番（配当重視：勝率×人気薄の分）。h['p5']に入れて、選ぶ順に並べた馬を返す"""
+    T = float(WIN5_RULES.get('T') or 1.0)
+    gm = float(WIN5_RULES.get('gamma') or 0.0)
+    w = [max(h['p'], 1e-9) ** (1 / T) for h in arr]
+    s = sum(w)
+    for h, x in zip(arr, w):
+        h['p5'] = x / s
+    if not all(h.get('pm') for h in arr):
+        gm = 0.0                     # オッズが無いときは当たりやすさだけで選ぶ
+    for h in arr:
+        h['v5'] = h['p5'] * (h['pm'] ** -gm if gm else 1.0)
+    return sorted(arr, key=lambda h: -h['v5'])
+
+
 def win5_plan(legs, P):
-    """各レースの勝率（高い順）から、点数P以内で5つとも当たる見込みが一番高い頭数の組み合わせ"""
+    """点数P以内で、5レースの頭数を決める。学習の結果、当たりやすさ（勝率）に人気薄の配当の分も少し足して選ぶ
+    返す：(5つとも当たる見込み, 各レースの頭数, 点数, 各レースで選んだ馬)"""
     from itertools import product as _prod
-    cum = []
+    orders, cumv = [], []
     for arr in legs:
-        ps = sorted((max(0.0, h['p']) for h in arr), reverse=True)
+        o = win5_leg(arr)[:10]
+        orders.append(o)
         c, s = [0.0], 0.0
-        for x in ps[:10]:
-            s += x
+        for h in o:
+            s += h['v5']
             c.append(s)
-        cum.append(c)
+        cumv.append(c)
     best = None
-    rngs = [range(1, len(c)) for c in cum]
-    for ks in _prod(*rngs):
+    for ks in _prod(*[range(1, len(c)) for c in cumv]):
         pts = 1
         for k in ks:
             pts *= k
         if pts > P:
             continue
-        pr = 1.0
-        for k, c in zip(ks, cum):
-            pr *= c[k]
-        if not best or pr > best[0] + 1e-12 or (abs(pr - best[0]) < 1e-12 and pts < best[2]):
-            best = (pr, ks, pts)
-    return best
+        val = 1.0
+        for k, c in zip(ks, cumv):
+            val *= c[k]
+        if not best or val > best[0] + 1e-15 or (abs(val - best[0]) < 1e-15 and pts < best[2]):
+            best = (val, ks, pts)
+    if not best:
+        return None
+    _, ks, pts = best
+    sel = [sorted(o[:k], key=lambda h: -h['p']) for o, k in zip(orders, ks)]
+    hit = 1.0
+    for ss in sel:
+        hit *= sum(h['p5'] for h in ss)
+    return hit, ks, pts, sel
+
+
+def win5_pay_estimate(sel):
+    """当たったときのふつうの配当の目安（100円あたり）。学習した式：e^a ×（勝ち馬の「1÷オッズの勝率」の掛け算）^b
+    返す：(当たったときの平均の目安, AIの1番手が5つとも勝ったときの目安)。オッズが無ければ None"""
+    pm_ = WIN5_RULES.get('pay_model')
+    if not pm_ or not all(h.get('pm') for ss in sel for h in ss):
+        return None
+    a, b = pm_['a'], pm_['b']
+    lg = 0.0     # 当たり方の見込みで重みをつけた「ふつうの配当」（平均だと人気薄の大きな配当に引っぱられすぎるため）
+    for ss in sel:
+        sp = sum(h['p5'] for h in ss)
+        lg += sum(h['p5'] * -b * math.log(h['pm']) for h in ss) / sp
+    return 100 * math.exp(a + lg)
+
+
+def win5_fav_pay(legs):
+    pm_ = WIN5_RULES.get('pay_model')
+    if not pm_ or not all(h.get('pm') for arr in legs for h in arr):
+        return None
+    v = 1.0
+    for arr in legs:
+        v *= max(arr, key=lambda h: h['p'])['pm'] ** -pm_['b']
+    return 100 * math.exp(pm_['a']) * v
 
 
 def _leg_label(h):
     return '堅い' if h['p'] >= 0.4 else '本命有力' if h['p'] >= 0.28 else '混戦' if h['p'] >= 0.18 else '大混戦'
 
 
-def render_win5_image(legs, ks, pts, hit, budget, result=None):
+def render_win5_image(legs, ks, pts, hit, budget, result=None, sel=None):
     """WIN5の買い目カード（実際の馬券ではないことを明記）"""
     W, H = 1280, 860
     BG_, LINE_, INK, ACC = (244, 248, 255), (176, 196, 236), (24, 24, 24), (40, 90, 190)
@@ -6285,7 +6339,7 @@ def render_win5_image(legs, ks, pts, hit, budget, result=None):
         ctext(d, x0 + colw / 2, top + 4, f'{i + 1}レース', F('sans_b', 28), (255, 255, 255))
         ctext(d, x0 + colw / 2, top + 54, f"{race['venue']}{race['R']}R", F('sans_b', 32), INK)
         ctext(d, x0 + colw / 2, top + 96, fit_text(d, race['name'], F('sans_r', 22), colw - 16), F('sans_r', 22), INK)
-        picks = sorted(arr, key=lambda h: -h['p'])[:k]
+        picks = sel[i] if sel else sorted(arr, key=lambda h: -h['p'])[:k]
         per_row = 1 if k == 1 else 2 if k <= 6 else 3
         bsz = 110 if k == 1 else 64 if k <= 6 else 54
         gx = x0 + (colw - (per_row * (bsz + 10) - 10)) / 2
@@ -6295,7 +6349,7 @@ def render_win5_image(legs, ks, pts, hit, budget, result=None):
             d.rectangle((bx, by, bx + bsz, by + bsz), fill=(255, 255, 255), outline=INK, width=4 if k == 1 else 3)
             fs = 80 if k == 1 else 44 if k <= 6 else 36
             ctext(d, bx + bsz / 2, by + (bsz - fs) / 2 - 8, str(h['n']), F('sans_b', fs), INK)
-        cov = sum(h['p'] for h in picks)
+        cov = sum(h.get('p5', h['p']) for h in picks)
         ctext(d, x0 + colw / 2, top + 452, f'{k}頭・カバー{cov * 100:.0f}%', F('sans_b', 24), ACC)
         if result:
             wn = result['win'][i]
@@ -6303,7 +6357,7 @@ def render_win5_image(legs, ks, pts, hit, budget, result=None):
             d.rectangle((x0 + 3, top + 486, x0 + colw - 3, top + 537), fill=(214, 60, 70) if ok else (120, 126, 140))
             ctext(d, x0 + colw / 2, top + 490, f"勝ち{wn}番 {'的中' if ok else 'ハズレ'}", F('sans_b', 28), (255, 255, 255))
         else:
-            ctext(d, x0 + colw / 2, top + 490, _leg_label(picks[0]), F('sans_r', 24), (90, 100, 120))
+            ctext(d, x0 + colw / 2, top + 490, _leg_label(max(arr, key=lambda h: h['p'])), F('sans_r', 24), (90, 100, 120))
         if result and ok:
             for j, h in enumerate(picks[:12]):
                 if h['n'] == wn:
@@ -6317,8 +6371,7 @@ def render_win5_image(legs, ks, pts, hit, budget, result=None):
     d.text((40, yb + 52), '合計', font=f2, fill=INK)
     d.text((240, yb + 48), f'{pts * 100:,}円', font=f3, fill=INK)
     if result:
-        nh = sum(1 for i, ((race, arr), k) in enumerate(zip(legs, ks))
-                 if result['win'][i] in [h['n'] for h in sorted(arr, key=lambda h: -h['p'])[:k]])
+        nh = sum(1 for i in range(len(legs)) if result['win'][i] in [h['n'] for h in sel[i]])
         if nh == 5:
             d.text((620, yb - 6), f"WIN5 的中！ 払戻 {result['pay']}", font=F('sans_b', 40), fill=(214, 60, 70))
         else:
@@ -6331,20 +6384,20 @@ def render_win5_image(legs, ks, pts, hit, budget, result=None):
     return img
 
 
-def win5_text(legs, ks, pts, hit, budget, result=None, past=False):
+def win5_text(legs, ks, pts, hit, budget, result=None, past=False, sel=None):
     L = [f"🎯 WIN5　{pts}点×100円＝{pts * 100:,}円（予算{budget:,}円）",
-         f"5つとも当たる見込み 約{hit * 100:.1f}%（AIの勝率から）"]
+         f"5つとも当たる見込み 約{hit * 100:.1f}%（AIの勝率から）",
+         "※過去2年半のWIN5の答え合わせから学んだ買い方（勝率を少し尖らせ、人気薄の配当の分も少し足して選ぶ）"]
     if past:
         L.append('※過去のWIN5：そのレースの日より前の成績だけで予想しています（騎手の成績などは今の数字）')
-    pay = 1.0
     for i, ((race, arr), k) in enumerate(zip(legs, ks)):
-        picks = sorted(arr, key=lambda h: -h['p'])[:k]
-        top = picks[0]
+        picks = sel[i]
+        top = max(arr, key=lambda h: h['p'])
         mk = {h['n']: MARKS[j] for j, h in enumerate(arr[:len(MARKS)])}
         L.append('')
         L.append(f"{i + 1}レース {race['venue']}{race['R']}R {race['name']}（{race['surf']}{race['dist']}m・{len(arr)}頭）"
                  f"…{_leg_label(top)}")
-        L.append('　' + '、'.join(f"{mk.get(h['n'], '')}{h['n']}{h['name']}({h['p'] * 100:.0f}%)" for h in picks[:8])
+        L.append('　' + '、'.join(f"{mk.get(h['n'], '')}{h['n']}{h['name']}({h.get('p5', h['p']) * 100:.0f}%)" for h in picks[:8])
                  + (' ほか' if k > 8 else ''))
         if result:
             wn = result['win'][i]
@@ -6352,16 +6405,18 @@ def win5_text(legs, ks, pts, hit, budget, result=None, past=False):
             rk = sorted(arr, key=lambda h: -h['p']).index(wh) + 1 if wh else 0
             L.append(f"　→ 勝ち {wn}番{wh['name'] if wh else ''}（AIの{rk}番手）"
                      f"{'⭕的中' if wn in [h['n'] for h in picks] else '❌ハズレ'}")
-        if top.get('o'):
-            pay *= top['o']
     L.append('')
-    L.append('買い目：' + ' ／ '.join(f"{i + 1}レース目 " + ','.join(str(h['n']) for h in sorted(arr, key=lambda h: -h['p'])[:k])
-                                      for i, ((race, arr), k) in enumerate(zip(legs, ks))))
-    if pay > 1:
-        L.append(f"※AIの1番手が5つとも勝った場合の配当の目安：約{pay * 0.7 * 100:,.0f}円（単勝オッズの掛け算×0.7のざっくり計算）")
+    L.append('買い目：' + ' ／ '.join(f"{i + 1}レース目 " + ','.join(str(h['n']) for h in sel[i]) for i in range(len(legs))))
+    est = win5_pay_estimate(sel)
+    fav = win5_fav_pay([arr for _, arr in legs])
+    if est:
+        L.append(f"※当たったときの配当の目安：約{est:,.0f}円（100円あたり・選んだ馬の勝ちやすさで重みをつけた真ん中あたり）")
+    if fav:
+        L.append(f"※AIの1番手が5つとも勝った場合の配当の目安：約{fav:,.0f}円")
+    if est or fav:
+        L.append('　（過去のWIN5の払戻から学んだ式。実際はだいたい1.3〜1.4倍の幅でずれます）')
     if result:
-        nh = sum(1 for i, ((race, arr), k) in enumerate(zip(legs, ks))
-                 if result['win'][i] in [h['n'] for h in sorted(arr, key=lambda h: -h['p'])[:k]])
+        nh = sum(1 for i in range(len(legs)) if result['win'][i] in [h['n'] for h in sel[i]])
         L.append('')
         L.append(f"【答え合わせ】{'🎉WIN5 的中！' if nh == 5 else f'5レース中{nh}レース的中'}"
                  f"　実際の払戻 {result['pay'] or '―'}（的中{result['votes'] or '―'}）")
@@ -6454,16 +6509,16 @@ def win5_messages(text, base):
     b = win5_plan([arr for _, arr in legs], P)
     if not b:
         return [TextSendMessage(text="買い目を作れませんでした")]
-    hit, ks, pts = b
+    hit, ks, pts, sel = b
     msgs = []
     try:
         if fonts_ok(20):
             with _render_lock:
-                key = save_image(render_win5_image(legs, ks, pts, hit, budget, result))
+                key = save_image(render_win5_image(legs, ks, pts, hit, budget, result, sel))
             msgs.append(ImageSendMessage(original_content_url=f"{base}/img/{key}.png", preview_image_url=f"{base}/img/{key}_pv.jpg"))
     except Exception:
         traceback.print_exc()
-    msgs.append(TextSendMessage(text=win5_text(legs, ks, pts, hit, budget, result, past=bool(result))[:4900]))
+    msgs.append(TextSendMessage(text=win5_text(legs, ks, pts, hit, budget, result, past=bool(result), sel=sel)[:4900]))
     return msgs
 
 
