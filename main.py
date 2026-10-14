@@ -5561,6 +5561,11 @@ def callback():
 def handle_message(event):
     """LINEにはすぐ「受け取った」と返し、予想づくりは裏で行う"""
     text = event.message.text.strip()
+    dc = getattr(event, 'delivery_context', None)
+    if dc is not None and getattr(dc, 'is_redelivery', False):
+        # LINEの再送（サーバーが落ちていた間のメッセージ）は、返信できず重い処理だけ走るので無視する
+        print(f'[recv] 再送のため無視: {text[:80]}', flush=True)
+        return
     print(f'[recv] {text[:80]}', flush=True)
     base = public_base_url()
     uid = getattr(event.source, 'user_id', None) or 'anon'
@@ -6374,13 +6379,20 @@ WIN5_TTL = 20 * 60
 
 
 def _win5_build(dkey, date):
-    """裏で5レースを予想して覚えておく（同時に重くならないよう、2レースずつ）"""
+    """裏で5レースを予想して覚えておく（同時に重くならないよう、1レースずつ）"""
     try:
         ids, result = fetch_win5(date)
         legs = None
         if len(ids) >= 5:
-            with ThreadPoolExecutor(max_workers=2) as ex:
-                res = list(ex.map(lambda r: _safe(analyze, r) or (None, 'エラー'), ids))
+            import gc
+            res = []
+            for i, rid in enumerate(ids[:5]):   # 1レースずつ（メモリが足りずサーバーが落ちるのを防ぐ）
+                res.append(_safe(analyze, rid) or (None, 'エラー'))
+                print(f'[win5] {dkey} {i + 1}/5 できた', flush=True)
+                with WIN5_LOCK:
+                    if dkey in WIN5_JOBS:
+                        WIN5_JOBS[dkey] = i + 1
+                gc.collect()
             legs = [r for r, err in res if r and not err]
             if len(legs) < 5:
                 legs = 'bad'
@@ -6409,13 +6421,18 @@ def win5_messages(text, base):
             WIN5_LEGS.pop(k, None)
         hit_ = WIN5_LEGS.get(dkey)
         running = dkey in WIN5_JOBS
+        done_n = WIN5_JOBS.get(dkey) if running else None
         if not hit_ and not running:
             WIN5_JOBS[dkey] = 'running'
             threading.Thread(target=_win5_build, args=(dkey, date), daemon=True).start()
     when = f"{date.month}月{date.day}日の" if date else '今週の'
+    if not hit_ and running:
+        n_ = done_n if isinstance(done_n, int) else 0
+        return [TextSendMessage(text=f"⏳ {when}WIN5はまだ予想中です（5レース中{n_}レースできました）。\n"
+                                     f"1分ほどたったら、もう一度「{text.strip()}」と送ってください")]
     if not hit_:
-        return [TextSendMessage(text=f"🎯 {when}WIN5を予想しています（5レース分で1〜2分かかります）。\n"
-                                     f"1〜2分たったら、もう一度「{text.strip()}」と送ってください。できた予想をお送りします")]
+        return [TextSendMessage(text=f"🎯 {when}WIN5を予想しています（5レース分で2〜3分かかります）。\n"
+                                     f"2〜3分たったら、もう一度「{text.strip()}」と送ってください。できた予想をお送りします")]
     _, ids, result, legs = hit_
     if isinstance(legs, str) and legs.startswith('err:'):
         with WIN5_LOCK:
