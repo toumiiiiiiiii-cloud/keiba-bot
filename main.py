@@ -1469,6 +1469,11 @@ except Exception:
 def race_trend(race):
     nm = unicodedata.normalize('NFKC', race.get('name') or '')
     for t in RACE_TRENDS:
+        c = t.get('course')
+        if c:     # コースの傾向（例：新潟芝1000m）
+            if c.get('venue') == race.get('venue') and c.get('surf') == race.get('surf') and int(c.get('dist') or 0) == int(race.get('dist') or -1):
+                return t
+            continue
         if unicodedata.normalize('NFKC', t['name']) in nm and (not t.get('venue') or t['venue'] == race.get('venue')):
             return t
     return None
@@ -1520,6 +1525,21 @@ def trend_points(t, h):
     fr = t.get('front')
     if fr and (h.get('leadRate') or 0) >= 0.5:
         out.append((fr['v'], fr['note']))
+    ce = t.get('course_exp')
+    if ce:
+        past = [l for l in (h.get('career') or h.get('lines') or []) if l.get('p') == ce['p'] and l.get('dist') == ce['dist']]
+        if any(0 < (l.get('pos') or 99) <= 3 for l in past):
+            out.append((ce['top3_v'], ce['top3_note']))
+        elif past:
+            out.append((ce['no_top3_v'], ce['no_top3_note']))
+    jk = h.get('jockey') or ''
+    for k, (v, note) in (t.get('jockey') or {}).items():
+        if k and (jk == k or jk.startswith(k) or k.startswith(jk) and len(jk) >= 2):
+            out.append((v, note))
+            break
+    for k, (v, note) in (t.get('sex') or {}).items():
+        if h.get('sex') == k:
+            out.append((v, note))
     sl = t.get('sire_line')
     if sl and any(x in (h.get('sire') or '') for x in sl['names']):
         out.append((sl['v'], sl['note']))
