@@ -1517,7 +1517,7 @@ def trend_points(t, h):
             for p in t.get('prev_cls') or []:
                 if p['key'] == 'OP' and not grade and re.search(r'(?<![1-3]勝)(OP|オープン|S$|ステークス|L$)', rn):
                     out.append((p['v'], p['note'])); break
-                if p['key'] != 'OP' and p['key'] in rn:
+                if p['key'] != 'OP' and (p['key'] in rn or p['key'] == '1勝' and re.search(r'未勝利|新馬|500万', rn)):
                     out.append((p['v'], p['note'])); break
         for p in t.get('prev_venue') or []:
             if p['key'] in (prev.get('p') or ''):
@@ -1540,6 +1540,39 @@ def trend_points(t, h):
     for k, (v, note) in (t.get('sex') or {}).items():
         if h.get('sex') == k:
             out.append((v, note))
+    car = [l for l in (h.get('career') or h.get('lines') or []) if l.get('pos')]
+    if prev:
+        for p in t.get('prev_special') or []:
+            if p['key'] in (prev.get('r') or '') and (prev.get('pos') or 99) <= p.get('pos_max', 99) \
+                    and (not p.get('area') or p['area'] == h.get('area')):
+                out.append((p['v'], p['note']))
+        pc = t.get('prev_corner')
+        nums = [int(x) for x in re.findall(r'\d+', prev.get('ps') or '')]
+        if pc and nums:
+            out.append((pc['v'], pc['note']) if nums[-1] <= pc['max'] else (pc.get('else_v', 0), pc.get('else_note', '')))
+        pp = t.get('prev_pop')
+        if pp and prev.get('pop'):
+            if prev['pop'] == 1 and '1' in pp:
+                out.append(tuple(pp['1']))
+            elif prev['pop'] >= 10 and '10' in pp:
+                out.append(tuple(pp['10']))
+    de = t.get('dist_exp')
+    if de and car:
+        mx = max((int(re.sub(r'\D', '', l.get('dist') or '') or 0) for l in car), default=0)
+        if mx < de['min']:
+            out.append((de['v'], de['note']))
+    cm = t.get('career_min')
+    if cm and 0 < len(car) < cm['n']:
+        out.append((cm['v'], cm['note']))
+    for p in t.get('career_race') or []:
+        if any(re.search(p['key'], l.get('r') or '') and (l.get('pos') or 99) <= p['pos_max'] for l in car):
+            out.append((p['v'], p['note']))
+    jc = t.get('jockey_change')
+    if jc and h.get('change'):
+        out.append((jc['v'], jc['note']))
+    hv = (t.get('horse') or {}).get(h.get('name') or '')
+    if hv:
+        out.append(tuple(hv))
     sl = t.get('sire_line')
     if sl and any(x in (h.get('sire') or '') for x in sl['names']):
         out.append((sl['v'], sl['note']))
