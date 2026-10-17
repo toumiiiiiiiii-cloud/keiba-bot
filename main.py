@@ -1246,9 +1246,10 @@ def apply_model(race, arr, odds):
     if not MODEL or os.environ.get('SYH_BACKTEST') or race.get('abroad'):
         return False
     debut = is_debut_race(race, arr)     # 新馬戦はオッズを予想に入れない（血統と今の材料だけ。Tomiさんの指定）
+    no_odds = NO_ODDS_PREDICT or debut   # 予想（勝率・印）にオッズを使わない。オッズは期待値（実力とオッズのズレ）だけに使う
     have = [h for h in arr if odds.get(h['n'])]
     odds_ok = len(have) >= max(5, math.ceil(len(arr) * 0.8))
-    if not odds_ok and not debut:
+    if not odds_ok and not no_odds:
         race['modelNote'] = 'オッズ未発表のため、AIだけで計算'
         return False
     if have:
@@ -1258,6 +1259,9 @@ def apply_model(race, arr, odds):
         inv = {h['n']: 1.0 for h in arr}
     tot = sum(inv.values())
     names, mean, std, beta = MODEL['names'], MODEL['mean'], MODEL['std'], MODEL['beta']
+    use_noodds = no_odds and NOODDS_MODEL is not None
+    if use_noodds:     # オッズ抜きで学習した重み（材料ぜんぶ）
+        names, mean, std, beta = NOODDS_MODEL['names'], NOODDS_MODEL['mean'], NOODDS_MODEL['std'], NOODDS_MODEL['beta']
     jt = MODEL.get('jockey_bias', {})
     N = len(arr)
     for k, h in enumerate(sorted(arr, key=lambda h: odds.get(h['n']) or 9999), 1):
@@ -1284,8 +1288,9 @@ def apply_model(race, arr, odds):
     if bst.get('k', 1) != 1:
         bset = set(bst.get('names', []))
         beta = [b * bst['k'] if n in bset else b for n, b in zip(names, beta)]
-    beta = [b * ODDS_W if n == 'log_market' else b * AI_W for n, b in zip(names, beta)]   # オッズ・AIの材料の効き（Tomiさんの指定の割合）
-    if debut:
+    if not use_noodds:
+        beta = [b * ODDS_W if n == 'log_market' else b * AI_W for n, b in zip(names, beta)]   # オッズ・AIの材料の効き（Tomiさんの指定の割合）
+    if no_odds:
         beta = [0.0 if n == 'log_market' else b for n, b in zip(names, beta)]
     # 血統の効きを上げる場面（Tomiさんの指定）：新馬戦×3／2歳戦×2／ダート→芝・芝→ダートに替わる馬×3（その馬だけ）
     race_k = 1.0
@@ -1295,7 +1300,7 @@ def apply_model(race, arr, odds):
         race['bloodNote'] = '新馬戦のためオッズは使わず、血統5割＋今の材料5割で計算'
     elif re.search(r'2歳', (race.get('name') or '') + (race.get('condText') or '')):
         blood_share = TWO_YO_BLOOD_SHARE
-        race['bloodNote'] = f'2歳戦のため 血統{TWO_YO_BLOOD_SHARE * 10:.0f}：今の材料{10 - TWO_YO_BLOOD_SHARE * 10:.0f}で計算（オッズは別）'
+        race['bloodNote'] = f'2歳戦のため 血統{TWO_YO_BLOOD_SHARE * 10:.0f}：今の材料{10 - TWO_YO_BLOOD_SHARE * 10:.0f}で計算'
     is_blood = [(n[:-2] if n.endswith('_r') else n) in BLOOD_KEYS for n in names]
     for h in arr:
         if odds_ok:
@@ -1325,6 +1330,12 @@ def apply_model(race, arr, odds):
         if sb > 1e-9 and sr > 1e-9:
             f_ = sr / sb * blood_share / (1 - blood_share)
             zs = [o + r + b * f_ for b, r, o in zip(zbs, zrs, zos)]
+    if no_odds and not use_noodds and len(zs) > 1:
+        # オッズを抜くと実力の差が小さく出るので、レースの中の散らばりを AI_SPREAD にそろえる（順番は変わらない）
+        mu_ = sum(zs) / len(zs)
+        sd_ = math.sqrt(sum((z - mu_) ** 2 for z in zs) / len(zs))
+        if sd_ > 1e-9:
+            zs = [(z - mu_) * (AI_SPREAD / sd_) for z in zs]
     try:
         pn = (MODEL.get('place') or {}).get('names')
         if pn:      # 2・3着の見込みは、勝つ見込みとは別の材料（堅実度など）も使える
@@ -1339,13 +1350,13 @@ def apply_model(race, arr, odds):
         e_ = [math.exp(v - m_) for v in z_]
         t_ = sum(e_)
         return [v / t_ for v in e_]
-    raw = _soft([sum(b * (v - m) / s for b, v, m, s in zip(MODEL['beta'], x, mean, std)) for x in xs])
+    raw = _soft([sum(b * (v - m) / s for b, v, m, s in zip(beta if use_noodds else MODEL['beta'], x, mean, std) if s and s > 1e-6) for x in xs])
     for h, v in zip(arr, raw):
         h['pRaw'] = v
-    if debut:     # 新馬戦はオッズ抜きの勝率を、穴・3連単の判定にも使う
+    if no_odds:     # オッズ抜きの勝率を、穴・3連単・イチ推しの判定にも使う
         for h, v in zip(arr, _soft(zs)):
             h['pRaw'] = v
-    if ANA_MODEL and not debut:     # 穴の判定用の別の重み（98材料）。新馬戦はオッズを使うので使わない
+    if ANA_MODEL and not no_odds:     # 穴の判定用の別の重み（98材料）。オッズを使う重みなので、オッズ抜きのときは使わない
         an_ = ANA_MODEL
         za = []
         for h, row in zip(arr, rows):
@@ -1362,7 +1373,7 @@ def apply_model(race, arr, odds):
         h['p'] = e / tot2
         h['ev'] = h['p'] * h['o'] if h.get('o') else None
     race['model'] = True
-    race['modelNote'] = (f"勝率＝AI（オッズは使わない）" if debut else "勝率＝オッズ＋AI") + f"（{MODEL.get('trained_range', '過去データ')}で学習）"
+    race['modelNote'] = (f"勝率＝AIの実力（オッズは使わない。オッズは期待値だけに使う）" if no_odds else "勝率＝オッズ＋AI") + f"（{MODEL.get('trained_range', '過去データ')}で学習）"
     if race.get('bloodNote'):
         race['modelNote'] += '・' + race['bloodNote']
     if any(h.get('bloodK', 1) > race_k for h in arr):
@@ -1377,6 +1388,18 @@ def apply_model(race, arr, odds):
 #   勝率を exp(補正) 倍してレース内で合計100%に直す。1頭の補正は ±0.30 まで（勝率がおよそ0.75〜1.35倍）
 # ═════════════════════════════════════════
 MANUAL_BOOST = True
+# ── 予想（勝率・印）にオッズを使わない（Tomiさんの方針：AIは実力・展開・適性で予想し、オッズは「実力とオッズのズレ＝期待値」だけに使う）──
+#    ただし今の重みは「オッズを土台に、オッズのズレを直す」形で学習したもので、オッズを抜くと意味が逆になる材料がある
+#    （例：前走大敗→オッズが低く見すぎる分のプラス）。そのため、オッズ抜きで学習した重み（data/model_weights_noodds.json）が
+#    あるときだけ全レースでオッズ抜きにする。無いときは新馬戦だけオッズ抜き
+try:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'model_weights_noodds.json'), encoding='utf-8') as _f:
+        NOODDS_MODEL = json.load(_f)
+    print(f"[model] オッズ抜きAIの重みを読み込み：材料{len(NOODDS_MODEL['names']) - 1}個", flush=True)
+except Exception:
+    NOODDS_MODEL = None
+NO_ODDS_PREDICT = bool(NOODDS_MODEL)
+AI_SPREAD = 0.9             # 今の重みでオッズを抜いたとき（新馬戦）の、レースの中の散らばり
 # ── 効きの割合（Tomiさんの指定：オッズ35%・重点補正39%・AIの材料26%。以前はオッズ50%・30%・20%）──
 #    1レースの中で各馬の評価を動かす大きさが、およそ オッズ0.47：重点補正0.53：AIの材料0.35 になるように調整
 #    （全体の大きさ 約1.35 は以前と同じ。オッズを下げた分を、重点補正とAIの材料に 3：2 で振り分け）
@@ -1807,7 +1830,7 @@ def manual_boost(race, arr):
             adj += add(wv, f"{ago}{short_date(l_['d'])}{l_['p']}は{e_['type']}（JRA発表・{l_.get('pos')}着）", 0.0, 0.10)
             h['troubleNote'] = f"{ago}{short_date(l_['d'])}{l_['p']}{e_.get('R')}R：{e_['type']}（JRA発表）"
         # ⑦ オッズとの食い違い（人気と、オッズ抜きの実力評価がずれていたら疑う）
-        pai, pm = h.get('pAI'), (None if is_debut_race(race, arr) else h.get('pm'))   # 新馬戦は人気との比較をしない
+        pai, pm = h.get('pAI'), (None if (NO_ODDS_PREDICT or is_debut_race(race, arr)) else h.get('pm'))   # 予想にオッズを使わないときは人気との比較で補正しない
         if pai and pm:
             ratio = pai / pm
             dv = 0.08 * clamp(math.log(ratio), -1, 1)
