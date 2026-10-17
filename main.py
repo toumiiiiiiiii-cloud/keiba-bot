@@ -1158,7 +1158,7 @@ def sire_tab(race, h, lookup):
 
 
 DEBUT_BLOOD_K = 3.0       # 新馬戦の血統の効き（ふだんの何倍か）
-TWO_YO_BLOOD_K = 2.0      # 2歳戦（新馬戦以外）
+TWO_YO_BLOOD_SHARE = 0.4  # 2歳戦（新馬戦以外）：血統4：今の材料6（Tomiさんの指定）。オッズは別
 SURF_CHG_BLOOD_K = 3.0    # ダート→芝・芝→ダートに替わる馬
 
 
@@ -1224,36 +1224,42 @@ def apply_model(race, arr, odds):
         beta = [0.0 if n == 'log_market' else b for n, b in zip(names, beta)]
     # 血統の効きを上げる場面（Tomiさんの指定）：新馬戦×3／2歳戦×2／ダート→芝・芝→ダートに替わる馬×3（その馬だけ）
     race_k = 1.0
+    blood_share = None       # 血統：今の材料 の割合（血統の割合）。オッズはこの外
     if debut:
+        blood_share = 0.5
         race['bloodNote'] = '新馬戦のためオッズは使わず、血統5割＋今の材料5割で計算'
     elif re.search(r'2歳', (race.get('name') or '') + (race.get('condText') or '')):
-        race_k, race['bloodNote'] = TWO_YO_BLOOD_K, f'2歳戦のため血統の効き×{TWO_YO_BLOOD_K:g}'
+        blood_share = TWO_YO_BLOOD_SHARE
+        race['bloodNote'] = f'2歳戦のため 血統{TWO_YO_BLOOD_SHARE * 10:.0f}：今の材料{10 - TWO_YO_BLOOD_SHARE * 10:.0f}で計算（オッズは別）'
     is_blood = [(n[:-2] if n.endswith('_r') else n) in BLOOD_KEYS for n in names]
     for h in arr:
         if odds_ok:
             h['pm'] = inv[h['n']] / tot
         else:
             h.pop('pm', None)
-    zs, xs, zbs, zrs = [], [], [], []
+    zs, xs, zbs, zrs, zos = [], [], [], [], []
+    is_odds = [n == 'log_market' for n in names]
     for h, row in zip(arr, rows):
         x = [math.log(inv[h['n']] / tot)] + [row.get(n, 0.0) for n in names[1:]]
         xs.append(x)
-        k_ = 1.0 if debut else max(race_k, SURF_CHG_BLOOD_K if surf_changed(race, h) else 1.0)
+        k_ = 1.0 if blood_share else max(race_k, SURF_CHG_BLOOD_K if surf_changed(race, h) else 1.0)
         h['bloodK'] = k_
-        zb_ = sum(b * k_ * (v - m) / s for b, v, m, s, bl in zip(beta, x, mean, std, is_blood) if bl)
-        zr_ = sum(b * (v - m) / s for b, v, m, s, bl in zip(beta, x, mean, std, is_blood) if not bl)
-        zbs.append(zb_); zrs.append(zr_)
-        zs.append(zb_ + zr_)
-    if debut and len(arr) > 1:
-        # 血統5割：レースの中で、血統の点数の散らばりを、それ以外（今の材料）の点数の散らばりにそろえる
+        terms = list(zip(beta, x, mean, std, is_blood, is_odds))
+        zb_ = sum(b * k_ * (v - m) / s for b, v, m, s, bl, od in terms if bl)
+        zo_ = sum(b * (v - m) / s for b, v, m, s, bl, od in terms if od)
+        zr_ = sum(b * (v - m) / s for b, v, m, s, bl, od in terms if not bl and not od)
+        zbs.append(zb_); zrs.append(zr_); zos.append(zo_)
+        zs.append(zb_ + zr_ + zo_)
+    if blood_share and len(arr) > 1:
+        # 血統の割合：レースの中で、血統の点数の散らばりを「今の材料の散らばり × 血統の割合÷材料の割合」にそろえる
+        #   新馬戦 5：5（オッズなし）／2歳戦 4：6（オッズはこれまでどおり別に足す）
         def _sd(v):
             mu_ = sum(v) / len(v)
             return math.sqrt(sum((a - mu_) ** 2 for a in v) / len(v))
         sb, sr = _sd(zbs), _sd(zrs)
         if sb > 1e-9 and sr > 1e-9:
-            zs = [r + b * (sr / sb) for b, r in zip(zbs, zrs)]
-        elif sb > 1e-9:
-            zs = list(zbs)
+            f_ = sr / sb * blood_share / (1 - blood_share)
+            zs = [o + r + b * f_ for b, r, o in zip(zbs, zrs, zos)]
     try:
         pn = (MODEL.get('place') or {}).get('names')
         if pn:      # 2・3着の見込みは、勝つ見込みとは別の材料（堅実度など）も使える
