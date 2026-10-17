@@ -31,6 +31,62 @@ from PIL import Image, ImageDraw, ImageFont
 
 app = Flask(__name__)
 
+# ── ログの窓口：Botが出した記録（print・エラー）を最新3000行だけ覚えておき、/logs?key=… で読めるようにする ──
+#    Renderの環境変数 LOG_KEY を入れたときだけ動く（入っていなければ /logs は「無い」と答える）
+import collections as _collections
+import hmac as _hmac
+_LOG_BUF = _collections.deque(maxlen=3000)
+_LOG_LOCK = threading.Lock()
+
+
+class _Tee:
+    def __init__(self, base, tag):
+        self.base, self.tag, self.part = base, tag, ''
+
+    def write(self, s):
+        try:
+            self.base.write(s)
+        except Exception:
+            pass
+        try:
+            with _LOG_LOCK:
+                self.part += s
+                while '\n' in self.part:
+                    line, self.part = self.part.split('\n', 1)
+                    t = (datetime.datetime.utcnow() + datetime.timedelta(hours=9)).strftime('%m-%d %H:%M:%S')
+                    _LOG_BUF.append(f'{t} {self.tag}{line}')
+        except Exception:
+            pass
+        return len(s)
+
+    def flush(self):
+        try:
+            self.base.flush()
+        except Exception:
+            pass
+
+    def __getattr__(self, k):
+        return getattr(self.base, k)
+
+
+sys.stdout = _Tee(sys.stdout, '')
+sys.stderr = _Tee(sys.stderr, '!')
+
+
+@app.route('/logs')
+def logs_page():
+    key = os.environ.get('LOG_KEY') or ''
+    if not key or not _hmac.compare_digest(request.args.get('key', ''), key):
+        abort(404)
+    n = min(int(request.args.get('n', 500) or 500), 3000)
+    q = request.args.get('q', '')
+    with _LOG_LOCK:
+        lines = list(_LOG_BUF)
+    if q:
+        lines = [l for l in lines if q in l]
+    return '\n'.join(lines[-n:]), 200, {'Content-Type': 'text/plain; charset=utf-8'}
+
+
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN) if LINE_CHANNEL_ACCESS_TOKEN else None
