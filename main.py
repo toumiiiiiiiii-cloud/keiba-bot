@@ -900,6 +900,69 @@ except Exception:
     ANA_MODEL = None
 
 
+# ═════════════════════════════════════════
+# 新しいタイム指数（PCの time2_learn.py が作る data/time_index.json と同じ計算）
+#   基準タイム（競馬場・芝ダ・距離）＋その日の馬場差（競馬場・芝ダ・馬場状態）より、1000mあたり1秒速いと＋10、斤量1kg重いと＋1
+# ═════════════════════════════════════════
+try:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'time_index.json'), encoding='utf-8') as _f:
+        TIME_INDEX = json.load(_f)
+    print(f"[time2] 新しいタイム指数の表：基準{len(TIME_INDEX['base'])}コース・馬場差{len(TIME_INDEX['var'])}日分（{TIME_INDEX.get('updated', '')}）", flush=True)
+except Exception:
+    TIME_INDEX = None
+
+
+def _going_grp(g):
+    return '良' if g == '良' else '稍' if g and g.startswith('稍') else '重'
+
+
+def time2_figure(l):
+    """1走分の新しいタイム指数（表に無いコースは None）"""
+    ti = TIME_INDEX
+    if not ti or not l.get('t') or not l.get('dist'):
+        return None
+    surf, dist = l['dist'][:1], dist_num(l['dist'])
+    b = ti['base'].get(f"{l.get('p')}|{surf}|{dist}")
+    if not b or not dist:
+        return None
+    v = ti['var'].get(f"{l.get('d')}|{l.get('p')}|{surf}|{_going_grp(l.get('cond'))}",
+                      ti['var'].get(f"{l.get('d')}|{l.get('p')}|{surf}|*", 0.0))
+    km = dist / 1000
+    try:
+        wt = float(l.get('w') or 55)
+    except (TypeError, ValueError):
+        wt = 55.0
+    return (b + v * km - float(l['t'])) / km * 10 + (wt - 55) * float(ti.get('kg_pt', 1.0))
+
+
+def add_time2(race, arr, rows):
+    """t2_best・t2_last・t2_avg・t2_n・t2_missing・t2_rel・t2_lastrel を各馬の材料に足す（PCの学習と同じ作り方）"""
+    surf, dist = race['surf'], int(race['dist'])
+    vals = []
+    for h in arr:
+        car = [l for l in (h.get('career') or h.get('lines') or []) if (l.get('pos') or 0) > 0 and l.get('t')]
+        car = list(reversed(car))                     # 古い順
+        same = [l for l in car if l['dist'][:1] == surf and abs(dist_num(l['dist']) - dist) <= 600][-5:]
+        use = same or [l for l in car if l['dist'][:1] == surf][-5:]
+        fs = [f for f in (time2_figure(l) for l in use) if f is not None]
+        vals.append(fs)
+        h['t2'] = round(max(fs), 1) if fs else None
+    have = [i for i, fs in enumerate(vals) if fs]
+    best = {i: max(vals[i]) for i in have}
+    last = {i: vals[i][-1] for i in have}
+    import numpy as np
+    med_b = float(np.median(list(best.values()))) if best else 0.0
+    med_l = float(np.median(list(last.values()))) if last else 0.0
+    for i, (row, fs) in enumerate(zip(rows, vals)):
+        if fs:
+            top = sorted(fs, reverse=True)
+            row.update({'t2_best': top[0], 't2_last': fs[-1], 't2_avg': sum(top[:2]) / len(top[:2]), 't2_n': float(len(fs)),
+                        't2_missing': 0.0, 't2_rel': top[0] - med_b, 't2_lastrel': fs[-1] - med_l})
+        else:
+            row.update({'t2_best': med_b - 5, 't2_last': med_l - 5, 't2_avg': med_b - 5, 't2_n': 0.0,
+                        't2_missing': 1.0, 't2_rel': 0.0, 't2_lastrel': 0.0})
+
+
 def model_row(race, h, N):
     """新方式の材料（オッズ以外）を作る。値はすべて数字。バックテストとBotで共通"""
     f = {}
@@ -1281,6 +1344,8 @@ def apply_model(race, arr, odds):
             h['jkRateNow'] = jr_get(jr, h.get('jockey'))
             h['jkRatePrev'] = jr_get(jr, prev) if prev else None
         rows.append(model_row(race, h, N))
+    if TIME_INDEX:
+        _safe(add_time2, race, arr, rows)      # 新しいタイム指数（馬場差・クラス・斤量の補正つき）
     add_relative(rows)
     for h, row in zip(arr, rows):
         h['_row'] = row
