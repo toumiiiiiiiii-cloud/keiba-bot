@@ -1180,12 +1180,17 @@ def apply_model(race, arr, odds):
     """オッズ＋AIの勝率に置き換える。置き換えたら True"""
     if not MODEL or os.environ.get('SYH_BACKTEST') or race.get('abroad'):
         return False
+    debut = is_debut_race(race, arr)     # 新馬戦はオッズを予想に入れない（血統と今の材料だけ。Tomiさんの指定）
     have = [h for h in arr if odds.get(h['n'])]
-    if len(have) < max(5, math.ceil(len(arr) * 0.8)):
+    odds_ok = len(have) >= max(5, math.ceil(len(arr) * 0.8))
+    if not odds_ok and not debut:
         race['modelNote'] = 'オッズ未発表のため、AIだけで計算'
         return False
-    mx = max(odds[h['n']] for h in have)
-    inv = {h['n']: 1 / (odds.get(h['n']) or mx * 1.5) for h in arr}
+    if have:
+        mx = max(odds[h['n']] for h in have)
+        inv = {h['n']: 1 / (odds.get(h['n']) or mx * 1.5) for h in arr}
+    else:
+        inv = {h['n']: 1.0 for h in arr}
     tot = sum(inv.values())
     names, mean, std, beta = MODEL['names'], MODEL['mean'], MODEL['std'], MODEL['beta']
     jt = MODEL.get('jockey_bias', {})
@@ -1215,22 +1220,40 @@ def apply_model(race, arr, odds):
         bset = set(bst.get('names', []))
         beta = [b * bst['k'] if n in bset else b for n, b in zip(names, beta)]
     beta = [b * ODDS_W if n == 'log_market' else b * AI_W for n, b in zip(names, beta)]   # オッズ・AIの材料の効き（Tomiさんの指定の割合）
+    if debut:
+        beta = [0.0 if n == 'log_market' else b for n, b in zip(names, beta)]
     # 血統の効きを上げる場面（Tomiさんの指定）：新馬戦×3／2歳戦×2／ダート→芝・芝→ダートに替わる馬×3（その馬だけ）
     race_k = 1.0
-    if is_debut_race(race, arr):
-        race_k, race['bloodNote'] = DEBUT_BLOOD_K, f'新馬戦のため血統の効き×{DEBUT_BLOOD_K:g}'
+    if debut:
+        race['bloodNote'] = '新馬戦のためオッズは使わず、血統5割＋今の材料5割で計算'
     elif re.search(r'2歳', (race.get('name') or '') + (race.get('condText') or '')):
         race_k, race['bloodNote'] = TWO_YO_BLOOD_K, f'2歳戦のため血統の効き×{TWO_YO_BLOOD_K:g}'
     is_blood = [(n[:-2] if n.endswith('_r') else n) in BLOOD_KEYS for n in names]
     for h in arr:
-        h['pm'] = inv[h['n']] / tot
-    zs, xs = [], []
+        if odds_ok:
+            h['pm'] = inv[h['n']] / tot
+        else:
+            h.pop('pm', None)
+    zs, xs, zbs, zrs = [], [], [], []
     for h, row in zip(arr, rows):
         x = [math.log(inv[h['n']] / tot)] + [row.get(n, 0.0) for n in names[1:]]
         xs.append(x)
-        k_ = max(race_k, SURF_CHG_BLOOD_K if surf_changed(race, h) else 1.0)
+        k_ = 1.0 if debut else max(race_k, SURF_CHG_BLOOD_K if surf_changed(race, h) else 1.0)
         h['bloodK'] = k_
-        zs.append(sum((b * k_ if bl else b) * (v - m) / s for b, v, m, s, bl in zip(beta, x, mean, std, is_blood)))
+        zb_ = sum(b * k_ * (v - m) / s for b, v, m, s, bl in zip(beta, x, mean, std, is_blood) if bl)
+        zr_ = sum(b * (v - m) / s for b, v, m, s, bl in zip(beta, x, mean, std, is_blood) if not bl)
+        zbs.append(zb_); zrs.append(zr_)
+        zs.append(zb_ + zr_)
+    if debut and len(arr) > 1:
+        # 血統5割：レースの中で、血統の点数の散らばりを、それ以外（今の材料）の点数の散らばりにそろえる
+        def _sd(v):
+            mu_ = sum(v) / len(v)
+            return math.sqrt(sum((a - mu_) ** 2 for a in v) / len(v))
+        sb, sr = _sd(zbs), _sd(zrs)
+        if sb > 1e-9 and sr > 1e-9:
+            zs = [r + b * (sr / sb) for b, r in zip(zbs, zrs)]
+        elif sb > 1e-9:
+            zs = list(zbs)
     try:
         pn = (MODEL.get('place') or {}).get('names')
         if pn:      # 2・3着の見込みは、勝つ見込みとは別の材料（堅実度など）も使える
@@ -1248,7 +1271,10 @@ def apply_model(race, arr, odds):
     raw = _soft([sum(b * (v - m) / s for b, v, m, s in zip(MODEL['beta'], x, mean, std)) for x in xs])
     for h, v in zip(arr, raw):
         h['pRaw'] = v
-    if ANA_MODEL:     # 穴の判定用の別の重み（98材料）
+    if debut:     # 新馬戦はオッズ抜きの勝率を、穴・3連単の判定にも使う
+        for h, v in zip(arr, _soft(zs)):
+            h['pRaw'] = v
+    if ANA_MODEL and not debut:     # 穴の判定用の別の重み（98材料）。新馬戦はオッズを使うので使わない
         an_ = ANA_MODEL
         za = []
         for h, row in zip(arr, rows):
@@ -1265,7 +1291,7 @@ def apply_model(race, arr, odds):
         h['p'] = e / tot2
         h['ev'] = h['p'] * h['o'] if h.get('o') else None
     race['model'] = True
-    race['modelNote'] = f"勝率＝オッズ＋AI（{MODEL.get('trained_range', '過去データ')}で学習）"
+    race['modelNote'] = (f"勝率＝AI（オッズは使わない）" if debut else "勝率＝オッズ＋AI") + f"（{MODEL.get('trained_range', '過去データ')}で学習）"
     if race.get('bloodNote'):
         race['modelNote'] += '・' + race['bloodNote']
     if any(h.get('bloodK', 1) > race_k for h in arr):
@@ -1486,7 +1512,7 @@ def manual_boost(race, arr):
             adj += add(wv, f"{ago}{short_date(l_['d'])}{l_['p']}は{e_['type']}（JRA発表・{l_.get('pos')}着）", 0.0, 0.10)
             h['troubleNote'] = f"{ago}{short_date(l_['d'])}{l_['p']}{e_.get('R')}R：{e_['type']}（JRA発表）"
         # ⑦ オッズとの食い違い（人気と、オッズ抜きの実力評価がずれていたら疑う）
-        pai, pm = h.get('pAI'), h.get('pm')
+        pai, pm = h.get('pAI'), (None if is_debut_race(race, arr) else h.get('pm'))   # 新馬戦は人気との比較をしない
         if pai and pm:
             ratio = pai / pm
             dv = 0.08 * clamp(math.log(ratio), -1, 1)
