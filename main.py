@@ -1760,7 +1760,7 @@ def ana_horses(arr, rule=None):
     main = lambda h: h.get('pRaw', h.get('pBase', h['p']))                # 印・本線の重み（学習そのまま）
     use_ana = (rule.get('model') or BET_RULES.get('ana_model')) == '98' and all('pAna' in h for h in arr)
     pb = (lambda h: h['pAna']) if use_ana else main                      # 穴の判定に使う勝率
-    top3 = {h['n'] for h in sorted(arr, key=lambda h: -main(h))[:3]}
+    top3 = {h['n'] for h in sorted(arr, key=lambda h: -main(h))[:3]} | {h['n'] for h in sorted(arr, key=lambda h: -h['p'])[:3]}   # 印の◎○▲とも重ねない
     for r_, h in enumerate(sorted(arr, key=lambda h: -pb(h)), 1):
         o = h.get('o') or 0
         if r_ < 4 or r_ > rule.get('max_rank', 10) or o < rule.get('min_odds', 12) or h['n'] in top3:
@@ -6103,7 +6103,9 @@ def recommended_tickets(arr, race=None):
                 why = f"ワイド {n[0]}-{ana}（◎{name[n[0]]['name']}と穴{name[ana]['name']} {name[ana].get('o')}倍）"
             elif kind == '3連複' and len(combos) == 1:
                 c = combos[0]
-                ana = next(x for x in c if x not in n[:2])
+                ana = next((x for x in c if x not in n[:2]), None)
+                if ana is None or len(set(c)) < 3:
+                    continue
                 cols = [[n[0], n[1], ana]]
                 why = f"3連複 {n[0]}-{n[1]}-{ana}（◎○と穴{name[ana]['name']} {name[ana].get('o')}倍）"
             else:
