@@ -842,6 +842,15 @@ def ranked(race, horses, odds):
         except Exception as e:
             traceback.print_exc()
             print(f"[boost] 重点補正を計算できず: {e}", flush=True)
+    if SIM_BLEND and SV and not os.environ.get('SYH_BACKTEST'):
+        try:
+            if sim_blend(race, arr):
+                arr.sort(key=lambda h: -h['p'])
+                for i, h in enumerate(arr):
+                    h['rk'] = i + 1
+        except Exception as e:
+            traceback.print_exc()
+            print(f"[simblend] シミュレーションを予想に入れられず: {e}", flush=True)
     if BET_RULES.get('ana') and race.get('model'):   # 穴の印：学習した決め方（AIの順位・オッズ・人気より強い度合い）
         ana_ids = {h['n'] for h in ana_horses(arr)}      # 穴の買い目に使う馬すべてに「穴」マーク
         for sp in BET_RULES.get('ana_bets') or []:
@@ -1578,6 +1587,108 @@ def trend_points(t, h):
     if sl and any(x in (h.get('sire') or '') for x in sl['names']):
         out.append((sl['v'], sl['note']))
     return out
+
+
+# ═════════════════════════════════════════
+# 1000回シミュレーションを予想に組み込む（Tomiさんの指定）
+#   勝率・位置取り・ペースに加えて、①今日（なければ前日）の同じ競馬場・芝ダ・距離帯の馬場の傾向（前残り／差し、内枠／外枠）
+#   ②コースの傾向（重賞の過去データ：差し有利など）③右回り・左回りの得意不得意 を入れて1000回走らせ、
+#   その勝率を予想の勝率に SIM_W の割合で混ぜる
+# ═════════════════════════════════════════
+SIM_BLEND = True
+SIM_W = 0.5
+
+
+def _prev_day_band(race):
+    """前日（同じ開催の前の日）の同じ競馬場・芝ダ・距離帯の結果の傾向"""
+    rid = race.get('id') or ''
+    if not re.match(r'^\d{12}$', rid) or rid[4:6] not in JRA_PLACE or int(rid[8:10]) <= 1:
+        return None
+    pre = f"{rid[:8]}{int(rid[8:10]) - 1:02d}"
+    def load():
+        res = []
+        for r_ in range(1, 13):
+            x = _safe(parse_result_full, f"{pre}{r_:02d}")
+            if x and x.get('surf') == race['surf']:
+                res.append((r_, x))
+        band = next(((n, lo, hi) for n, lo, hi in DIST_BANDS if lo <= race['dist'] <= hi), None)
+        b = [x for x in res if x[1].get('dist') and band and band[1] <= x[1]['dist'] <= band[2]]
+        if len(b) >= 2:
+            return (band[0], band_stats(b))
+        if len(res) >= 3:
+            return ('全体', band_stats(res))
+        return None
+    return cached(('pband', pre, race['surf'], race['dist']), 3600, load)
+
+
+def turn_pref(race, h):
+    """右回り・左回りの得意不得意（3着以内率の差）。それぞれ2戦以上のときだけ"""
+    cs = [l for l in (h.get('career') or h.get('lines') or []) if (l.get('pos') or 0) > 0 and l.get('p') in KNOWN_DIR]
+    if not cs or race.get('venue') not in KNOWN_DIR:
+        return 0.0, ''
+    left = race['venue'] in LEFT_TURN
+    same = [l for l in cs if (l['p'] in LEFT_TURN) == left]
+    other = [l for l in cs if (l['p'] in LEFT_TURN) != left]
+    if len(same) < 2 or len(other) < 2:
+        return 0.0, ''
+    def rate(ls):    # 3着以内と勝ちを半分ずつ
+        return (sum(1 for l in ls if l['pos'] <= 3) + sum(1 for l in ls if l['pos'] == 1)) / (2 * len(ls))
+    d = rate(same) - rate(other)
+    k = min(len(same), len(other))
+    d *= k / (k + 2)          # レース数が少ないときは控えめに
+    if abs(d) < 0.12:
+        return 0.0, ''
+    side = '左' if left else '右'
+    return clamp(d * 0.6, -0.35, 0.35), (f"{side}回りが得意（{rec_str(same)[0]}／逆回り{rec_str(other)[0]}）" if d > 0
+                                          else f"{side}回りは苦手（{rec_str(same)[0]}／逆回り{rec_str(other)[0]}）")
+
+
+def sim_blend(race, arr):
+    if len(arr) < 3:
+        return False
+    tb = _today_band(race) if race.get('id') else None
+    src = '今日'
+    if not tb or not tb[1]:
+        tb = _prev_day_band(race)
+        src = '前日'
+    style_k = inner_k = 0.0
+    notes = []
+    if tb and tb[1]:
+        st_ = tb[1]
+        style_k += clamp((0.5 - st_.get('front', 0.5)) * 1.6, -0.6, 0.6)      # 前残り→マイナス（前有利）、差し→プラス
+        inner_k += clamp((st_.get('inner', 0.5) - 0.5) * 1.6, -0.5, 0.5)
+        w_ = st_.get('word') or ''
+        notes.append(f"{src}の{race['venue']}{race['surf']}{'' if tb[0] == '全体' else tb[0]}：{w_}{'・' + st_['io'] if st_.get('io') else ''}")
+    tr_ = race_trend(race)
+    if tr_ and tr_.get('sim_style'):
+        style_k += float(tr_['sim_style'])
+        notes.append(tr_.get('sim_note') or '')
+    extra = []
+    for h in arr:
+        v, t_ = turn_pref(race, h)
+        extra.append(v)
+        h['turnNote'] = t_
+    sim = SV.simulate(race, arr, runs=1000, match_prediction=False, extra=extra, style_k=style_k, inner_k=inner_k)
+    if not sim:
+        return False
+    for h in arr:
+        hs = sim['horses'].get(str(h['n']))
+        if not hs:
+            continue
+        h['simWin'], h['simTop3'] = hs['win'], hs['top3']
+    tot = 0.0
+    for h in arr:
+        h['pPreSim'] = h['p']
+        h['p'] = (1 - SIM_W) * h['p'] + SIM_W * h.get('simWin', h['p'])
+        tot += h['p']
+    for h in arr:
+        h['p'] /= tot
+        h['ev'] = h['p'] * h['o'] if h.get('o') else None
+        if h.get('turnNote'):
+            h.setdefault('boostNotes', []).append(h['turnNote'])
+    race['simNote'] = 'シミュレーション1000回（' + '／'.join(x for x in notes if x) + '）' if any(notes) else 'シミュレーション1000回'
+    race['modelNote'] = (race.get('modelNote') or '') + f"・{race['simNote']}を{SIM_W * 100:.0f}%反映"
+    return True
 
 
 def manual_boost(race, arr):

@@ -31,7 +31,7 @@ def _early_ratio(h):
     return float(r)
 
 
-def simulate(race, arr, runs=1000, seed=None, match_prediction=True):
+def simulate(race, arr, runs=1000, seed=None, match_prediction=True, extra=None, style_k=0.0, inner_k=0.0):
     """各馬の位置取り（earlyRatio）と勝率（p）から、1000回レースを走らせて集計する。
     ・序盤：近走の位置取り＋ゆらぎ＋たまに出遅れ → 隊列とペースが決まる
     ・ゴール：勝率（Plackett-Luce：log p ＋ ガンベル乱数）に、その回のペースの有利不利を足す
@@ -63,6 +63,14 @@ def simulate(race, arr, runs=1000, seed=None, match_prediction=True):
     # ゴール
     gum = -np.log(-np.log(rng.random((runs, N))))
     S = np.log(p)[None, :] + gum + 0.6 * pace_sign[:, None] * (E - 0.5)
+    # 予想に組み込むときだけ：馬場・コースの差し有利（style_k＞0）／前有利（＜0）、内枠有利（inner_k＞0）、馬ごとの上乗せ（回りの得意など）
+    if style_k:
+        S = S + style_k * (E - 0.5)
+    if inner_k and N > 1:
+        draw = (nums - nums.min()) / max(1, nums.max() - nums.min())     # 0＝最内 1＝大外
+        S = S + inner_k * (0.5 - draw)[None, :]
+    if extra is not None:
+        S = S + np.asarray(extra, dtype=float)[None, :]
     fin_rank = (-S).argsort(axis=1).argsort(axis=1)           # 0 = 1着
 
     # 集計
