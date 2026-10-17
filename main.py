@@ -1459,6 +1459,57 @@ def trouble_of(h):
     return None
 
 
+try:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'race_trends.json'), encoding='utf-8') as _f:
+        RACE_TRENDS = json.load(_f).get('races') or []
+except Exception:
+    RACE_TRENDS = []
+
+
+def race_trend(race):
+    nm = unicodedata.normalize('NFKC', race.get('name') or '')
+    for t in RACE_TRENDS:
+        if unicodedata.normalize('NFKC', t['name']) in nm and (not t.get('venue') or t['venue'] == race.get('venue')):
+            return t
+    return None
+
+
+def trend_points(t, h):
+    """重賞の傾向から、その馬の加点・減点 [(点数, 理由)]"""
+    out = []
+    w = str(h.get('w') or '')
+    if w in (t.get('waku') or {}):
+        out.append((t['waku'][w], (t.get('waku_note') or {}).get(w, f'{w}枠')))
+    age = h.get('age')
+    if age:
+        ak = str(min(int(age), 7))
+        if ak in (t.get('age') or {}) and t['age'][ak]:
+            out.append((t['age'][ak], (t.get('age_note') or {}).get(ak, f'{age}歳')))
+    prev = next((l for l in (h.get('lines') or []) if l.get('r')), None)
+    if prev:
+        rn = unicodedata.normalize('NFKC', prev.get('r') or '')
+        hit = next((p for p in t.get('prev') or [] if p['key'] in rn), None)
+        if hit:
+            out.append((hit['v'], hit['note']))
+        else:
+            grade = re.search(r'G[1-3]|GI{1,3}|\(G|重賞', rn)
+            for p in t.get('prev_cls') or []:
+                if p['key'] == 'OP' and not grade and re.search(r'(?<![1-3]勝)(OP|オープン|S$|ステークス|L$)', rn):
+                    out.append((p['v'], p['note'])); break
+                if p['key'] != 'OP' and p['key'] in rn:
+                    out.append((p['v'], p['note'])); break
+        for p in t.get('prev_venue') or []:
+            if p['key'] in (prev.get('p') or ''):
+                out.append((p['v'], p['note']))
+    fr = t.get('front')
+    if fr and (h.get('leadRate') or 0) >= 0.5:
+        out.append((fr['v'], fr['note']))
+    sl = t.get('sire_line')
+    if sl and any(x in (h.get('sire') or '') for x in sl['names']):
+        out.append((sl['v'], sl['note']))
+    return out
+
+
 def manual_boost(race, arr):
     if not arr:
         return False
@@ -1587,6 +1638,14 @@ def manual_boost(race, arr):
                 t_ = ''
             adj += add(dv, t_, -0.08, 0.08)
             h['diverge'] = ratio
+        # ⑨ そのレース（重賞）の過去10年の傾向：枠・年齢・前走・脚質・血統（data/race_trends.json）
+        tr_ = race_trend(race)
+        if tr_:
+            try:
+                for v, t_ in trend_points(tr_, h):
+                    adj += add(v, t_, -0.08, 0.08)
+            except Exception as e:
+                print(f"[trend] 傾向の補正を計算できず: {e}", flush=True)
         adj = clamp(adj * BOOST_W, -BOOST_CAP, BOOST_CAP)
         h['boostAdj'] = adj
         h['boostParts'] = parts
