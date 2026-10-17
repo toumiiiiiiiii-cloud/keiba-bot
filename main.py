@@ -1571,8 +1571,9 @@ def trend_points(t, h):
     if jc and h.get('change'):
         out.append((jc['v'], jc['note']))
     hv = (t.get('horse') or {}).get(h.get('name') or '')
-    if hv:
-        out.append(tuple(hv))
+    if hv:     # 馬ごとの評価（記事・調教・馬体）。1つでも複数でも
+        for e in (hv if isinstance(hv[0], list) else [hv]):
+            out.append(tuple(e))
     sl = t.get('sire_line')
     if sl and any(x in (h.get('sire') or '') for x in sl['names']):
         out.append((sl['v'], sl['note']))
