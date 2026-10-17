@@ -783,7 +783,8 @@ def line_key(l):
     return f"{l.get('d')}|{l.get('p')}|{dist_num(l.get('dist'))}|{l.get('f')}"
 
 
-AI_PUSH_EV = 1.1
+AI_PUSH_EV = 1.0
+AI_PUSH_MAX_ODDS = 50.0   # 2025年・2026年の答え合わせ：期待値1.0以上・50倍以下で単勝150%／123%、複勝109%／113%
 
 
 def ranked(race, horses, odds):
@@ -869,7 +870,7 @@ def ranked(race, horses, odds):
     for h in arr:
         # 判定は学習と同じ勝率（補正前・効きを変える前）×オッズで（バックテストで2年とも100%超だったのはこの数字）
         h['evRaw'] = (h['pRaw'] * h['o']) if h.get('pRaw') and h.get('o') else None
-        h['aiPush'] = bool(race.get('model') and h.get('evRaw') and h['evRaw'] >= AI_PUSH_EV)
+        h['aiPush'] = bool(race.get('model') and h.get('evRaw') and h['evRaw'] >= AI_PUSH_EV and (h.get('o') or 999) <= AI_PUSH_MAX_ODDS)
     race['aiPush'] = sorted([h for h in arr if h['aiPush']], key=lambda h: -h['evRaw'])
     return arr
 
@@ -1463,15 +1464,13 @@ try:
     print(f"[model] オッズ抜きAIの重みを読み込み：材料{len(NOODDS_MODEL['names']) - 1}個", flush=True)
 except Exception:
     NOODDS_MODEL = None
-NO_ODDS_PREDICT = bool(NOODDS_MODEL)
+NO_ODDS_PREDICT = False     # 答え合わせの結果、オッズ抜きは市場に勝てず。オッズ抜きAIは新馬戦だけ（単勝113%）
 AI_SPREAD = 0.9             # 今の重みでオッズを抜いたとき（新馬戦）の、レースの中の散らばり
-# ── 効きの割合（Tomiさんの指定：オッズ35%・重点補正39%・AIの材料26%。以前はオッズ50%・30%・20%）──
-#    1レースの中で各馬の評価を動かす大きさが、およそ オッズ0.47：重点補正0.53：AIの材料0.35 になるように調整
-#    （全体の大きさ 約1.35 は以前と同じ。オッズを下げた分を、重点補正とAIの材料に 3：2 で振り分け）
-ODDS_W = 0.45               # オッズ（学習した重み1.045 × 0.45 ≒ 0.47）
-AI_W = 2.34                 # AIの材料（学習した重み × 2.34。動かす大きさ 約0.15 → 約0.35）
-BOOST_W = 3.55              # 重点補正（各項目の点数 × 3.55。動かす大きさ 約0.15 → 約0.53）
-BOOST_CAP = 1.3             # 1頭の補正の上限（勝率およそ0.27〜3.7倍。重点補正を強めた分、上限も同じ割合で広げた）
+# ── 効きの割合：オッズとAIの材料は学習したそのまま（以前のTomiさん指定 オッズ50%→35% から変更。答え合わせで一番良かった形）──
+ODDS_W = 1.0               # 学習したそのままの割合（オッズを土台に、材料で市場のズレを探す。答え合わせで一番良かった形）
+AI_W = 1.0
+BOOST_W = 2.7               # 重点補正（以前の大きさに戻す）
+BOOST_CAP = 1.0             # 1頭の補正の上限（勝率およそ0.37〜2.7倍）
 
 
 def _first_ratio(l):
@@ -2410,11 +2409,11 @@ def best_bet(arr, plan=None):
     push = [h for h in arr if h.get('aiPush')]
     if not push:
         return {'skip': True, 'kind': '単勝', 'combos': [],
-                'why': f'期待値{AI_PUSH_EV}以上の馬がいないため見送り推奨'}
+                'why': f'期待値{AI_PUSH_EV}以上・{AI_PUSH_MAX_ODDS:.0f}倍以下の馬がいないため見送り推奨'}
     h = max(push, key=lambda x: x.get('evRaw') or x['ev'])
     return {'skip': False, 'kind': '単勝', 'name': '単勝', 'combos': [(h['n'],)], 'n': 1, 'cost': 100,
             'horse': h, 'hit': h['p'], 'pay': h['o'], 'ev': h.get('evRaw') or h['ev'], 'edge': h['p'] / max(pm[h['n']], 1e-9),
-            'why': f"期待値{AI_PUSH_EV}以上（2年分のバックテストで単勝回収率180%台）の中で期待値が最も高い"}
+            'why': f"実力とオッズのズレ＝期待値{AI_PUSH_EV}以上・{AI_PUSH_MAX_ODDS:.0f}倍以下の中で一番（答えを知らない2年の答え合わせで単勝150%／123%・複勝109%／113%）"}
 
 
 def best_bet_text(bb):
