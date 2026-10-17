@@ -1485,12 +1485,28 @@ def trend_points(t, h):
         ak = str(min(int(age), 7))
         if ak in (t.get('age') or {}) and t['age'][ak]:
             out.append((t['age'][ak], (t.get('age_note') or {}).get(ak, f'{age}歳')))
-    prev = next((l for l in (h.get('lines') or []) if l.get('r')), None)
+    runs = [l for l in (h.get('lines') or []) if l.get('r')][:int(t.get('prev_runs') or 1)]
+    wts = t.get('prev_weights') or [1.0]
+    best = None    # どのレースを走った馬が活躍しているか：前走は満点、2〜3走前は半分。一番大きいものを使う
+    for i, l in enumerate(runs):
+        rn_ = unicodedata.normalize('NFKC', l.get('r') or '')
+        for p in t.get('prev') or []:
+            if p['key'] in rn_:
+                v = p['v']
+                if p.get('pop_max') and (h.get('popNow') or 99) > p['pop_max']:
+                    v = p.get('else_v', v)
+                v *= wts[i] if i < len(wts) else wts[-1]
+                note = p['note'] + ('' if i == 0 else f'（{i + 1}走前）')
+                if best is None or abs(v) > abs(best[0]):
+                    best = (v, note)
+    if best:
+        out.append(best)
+    prev = runs[0] if runs else None
     if prev:
         rn = unicodedata.normalize('NFKC', prev.get('r') or '')
-        hit = next((p for p in t.get('prev') or [] if p['key'] in rn), None)
+        hit = best and not best[1].endswith('走前）')
         if hit:
-            out.append((hit['v'], hit['note']))
+            pass
         else:
             grade = re.search(r'G[1-3]|GI{1,3}|\(G|重賞', rn)
             for p in t.get('prev_cls') or []:
