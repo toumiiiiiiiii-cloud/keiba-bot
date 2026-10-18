@@ -1788,6 +1788,7 @@ def sim_blend(race, arr):
         if not hs:
             continue
         h['simWin'], h['simTop3'] = hs['win'], hs['top3']
+        h['simPos'] = hs.get('pos_cnt')
     tot = 0.0
     for h in arr:
         h['pPreSim'] = h['p']
