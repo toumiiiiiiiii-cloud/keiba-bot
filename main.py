@@ -1363,7 +1363,8 @@ def apply_model(race, arr, odds):
         bset = set(bst.get('names', []))
         beta = [b * bst['k'] if n in bset else b for n, b in zip(names, beta)]
     if not use_noodds:
-        beta = [b * ODDS_W if n == 'log_market' else b * AI_W for n, b in zip(names, beta)]   # オッズ・AIの材料の効き（Tomiさんの指定の割合）
+        ow, aw, _, _ = ratio_today()
+        beta = [b * ow if n == 'log_market' else b * aw for n, b in zip(names, beta)]   # オッズ・AIの材料の効き（Tomiさんの指定の割合）
     if no_odds:
         beta = [0.0 if n == 'log_market' else b for n, b in zip(names, beta)]
     # 血統の効きを上げる場面（Tomiさんの指定）：新馬戦×3／2歳戦×2／ダート→芝・芝→ダートに替わる馬×3（その馬だけ）
@@ -1479,6 +1480,16 @@ ODDS_W = 1.0               # 学習したそのままの割合（オッズを土
 AI_W = 1.0
 BOOST_W = 2.7               # 重点補正（以前の大きさに戻す）
 BOOST_CAP = 1.0             # 1頭の補正の上限（勝率およそ0.37〜2.7倍）
+# その日だけの割合（Tomiさんの指定）。日付（日本時間）→ (オッズ, AIの材料, 重点補正, 補正の上限)
+#   オッズ3割：オッズ0.41：重点補正0.57：AIの材料0.38（全体の大きさ約1.35はそのまま。下げた分を3：2で振り分け）
+RATIO_BY_DAY = {
+    '2026-10-18': (0.39, 2.52, 3.8, 1.4),
+}
+
+
+def ratio_today():
+    d = (datetime.datetime.utcnow() + datetime.timedelta(hours=9)).strftime('%Y-%m-%d')
+    return RATIO_BY_DAY.get(d, (ODDS_W, AI_W, BOOST_W, BOOST_CAP))
 
 
 def _first_ratio(l):
@@ -1922,7 +1933,8 @@ def manual_boost(race, arr):
                     adj += add(v, t_, -0.08, 0.08)
             except Exception as e:
                 print(f"[trend] 傾向の補正を計算できず: {e}", flush=True)
-        adj = clamp(adj * BOOST_W, -BOOST_CAP, BOOST_CAP)
+        _, _, bw, bc = ratio_today()
+        adj = clamp(adj * bw, -bc, bc)
         h['boostAdj'] = adj
         h['boostParts'] = parts
         h['boostNotes'] = [t for v, t in sorted(parts, key=lambda x: -abs(x[0])) if t][:5]
