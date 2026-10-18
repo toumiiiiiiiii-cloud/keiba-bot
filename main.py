@@ -914,7 +914,9 @@ except Exception:
 
 
 def _going_grp(g):
-    return '良' if g == '良' else '稍' if g and g.startswith('稍') else '重'
+    """良・稍重・重・不良の4つに分ける"""
+    g = g or ''
+    return '良' if g.startswith('良') else '稍' if g.startswith('稍') else '不' if g.startswith('不') else '重' if g.startswith('重') else '良'
 
 
 def time2_figure(l):
@@ -926,8 +928,14 @@ def time2_figure(l):
     b = ti['base'].get(f"{l.get('p')}|{surf}|{dist}")
     if not b or not dist:
         return None
-    v = ti['var'].get(f"{l.get('d')}|{l.get('p')}|{surf}|{_going_grp(l.get('cond'))}",
-                      ti['var'].get(f"{l.get('d')}|{l.get('p')}|{surf}|*", 0.0))
+    var, g = ti['var'], _going_grp(l.get('cond'))
+    k = f"{l.get('d')}|{l.get('p')}|{surf}|{g}"
+    goff = (var.get('_goff') or {}).get(f"{surf}|{g}", 0.0)
+    if k in var:
+        v = var[k]
+    else:
+        # その日・同じ馬場のレースが少ないときは、その日全体の馬場差＋馬場状態ごとの平均の差
+        v = var.get(f"{l.get('d')}|{l.get('p')}|{surf}|*", 0.0) + goff
     km = dist / 1000
     try:
         wt = float(l.get('w') or 55)
