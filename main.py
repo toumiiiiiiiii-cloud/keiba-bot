@@ -1773,7 +1773,7 @@ def sim_blend(race, arr):
         notes.append(f"{src}の{race['venue']}{race['surf']}{'' if tb[0] == '全体' else tb[0]}：{w_}{'・' + st_['io'] if st_.get('io') else ''}")
     tr_ = race_trend(race)
     if tr_ and tr_.get('sim_style'):
-        style_k += float(tr_['sim_style'])
+        style_k += float(tr_['sim_style']) * float(tr_.get('weight') or 1.0)
         notes.append(tr_.get('sim_note') or '')
     extra = []
     for h in arr:
@@ -1940,11 +1940,14 @@ def manual_boost(race, arr):
         tr_ = race_trend(race)
         if tr_:
             try:
+                tw = float(tr_.get('weight') or 1.0)     # そのレースの傾向の強さ（Tomiさんの指定で強めたレースは2倍など）
                 for v, t_ in trend_points(tr_, h):
-                    adj += add(v, t_, -0.08, 0.08)
+                    adj += add(v * tw, t_, -0.08 * tw, 0.08 * tw)
             except Exception as e:
                 print(f"[trend] 傾向の補正を計算できず: {e}", flush=True)
         _, _, bw, bc = ratio_today()
+        if tr_ and tr_.get('cap_k'):
+            bc *= float(tr_['cap_k'])                  # 傾向を強めたレースは、1頭の補正の上限も広げる
         adj = clamp(adj * bw, -bc, bc)
         h['boostAdj'] = adj
         h['boostParts'] = parts
