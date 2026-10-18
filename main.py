@@ -785,6 +785,16 @@ def line_key(l):
 
 AI_PUSH_EV = 1.0
 AI_PUSH_MAX_ODDS = 50.0   # 2025年・2026年の答え合わせ：期待値1.0以上・50倍以下で単勝150%／123%、複勝109%／113%
+# 1400m以下は推奨しない（2024・2025・2026年の答え合わせで、期待値で買う単勝が 75%／78%／54%。3連系・馬連でも同じく弱い）
+SPRINT_SKIP_DIST = 1400
+SPRINT_SKIP = True
+
+
+def is_sprint(race):
+    try:
+        return race.get('surf') in ('芝', 'ダ') and 0 < int(race.get('dist') or 0) <= SPRINT_SKIP_DIST
+    except (TypeError, ValueError):
+        return False
 
 
 def ranked(race, horses, odds):
@@ -870,7 +880,10 @@ def ranked(race, horses, odds):
     for h in arr:
         # 判定は学習と同じ勝率（補正前・効きを変える前）×オッズで（バックテストで2年とも100%超だったのはこの数字）
         h['evRaw'] = (h['pRaw'] * h['o']) if h.get('pRaw') and h.get('o') else None
-        h['aiPush'] = bool(race.get('model') and h.get('evRaw') and h['evRaw'] >= AI_PUSH_EV and (h.get('o') or 999) <= AI_PUSH_MAX_ODDS)
+        h['aiPush'] = bool(race.get('model') and h.get('evRaw') and h['evRaw'] >= AI_PUSH_EV and (h.get('o') or 999) <= AI_PUSH_MAX_ODDS
+                           and not (SPRINT_SKIP and is_sprint(race)))
+        h['sprintSkip'] = bool(SPRINT_SKIP and is_sprint(race))
+    race['sprintSkip'] = bool(SPRINT_SKIP and is_sprint(race))
     race['aiPush'] = sorted([h for h in arr if h['aiPush']], key=lambda h: -h['evRaw'])
     return arr
 
@@ -2446,6 +2459,9 @@ def best_bet(arr, plan=None):
         return {'skip': True, 'noOdds': True, 'kind': '単勝', 'combos': [],
                 'why': 'オッズ未発表のため判定できません（オッズ発表後にもう一度送ってください）'}
     pa, pm = prob_tables(arr)
+    if any(h.get('sprintSkip') for h in arr):
+        return {'skip': True, 'kind': '単勝', 'combos': [],
+                'why': f'{SPRINT_SKIP_DIST}m以下は見送り推奨（3年の答え合わせで、期待値で買っても単勝75%／78%／54%と負け越し）'}
     push = [h for h in arr if h.get('aiPush')]
     if not push:
         return {'skip': True, 'kind': '単勝', 'combos': [],
@@ -2453,7 +2469,7 @@ def best_bet(arr, plan=None):
     h = max(push, key=lambda x: x.get('evRaw') or x['ev'])
     return {'skip': False, 'kind': '単勝', 'name': '単勝', 'combos': [(h['n'],)], 'n': 1, 'cost': 100,
             'horse': h, 'hit': h['p'], 'pay': h['o'], 'ev': h.get('evRaw') or h['ev'], 'edge': h['p'] / max(pm[h['n']], 1e-9),
-            'why': f"実力とオッズのズレ＝期待値{AI_PUSH_EV}以上・{AI_PUSH_MAX_ODDS:.0f}倍以下の中で一番（答えを知らない2年の答え合わせで単勝150%／123%・複勝109%／113%）"}
+            'why': f"実力とオッズのズレ＝期待値{AI_PUSH_EV}以上・{AI_PUSH_MAX_ODDS:.0f}倍以下の中で一番（1400m超の答え合わせ：2024〜2026年で単勝137%／174%／154%・複勝123%／117%／133%）"}
 
 
 def best_bet_text(bb):
@@ -4300,12 +4316,13 @@ def render_image(race, arr):
     # ── 買い目 ──
     if race.get('model'):
         ps = race.get('aiPush') or []
-        t_ = ('AI推し（期待値1.1以上）：' + '、'.join(f"{h['n']}{h['name']}（{h['ev']:.2f}）" for h in ps[:3])) if ps \
-            else 'AI推し（期待値1.1以上）：該当なし'
+        t_ = ('AI推し（期待値1.0以上）：' + '、'.join(f"{h['n']}{h['name']}（{(h.get('evRaw') or h['ev']):.2f}）" for h in ps[:3])) if ps \
+            else ('AI推し：1400m以下は見送り' if race.get('sprintSkip') else 'AI推し（期待値1.0以上）：該当なし')
         ctext(d, W / 2, y - 22, fit_text(d, t_, F('sans_b', 24), W - PAD * 2), F('sans_b', 24),
               (120, 220, 140) if ps else MUTED)
         y += 22
-    axis_t = f"― おすすめ買い目　軸 ◎{arr[0]['n']} {arr[0]['name']} ―"
+    _ps = race.get('aiPush') or []
+    axis_t = (f"― おすすめ買い目　軸 イチ推し{_ps[0]['n']} {_ps[0]['name']} ―" if _ps else "― おすすめ買い目 ―")
     box_h = draw_bet_section(d, PAD, y, W - PAD, brows, {h['n']: h.get('w') for h in arr}, title=axis_t)
     y += box_h + 24
 
@@ -4325,7 +4342,7 @@ def render_image(race, arr):
 # 買い目の表示（券種ごとに色分けしたカード）と予算の割り振り
 # ═════════════════════════════════════════
 CAT_COLOR = {'推奨': (226, 112, 40), '本線': (201, 160, 70), '妙味': (40, 165, 85), '穴': (216, 62, 62), '高目': (150, 85, 205),
-             '2頭軸': (150, 85, 205), 'イチ推し': (230, 60, 90), '勝負': (150, 85, 205), '検証': (90, 110, 140)}
+             '2頭軸': (150, 85, 205), 'イチ推し': (230, 60, 90), '勝負': (150, 85, 205), '検証': (90, 110, 140), 'イチ推し軸': (230, 60, 90)}
 KIND_COLOR = {'3連複2頭軸流し': (140, 105, 225), '単勝': (224, 86, 86), '複勝': (234, 140, 70), '馬連': (60, 135, 225), 'ワイド': (40, 175, 160),
               '馬単': (90, 110, 230), '3連複': (140, 105, 225), '3連単': (214, 72, 160), '枠連': (120, 140, 160)}
 CAT_W = {'推奨': 0.15, '本線': 0.65, '妙味': 0.10, '穴': 0.10}      # 予算の割合（項目ごと）
@@ -4345,6 +4362,11 @@ def bet_rows_for(arr, race=None):
         except Exception:
             traceback.print_exc()
             recs = []
+        if not recs:
+            bb = best_bet(arr)
+            why = (bb or {}).get('why') or '期待値1.0以上の馬がいないため見送り推奨'
+            return [{'label': BEST_LABEL, 'kind': '見送り', 'combos': [], 'body': why, 'n': 0,
+                     'note': '◎から組む買い目は3年とも回収70〜85%のため出しません', 'per': None, 'amount': None}]
         if recs:
             for r in recs:
                 if r['method'] == 'normal':
@@ -6495,83 +6517,46 @@ def _roi_short(roi):
 
 
 def recommended_tickets(arr, race=None):
-    """本当に推奨する買い目だけ（2年分の確かめで回収率が良かった順）。馬券の画像にして送る
-    ①イチ推し（期待値1.1以上の単勝）②ワイド◎-穴 ③3連複◎○-穴 ④3連単（本線）。①〜③が無いときは本線を1つ"""
+    """推奨の買い目（2024・2025・2026年の答え合わせで3年とも100%超の形だけ）
+    軸＝イチ推し（期待値1.0以上・50倍以下で一番の馬）、相手＝AIの上位5頭（軸を除く）
+      単勝・複勝（1点ずつ）／3連複 軸→相手5頭（10点）／ワイド 軸→相手5頭（5点）／馬連 軸→相手5頭（5点）
+    ◎から組む買い目はどの券種も70〜85%（控除率に負ける）ので出さない。イチ推しがいなければ見送り（空のリスト）
+    1400m以下は見送り。馬単・3連単は大穴頼みで年によって100%を切るので推奨しない"""
     a = sorted(arr, key=lambda h: -h['p'])
     if len(a) < 3:
         return []
-    n = [h['n'] for h in a]
-    name = {h['n']: h for h in a}
-    plan = bet_plan(arr)
-    pa = {h['n']: max(1e-6, h['p']) for h in a}
-    recs = []
-    bb = best_bet(arr, plan)
-    if bb and not bb.get('skip'):
-        h = bb['horse']
-        recs.append({'kind': '単勝', 'method': 'single', 'title': '通常', 'labels': ['馬番'], 'cols': [[h['n']]],
-                     'combos': [(h['n'],)], 'badge': 'イチ推し', 'hit': h['p'],
-                     'note': f"イチ推し：{h['n']}番 {h['o']}倍・期待値{bb['ev']:.2f}",
-                     'why': f"単勝 {h['n']} {h['name']}（{h['o']}倍・期待値{bb['ev']:.2f}。期待値1.1以上の単勝は2年とも回収率100%超）"})
-    for b in plan:
-        if b['label'] != '穴':
-            continue
-        for kind, combos in b['parts']:
-            if not combos:
-                continue
-            spec = next((sp for sp in BET_RULES.get('ana_bets') or [] if ANA_BET_JP.get(sp['bet']) == kind
-                         and (kind != '3連複' or '◎○' in sp['bet'])), {})
-            if kind == 'ワイド':
-                c = combos[0]
-                ana = c[1] if c[0] == n[0] else c[0]
-                cols = [[n[0], ana]]
-                why = f"ワイド {n[0]}-{ana}（◎{name[n[0]]['name']}と穴{name[ana]['name']} {name[ana].get('o')}倍）"
-            elif kind == '3連複' and len(combos) == 1:
-                c = combos[0]
-                ana = next((x for x in c if x not in n[:2]), None)
-                if ana is None or len(set(c)) < 3:
-                    continue
-                cols = [[n[0], n[1], ana]]
-                why = f"3連複 {n[0]}-{n[1]}-{ana}（◎○と穴{name[ana]['name']} {name[ana].get('o')}倍）"
-            else:
-                continue
-            roi = _roi_short(spec.get('roi', ''))
-            recs.append({'kind': kind, 'method': 'normal', 'title': '通常', 'labels': ['馬番'], 'cols': cols,
-                         'combos': [tuple(sorted(cols[0]))], 'badge': '穴', 'hit': combo_prob(kind, tuple(sorted(cols[0])), pa)
-                         if kind != 'ワイド' else None,
-                         'note': f"穴：{ana}番（{name[ana].get('o')}倍）" + (f"・2年の回収 {roi}%" if roi else ''),
-                         'why': why + (f"。2年の回収率 {roi}%" if roi else '')})
-    tan = sanren_combos(a, '3連単')
-    tr = BET_RULES.get('sanren_tan')
-    if not all('pRaw' in h for h in a) or 'nar.' in str((race or {}).get('base', '')):
-        # 地方競馬・オッズが無いレース（海外・前日など）：3連単は頭（1着）を◎1頭に固定 → 2着 ○▲△ → 3着 2〜6番手（12点）
-        if len(n) >= 6:
-            cols = [[n[0]], n[1:4], n[1:6]]
-            tan1 = _combos_from_cols('3連単', cols)
-            recs.append({'kind': '3連単', 'method': 'form', 'title': 'フォーメーション', 'labels': ['1着', '2着', '3着'],
-                         'cols': cols, 'combos': tan1, 'badge': '本線', 'hit': sum(combo_prob('3連単', c, pa) for c in tan1),
-                         'note': '地方・オッズ無しは1着◎固定',
-                         'why': f"3連単 {n[0]} → {','.join(map(str, cols[1]))} → {','.join(map(str, cols[2]))}"
-                                f"（{len(tan1)}点・地方／オッズが無いレースは1着を◎1頭に固定）"})
-        tan, tr = [], None
-    if tan and tr:
-        cols = _prune_cols('3連単', tan_cols(a, n, tr), tan)
-        recs.append({'kind': '3連単', 'method': 'form', 'title': 'フォーメーション', 'labels': ['1着', '2着', '3着'],
-                     'cols': cols, 'combos': tan, 'badge': '本線', 'hit': sum(combo_prob('3連単', c, pa) for c in tan),
-                     'note': f"本線・2年の回収 {_roi_short(tr.get('roi', ''))}%" if tr.get('roi') else '本線',
-                     'why': f"3連単 {','.join(map(str, cols[0]))} → {','.join(map(str, cols[1]))} → {','.join(map(str, cols[2]))}"
-                            f"（{len(tan)}点）" + (f"。2年の回収率 {_roi_short(tr['roi'])}%" if tr.get('roi') else '')})
-    if not recs:
-        fuku = sanren_combos(a, '3連複')
-        if fuku:
-            two = sanren_shape(a) != 'open'
-            axes = n[:2] if two else n[:1]
-            mates = sorted({x for c in fuku for x in c} - set(axes), key=n.index)
-            recs.append({'kind': '3連複', 'method': 'nagashi', 'title': f"軸{len(axes)}頭ながし", 'labels': ['軸', '相手'],
-                         'cols': [axes, mates], 'combos': fuku, 'badge': '本線',
-                         'hit': sum(combo_prob('3連複', c, pa) for c in fuku),
-                         'note': '強く推せる買い目なし・本線のみ',
-                         'why': f"3連複 軸{'-'.join(map(str, axes))} 相手{','.join(map(str, mates))}（{len(fuku)}点）。"
-                                "回収率100%を超える条件の買い目が無いレースなので、買うならこれ（見送りも可）"})
+    bb = best_bet(arr)
+    if not bb or bb.get('skip'):
+        return []
+    h = bb['horse']
+    ax = h['n']
+    mates = [x['n'] for x in a if x['n'] != ax][:5]
+    pa = {x['n']: max(1e-6, x['p']) for x in a}
+    recs = [{'kind': '単勝', 'method': 'single', 'title': '通常', 'labels': ['馬番'], 'cols': [[ax]],
+             'combos': [(ax,)], 'badge': 'イチ推し', 'hit': h['p'],
+             'note': f"イチ推し：{ax}番 {h['o']}倍・期待値{bb['ev']:.2f}",
+             'why': f"単勝 {ax} {h['name']}（{h['o']}倍・期待値{bb['ev']:.2f}。3年の回収率 137%／174%／154%）"}]
+    if len(mates) >= 2:
+        c3 = [tuple(sorted((ax, x, y))) for x, y in itertools.combinations(mates, 2)]
+        recs.append({'kind': '3連複', 'method': 'nagashi', 'title': '軸1頭ながし', 'labels': ['軸', '相手'],
+                     'cols': [[ax], mates], 'combos': c3, 'badge': 'イチ推し軸',
+                     'hit': sum(combo_prob('3連複', c, pa) for c in c3),
+                     'note': "イチ推し軸・3年回収222/278/200%",
+                     'why': f"3連複 軸{ax} 相手{','.join(map(str, mates))}（{len(c3)}点。イチ推し軸→AIの上位。3年の回収率 222%／278%／200%）"})
+    c2 = [tuple(sorted((ax, x))) for x in mates]
+    recs.append({'kind': 'ワイド', 'method': 'nagashi', 'title': '軸1頭ながし', 'labels': ['軸', '相手'],
+                 'cols': [[ax], mates], 'combos': c2, 'badge': 'イチ推し軸', 'hit': None,
+                 'note': "イチ推し軸・3年回収170/161/140%",
+                 'why': f"ワイド 軸{ax} 相手{','.join(map(str, mates))}（{len(c2)}点。3年の回収率 170%／161%／140%）"})
+    recs.append({'kind': '馬連', 'method': 'nagashi', 'title': '軸1頭ながし', 'labels': ['軸', '相手'],
+                 'cols': [[ax], mates], 'combos': c2, 'badge': 'イチ推し軸',
+                 'hit': sum(combo_prob('馬連', c, pa) for c in c2),
+                 'note': "イチ推し軸・3年回収200/175/139%",
+                 'why': f"馬連 軸{ax} 相手{','.join(map(str, mates))}（{len(c2)}点。3年の回収率 200%／175%／139%）"})
+    recs.append({'kind': '複勝', 'method': 'single', 'title': '通常', 'labels': ['馬番'], 'cols': [[ax]],
+                 'combos': [(ax,)], 'badge': 'イチ推し', 'hit': None,
+                 'note': f"イチ推しの複勝・3年の回収 123/117/133%",
+                 'why': f"複勝 {ax} {h['name']}（3年の回収率 123%／117%／133%）"})
     for r in recs:
         r['per'] = 100
         r['multi'] = False
