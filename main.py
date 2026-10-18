@@ -1363,7 +1363,7 @@ def apply_model(race, arr, odds):
         bset = set(bst.get('names', []))
         beta = [b * bst['k'] if n in bset else b for n, b in zip(names, beta)]
     if not use_noodds:
-        ow, aw, _, _ = ratio_today()
+        ow, aw, _, _ = ratio_today(race)
         beta = [b * ow if n == 'log_market' else b * aw for n, b in zip(names, beta)]   # オッズ・AIの材料の効き（Tomiさんの指定の割合）
     if no_odds:
         beta = [0.0 if n == 'log_market' else b for n, b in zip(names, beta)]
@@ -1487,9 +1487,14 @@ RATIO_BY_DAY = {
 }
 
 
-def ratio_today():
+def ratio_today(race=None):
+    base_ = (ODDS_W, AI_W, BOOST_W, BOOST_CAP)
+    if race is not None:
+        tr = race_trend(race)
+        if tr and tr.get('ratio') == 'learned':     # このレースは学習したそのままの割合（Tomiさんの指定）
+            return base_
     d = (datetime.datetime.utcnow() + datetime.timedelta(hours=9)).strftime('%Y-%m-%d')
-    return RATIO_BY_DAY.get(d, (ODDS_W, AI_W, BOOST_W, BOOST_CAP))
+    return RATIO_BY_DAY.get(d, base_)
 
 
 def _first_ratio(l):
@@ -1946,7 +1951,7 @@ def manual_boost(race, arr):
                     adj += add(v * tw, t_, -0.08 * tw, 0.08 * tw)
             except Exception as e:
                 print(f"[trend] 傾向の補正を計算できず: {e}", flush=True)
-        _, _, bw, bc = ratio_today()
+        _, _, bw, bc = ratio_today(race)
         if tr_ and tr_.get('cap_k'):
             bc *= float(tr_['cap_k'])                  # 傾向を強めたレースは、1頭の補正の上限も広げる
         adj = clamp(adj * bw, -bc, bc)
