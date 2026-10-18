@@ -1727,6 +1727,12 @@ def _prev_day_band(race):
     return cached(('pband', pre, race['surf'], race['dist']), 3600, load)
 
 
+# 右回り・左回りの効き（Tomiさんの指定で強め。以前は 0.6倍・上限0.35・シミュレーションの中だけ）
+TURN_K = 1.2        # 得意不得意の差 × 1.2（シミュレーションの速さ）
+TURN_CAP = 0.7
+TURN_W = 0.6        # 勝率にも直接かける（勝率およそ 0.66〜1.5倍）
+
+
 def turn_pref(race, h):
     """右回り・左回りの得意不得意（3着以内率の差）。それぞれ2戦以上のときだけ"""
     cs = [l for l in (h.get('career') or h.get('lines') or []) if (l.get('pos') or 0) > 0 and l.get('p') in KNOWN_DIR]
@@ -1741,11 +1747,11 @@ def turn_pref(race, h):
         return (sum(1 for l in ls if l['pos'] <= 3) + sum(1 for l in ls if l['pos'] == 1)) / (2 * len(ls))
     d = rate(same) - rate(other)
     k = min(len(same), len(other))
-    d *= k / (k + 2)          # レース数が少ないときは控えめに
-    if abs(d) < 0.12:
+    d *= k / (k + 1)          # レース数が少ないときは控えめに
+    if abs(d) < 0.08:
         return 0.0, ''
     side = '左' if left else '右'
-    return clamp(d * 0.6, -0.35, 0.35), (f"{side}回りが得意（{rec_str(same)[0]}／逆回り{rec_str(other)[0]}）" if d > 0
+    return clamp(d * TURN_K, -TURN_CAP, TURN_CAP), (f"{side}回りが得意（{rec_str(same)[0]}／逆回り{rec_str(other)[0]}）" if d > 0
                                           else f"{side}回りは苦手（{rec_str(same)[0]}／逆回り{rec_str(other)[0]}）")
 
 
@@ -1787,6 +1793,11 @@ def sim_blend(race, arr):
         h['pPreSim'] = h['p']
         h['p'] = (1 - SIM_W) * h['p'] + SIM_W * h.get('simWin', h['p'])
         tot += h['p']
+    # 右回り・左回りの得意不得意を勝率にも直接かける
+    for h, v in zip(arr, extra):
+        if v:
+            h['p'] *= math.exp(TURN_W * v)
+    tot = sum(h['p'] for h in arr) or 1.0
     for h in arr:
         h['p'] /= tot
         h['ev'] = h['p'] * h['o'] if h.get('o') else None
