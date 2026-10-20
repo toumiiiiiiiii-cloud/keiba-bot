@@ -34,6 +34,12 @@ app = Flask(__name__)
 # ── ログの窓口：Botが出した記録（print・エラー）を最新3000行だけ覚えておき、/logs?key=… で読めるようにする ──
 #    Renderの環境変数 LOG_KEY を入れたときだけ動く（入っていなければ /logs は「無い」と答える）
 import collections as _collections
+import numpy as np
+try:
+    import nar_mode as NM
+except Exception as _e:
+    NM = None
+    print(f'[nar] 地方モードを読み込めず: {_e}', flush=True)
 import hmac as _hmac
 _LOG_BUF = _collections.deque(maxlen=3000)
 _LOG_LOCK = threading.Lock()
@@ -797,6 +803,60 @@ def is_sprint(race):
         return False
 
 
+def nar_apply(race, arr):
+    """地方競馬（帯広以外）：地方の結果で学習したAIで勝率を出し直す。オッズが全頭そろっているときだけ"""
+    if not NM or 'nar.' not in race.get('base', '') or race.get('banei'):
+        return False
+    M_ = NM.load()
+    if not M_ or not M_.get('beta'):
+        return False
+    vcode = NM.CODE.get(race.get('venue'))
+    if not vcode or len(arr) < 5 or not all(h.get('o') for h in arr):
+        return False
+    T_ = M_['tables']
+    rd = race['date'].strftime('%Y.%m.%d') if race.get('date') else '9999.99.99'
+    hs = []
+    for h in arr:
+        past = []
+        for l in reversed(h.get('career') or h.get('lines') or []):
+            vc = NM.CODE.get(l.get('p'))
+            if not vc or l.get('d', '9') >= rd or not l.get('pos'):
+                continue
+            surf = (l.get('dist') or '')[:1]
+            dist = dist_num(l.get('dist'))
+            past.append({'d': l['d'], 'v': vc, 'pos': l['pos'], 'N': l.get('f') or 12, 'pop': l.get('pop') or None,
+                         'gap': max(0.0, l['m']) if l.get('m') is not None and l['m'] < 9 else None, 'ps': l.get('ps') or '',
+                         'fig': NM.fig_of(T_, vc, surf, dist, l.get('cond'), l.get('t')) if dist else None,
+                         'surf': surf, 'jid': l.get('jid')})
+        past.sort(key=lambda x: x['d'])
+        days = 0
+        if past and race.get('date'):
+            y_, m_, d_ = map(int, past[-1]['d'].split('.'))
+            days = (race['date'] - datetime.date(y_, m_, d_)).days
+        try:
+            bw = int(h.get('bwNow') or 0) or None
+        except (TypeError, ValueError):
+            bw = None
+        hs.append({'o': h['o'], 'n': h['n'], 'jid': h.get('jid'), 'trid': h.get('trid'), 'bw': bw, 'bwd': h.get('bwDiff') or 0,
+                   'wt': h.get('wt') or 0, 'age': h.get('age') or 4, 'female': h.get('sex') == '牝', 'past': past, 'days': days})
+    try:
+        X = NM.nar_features({'v': vcode, 'surf': race.get('surf'), 'dist': int(race.get('dist') or 0), 'N': len(arr)}, hs, T_)
+        p = NM.predict(X, M_)
+    except Exception as e:
+        traceback.print_exc()
+        print(f"[nar] 地方モードで計算できず: {e}", flush=True)
+        return False
+    for h, p_, x in zip(arr, p, X):
+        h['pAI'] = h['pRaw'] = h['p'] = float(p_)
+        h['ev'] = h['p'] * h['o']
+        h['narNew'] = bool(x[17])
+        h['narMode'] = True
+    race['model'] = True
+    race['narMode'] = True
+    race['modelNote'] = f"地方モード（地方競馬{M_.get('races', 0):,}レース・{M_.get('trained', '')}で学習したオッズ＋AI。騎手・調教師・前走・先行力・タイム指数・転入など）"
+    return True
+
+
 def ranked(race, horses, odds):
     going, pace = race['going'], race['pace']
     shr = 1 - (1 - CLASS_SHRINK.get(going, 1)) * SETTINGS['mudw']
@@ -842,9 +902,15 @@ def ranked(race, horses, odds):
             r_ = h['p'] * N
             h['rank'] = 'S' if r_ >= 2.0 else 'A' if r_ >= 1.3 else 'B' if r_ >= 0.8 else 'C' if r_ >= 0.5 else 'D'
             h['anaFlag'] = h['rk'] >= 4 and h['anaScore'] >= 0.02
+    if nar_apply(race, arr):
+        arr.sort(key=lambda h: -h['p'])
+        for i, h in enumerate(arr):
+            h['rk'] = i + 1
+            r_ = h['p'] * len(arr)
+            h['rank'] = 'S' if r_ >= 2.0 else 'A' if r_ >= 1.3 else 'B' if r_ >= 0.8 else 'C' if r_ >= 0.5 else 'D'
     for h in arr:
         h['pBase'] = h['p']      # 重点補正の前の勝率（穴の決め方はこの勝率で学習したので、穴選びにはこちらを使う）
-    if MANUAL_BOOST and not os.environ.get('SYH_BACKTEST'):
+    if MANUAL_BOOST and not os.environ.get('SYH_BACKTEST') and not race.get('narMode'):
         try:
             if manual_boost(race, arr):
                 arr.sort(key=lambda h: -h['p'])
@@ -853,7 +919,7 @@ def ranked(race, horses, odds):
         except Exception as e:
             traceback.print_exc()
             print(f"[boost] 重点補正を計算できず: {e}", flush=True)
-    if SIM_BLEND and SV and not os.environ.get('SYH_BACKTEST'):
+    if SIM_BLEND and SV and not os.environ.get('SYH_BACKTEST') and not race.get('narMode'):
         try:
             if sim_blend(race, arr):
                 arr.sort(key=lambda h: -h['p'])
@@ -880,10 +946,16 @@ def ranked(race, horses, odds):
     for h in arr:
         # 判定は学習と同じ勝率（補正前・効きを変える前）×オッズで（バックテストで2年とも100%超だったのはこの数字）
         h['evRaw'] = (h['pRaw'] * h['o']) if h.get('pRaw') and h.get('o') else None
+        if race.get('narMode'):
+            # 地方モード：期待値1.0以上・15倍以下・AIの4位以下（2024〜2026年の単勝 115%／104%／127%）
+            h['aiPush'] = bool(h.get('evRaw') and h['evRaw'] >= NM.PUSH_EV and (h.get('o') or 999) <= NM.PUSH_MAX_ODDS
+                               and h['rk'] >= NM.PUSH_MIN_RANK)
+            h['sprintSkip'] = False
+            continue
         h['aiPush'] = bool(race.get('model') and h.get('evRaw') and h['evRaw'] >= AI_PUSH_EV and (h.get('o') or 999) <= AI_PUSH_MAX_ODDS
                            and not (SPRINT_SKIP and is_sprint(race)))
         h['sprintSkip'] = bool(SPRINT_SKIP and is_sprint(race))
-    race['sprintSkip'] = bool(SPRINT_SKIP and is_sprint(race))
+    race['sprintSkip'] = bool(SPRINT_SKIP and is_sprint(race)) and not race.get('narMode')
     race['aiPush'] = sorted([h for h in arr if h['aiPush']], key=lambda h: -h['evRaw'])
     return arr
 
@@ -2459,6 +2531,15 @@ def best_bet(arr, plan=None):
         return {'skip': True, 'noOdds': True, 'kind': '単勝', 'combos': [],
                 'why': 'オッズ未発表のため判定できません（オッズ発表後にもう一度送ってください）'}
     pa, pm = prob_tables(arr)
+    if any(h.get('narMode') for h in arr):
+        push = [h for h in arr if h.get('aiPush')]
+        if not push:
+            return {'skip': True, 'kind': '単勝', 'combos': [],
+                    'why': '地方モード：期待値1.0以上・15倍以下・AI4位以下の馬がいないため見送り推奨'}
+        h = max(push, key=lambda x: x.get('evRaw') or x['ev'])
+        return {'skip': False, 'kind': '単勝', 'name': '単勝', 'combos': [(h['n'],)], 'n': 1, 'cost': 100,
+                'horse': h, 'hit': h['p'], 'pay': h['o'], 'ev': h.get('evRaw') or h['ev'], 'edge': h['p'] / max(pm[h['n']], 1e-9),
+                'why': '地方モード：人気の盲点の中位の馬（期待値1.0以上・15倍以下・AI4位以下）。2024〜2026年の単勝回収率 115%／104%／127%'}
     if any(h.get('sprintSkip') for h in arr):
         return {'skip': True, 'kind': '単勝', 'combos': [],
                 'why': f'{SPRINT_SKIP_DIST}m以下は見送り推奨（3年の答え合わせで、期待値で買っても単勝75%／78%／54%と負け越し）'}
@@ -3106,6 +3187,9 @@ def parse_career_table(soup):
             dm = re.match(r'(\d{4})/(\d{1,2})/(\d{1,2})', g('d'))
             venue_txt, rname = g('p'), g('r')
             r_td = tds[I['r']] if I.get('r') is not None and I['r'] < len(tds) else None
+            j_td = tds[I['j']] if I.get('j') is not None and I['j'] < len(tds) else None
+            ja = j_td.find('a', href=re.compile(r'/jockey/')) if j_td is not None else None
+            jm_ = re.search(r'/jockey/(?:result/recent/)?(\w+)', ja.get('href', '')) if ja else None
             if not dm and r_td is not None:   # スマホ版：「26/09/13 阪神 12R レース名」
                 sm_ = re.match(r'(\d{2})/(\d{2})/(\d{2})\s*(\D+?)\s*\d+R', r_td.get_text(' ', strip=True))
                 if sm_:
@@ -3136,7 +3220,7 @@ def parse_career_table(soup):
                 'f': int(to_float(g('f')) or 0) or 16, 'n': int(to_float(g('n')) or 0),
                 'pop': int(to_float(g('pop')) or 0), 'j': g('j'), 'w': to_float(g('w')) or 0,
                 'ps': g('ps'), 'l3': to_float(g('l3')) or 0, 'bw': g('bw'), 'win': g('win'), 'm': m,
-                'rid': rid_m.group(1) if rid_m else None,
+                'rid': rid_m.group(1) if rid_m else None, 'jid': jm_.group(1) if jm_ else None,
                 'pf': float(pc.group(1)) if pc else None, 'pb': float(pc.group(2)) if pc else None,
             })
         if out:
@@ -4316,8 +4400,9 @@ def render_image(race, arr):
     # ── 買い目 ──
     if race.get('model'):
         ps = race.get('aiPush') or []
-        t_ = ('AI推し（期待値1.0以上）：' + '、'.join(f"{h['n']}{h['name']}（{(h.get('evRaw') or h['ev']):.2f}）" for h in ps[:3])) if ps \
-            else ('AI推し：1400m以下は見送り' if race.get('sprintSkip') else 'AI推し（期待値1.0以上）：該当なし')
+        lab_ = 'AI推し（地方：期待値1.0以上・15倍以下・AI4位以下）' if race.get('narMode') else 'AI推し（期待値1.0以上）'
+        t_ = (lab_ + '：' + '、'.join(f"{h['n']}{h['name']}（{(h.get('evRaw') or h['ev']):.2f}）" for h in ps[:3])) if ps \
+            else ('AI推し：1400m以下は見送り' if race.get('sprintSkip') else lab_ + '：該当なし')
         ctext(d, W / 2, y - 22, fit_text(d, t_, F('sans_b', 24), W - PAD * 2), F('sans_b', 24),
               (120, 220, 140) if ps else MUTED)
         y += 22
@@ -4327,7 +4412,7 @@ def render_image(race, arr):
     y += box_h + 24
 
     if race.get('model'):
-        ctext(d, W / 2, y, '評価＝平均的な馬の何倍勝ちやすいか　S≥2.0倍 ／ A≥1.3 ／ B≥0.8 ／ C≥0.5 ／ D　「推」＝期待値1.1以上', F('sans_r', 20), MUTED)
+        ctext(d, W / 2, y, '評価＝平均的な馬の何倍勝ちやすいか　S≥2.0倍 ／ A≥1.3 ／ B≥0.8 ／ C≥0.5 ／ D　「推」＝期待値1.0以上', F('sans_r', 20), MUTED)
         foot = f"※{race['modelNote']}。オッズは取得時点のもの"
     else:
         ctext(d, W / 2, y, 'スコア×1.00基準　S≥1.08 ／ A≥1.03 ／ B≥1.00 ／ C≥0.96 ／ D', F('sans_r', 20), MUTED)
@@ -4342,7 +4427,7 @@ def render_image(race, arr):
 # 買い目の表示（券種ごとに色分けしたカード）と予算の割り振り
 # ═════════════════════════════════════════
 CAT_COLOR = {'推奨': (226, 112, 40), '本線': (201, 160, 70), '妙味': (40, 165, 85), '穴': (216, 62, 62), '高目': (150, 85, 205),
-             '2頭軸': (150, 85, 205), 'イチ推し': (230, 60, 90), '勝負': (150, 85, 205), '検証': (90, 110, 140), 'イチ推し軸': (230, 60, 90)}
+             '2頭軸': (150, 85, 205), 'イチ推し': (230, 60, 90), '勝負': (150, 85, 205), '検証': (90, 110, 140), 'イチ推し軸': (230, 60, 90), '楽しむ用': (90, 140, 200)}
 KIND_COLOR = {'3連複2頭軸流し': (140, 105, 225), '単勝': (224, 86, 86), '複勝': (234, 140, 70), '馬連': (60, 135, 225), 'ワイド': (40, 175, 160),
               '馬単': (90, 110, 230), '3連複': (140, 105, 225), '3連単': (214, 72, 160), '枠連': (120, 140, 160)}
 CAT_W = {'推奨': 0.15, '本線': 0.65, '妙味': 0.10, '穴': 0.10}      # 予算の割合（項目ごと）
@@ -4366,7 +4451,8 @@ def bet_rows_for(arr, race=None):
             bb = best_bet(arr)
             why = (bb or {}).get('why') or '期待値1.0以上の馬がいないため見送り推奨'
             return [{'label': BEST_LABEL, 'kind': '見送り', 'combos': [], 'body': why, 'n': 0,
-                     'note': '◎から組む買い目は3年とも回収70〜85%のため出しません', 'per': None, 'amount': None}]
+                     'note': ('地方モード：推奨の条件に合う馬・目がないレース' if (race or {}).get('narMode') else
+                              '◎から組む買い目は3年とも回収70〜85%のため出しません'), 'per': None, 'amount': None}]
         if recs:
             for r in recs:
                 if r['method'] == 'normal':
@@ -4379,7 +4465,7 @@ def bet_rows_for(arr, race=None):
                     body = ','.join(map(str, r['cols'][0]))
                 rows.append({'label': r['badge'] if r['badge'] != 'イチ推し' else BEST_LABEL, 'kind': r['kind'],
                              'combos': r['combos'], 'body': body, 'note': r.get('note', ''), 'n': len(r['combos']),
-                             'per': None, 'amount': None})
+                             'per': r.get('per') if r.get('amount') else None, 'amount': r.get('amount')})
             return rows
     plan = bet_plan(arr)
     bb = best_bet(arr, plan)
@@ -6525,6 +6611,8 @@ def recommended_tickets(arr, race=None):
     a = sorted(arr, key=lambda h: -h['p'])
     if len(a) < 3:
         return []
+    if (race or {}).get('narMode'):
+        return nar_tickets(race, a)
     bb = best_bet(arr)
     if not bb or bb.get('skip'):
         return []
@@ -6559,6 +6647,38 @@ def recommended_tickets(arr, race=None):
                  'why': f"複勝 {ax} {h['name']}（3年の回収率 123%／117%／133%）"})
     for r in recs:
         r['per'] = 100
+        r['multi'] = False
+    return recs
+
+
+def nar_tickets(race, a):
+    """地方モードの推奨（金額つき・1レースの予算は 推奨1,000円＋楽しむ用1,000円）
+    ①推奨：期待値1.0以上・15倍以下・AI4位以下の単勝（3年とも105%以上）。該当が複数なら予算を等分
+    ②楽しむ用：1番人気を1着に固定した馬単（相手はAI上位5頭、お得度1.2以上の目だけ、お得度に比例して配分）。3年の回収率84%／104%／89%"""
+    recs = []
+    push = [h for h in a if h.get('aiPush')]
+    if push:
+        per = NM.unit100(NM.BUDGET_PUSH / len(push))
+        for h in push:
+            recs.append({'kind': '単勝', 'method': 'single', 'title': '通常', 'labels': ['馬番'], 'cols': [[h['n']]],
+                         'combos': [(h['n'],)], 'badge': '推奨', 'hit': h['p'], 'per': per, 'amount': per,
+                         'note': f"{h['name']} {h['o']}倍・AI{h['rk']}位・期待値{h['evRaw']:.2f}",
+                         'why': f"単勝 {h['n']} {h['name']} に{per:,}円（{h['o']}倍・AIの{h['rk']}位・期待値{h['evRaw']:.2f}。"
+                                "地方の人気の盲点の中位の馬。2024〜2026年の回収率 115%／104%／127%）"})
+    try:
+        pm_ = np.array([1.0 / h['o'] for h in a]); pm_ /= pm_.sum()
+        fun = NM.exacta_fun(np.array([h['p'] for h in a]), pm_, [h['n'] for h in a])
+    except Exception:
+        traceback.print_exc()
+        fun = []
+    name = {h['n']: h['name'] for h in a}
+    for x, y_, amt, e in fun:
+        recs.append({'kind': '馬単', 'method': 'normal', 'title': '通常', 'labels': ['1着', '2着'], 'cols': [[x, y_]],
+                     'combos': [(x, y_)], 'badge': '楽しむ用', 'hit': None, 'per': amt, 'amount': amt,
+                     'note': f"1番人気{x}→{y_}（お得度{e:.2f}）",
+                     'why': f"馬単 {x}→{y_} に{amt:,}円（1番人気{name.get(x, '')}を1着に固定、相手はAIの上位。お得度{e:.2f}。"
+                            "3年の回収率は84%／104%／89%。勝ち越せていないので楽しむ用）"})
+    for r in recs:
         r['multi'] = False
     return recs
 
