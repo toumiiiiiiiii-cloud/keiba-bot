@@ -902,6 +902,19 @@ def ranked(race, horses, odds):
             r_ = h['p'] * N
             h['rank'] = 'S' if r_ >= 2.0 else 'A' if r_ >= 1.3 else 'B' if r_ >= 0.8 else 'C' if r_ >= 0.5 else 'D'
             h['anaFlag'] = h['rk'] >= 4 and h['anaScore'] >= 0.02
+    if race.get('banei') and len(arr) >= 3 and all(h.get('o') for h in arr):
+        inv = [1.0 / h['o'] for h in arr]
+        tot = sum(inv)
+        for h, v in zip(arr, inv):
+            h['pAI'] = h['pRaw'] = h['p'] = v / tot
+            h['ev'] = h['p'] * h['o']
+        race['model'] = True
+        race['baneiMode'] = True
+        race['modelNote'] = ('ばんえいモード（オッズの勝率をそのまま使用。ばんえい専用AIは2021〜2026年の1万レースで試したが、'
+                             '期待値で勝てる買い方が見つからなかったため推奨は出さない）')
+        arr.sort(key=lambda h: -h['p'])
+        for i, h in enumerate(arr):
+            h['rk'] = i + 1
     if nar_apply(race, arr):
         arr.sort(key=lambda h: -h['p'])
         for i, h in enumerate(arr):
@@ -910,7 +923,7 @@ def ranked(race, horses, odds):
             h['rank'] = 'S' if r_ >= 2.0 else 'A' if r_ >= 1.3 else 'B' if r_ >= 0.8 else 'C' if r_ >= 0.5 else 'D'
     for h in arr:
         h['pBase'] = h['p']      # 重点補正の前の勝率（穴の決め方はこの勝率で学習したので、穴選びにはこちらを使う）
-    if MANUAL_BOOST and not os.environ.get('SYH_BACKTEST') and not race.get('narMode'):
+    if MANUAL_BOOST and not os.environ.get('SYH_BACKTEST') and not race.get('narMode') and not race.get('banei'):
         try:
             if manual_boost(race, arr):
                 arr.sort(key=lambda h: -h['p'])
@@ -919,7 +932,7 @@ def ranked(race, horses, odds):
         except Exception as e:
             traceback.print_exc()
             print(f"[boost] 重点補正を計算できず: {e}", flush=True)
-    if SIM_BLEND and SV and not os.environ.get('SYH_BACKTEST') and not race.get('narMode'):
+    if SIM_BLEND and SV and not os.environ.get('SYH_BACKTEST') and not race.get('narMode') and not race.get('banei'):
         try:
             if sim_blend(race, arr):
                 arr.sort(key=lambda h: -h['p'])
@@ -946,6 +959,10 @@ def ranked(race, horses, odds):
     for h in arr:
         # 判定は学習と同じ勝率（補正前・効きを変える前）×オッズで（バックテストで2年とも100%超だったのはこの数字）
         h['evRaw'] = (h['pRaw'] * h['o']) if h.get('pRaw') and h.get('o') else None
+        if race.get('banei'):
+            h['aiPush'] = False
+            h['sprintSkip'] = False
+            continue
         if race.get('narMode'):
             # 地方モード：期待値1.0以上・15倍以下・AIの4位以下（2024〜2026年の単勝 115%／104%／127%）
             h['aiPush'] = bool(h.get('evRaw') and h['evRaw'] >= NM.PUSH_EV and (h.get('o') or 999) <= NM.PUSH_MAX_ODDS
@@ -1393,6 +1410,8 @@ BLOOD_KEYS = {'sireSurf', 'sireDist', 'sireWet', 'dsireSurf', 'sireNewSurf', 'to
 
 def is_debut_race(race, arr):
     """新馬戦か（レース名に「新馬」、または出走馬がみんな初出走）"""
+    if race.get('banei'):
+        return False
     if '新馬' in (race.get('name') or '') or '新馬' in (race.get('condText') or ''):
         return True
     return bool(arr) and all(not [l for l in (h.get('career') or h.get('lines') or []) if l.get('pos')] for h in arr)
@@ -4450,6 +4469,8 @@ def bet_rows_for(arr, race=None):
         if not recs:
             bb = best_bet(arr)
             why = (bb or {}).get('why') or '期待値1.0以上の馬がいないため見送り推奨'
+            if (race or {}).get('banei'):
+                why = 'ばんえい：勝てる買い方が見つかっていないため、推奨なし（印は参考）'
             return [{'label': BEST_LABEL, 'kind': '見送り', 'combos': [], 'body': why, 'n': 0,
                      'note': ('地方モード：推奨の条件に合う馬・目がないレース' if (race or {}).get('narMode') else
                               '◎から組む買い目は3年とも回収70〜85%のため出しません'), 'per': None, 'amount': None}]
@@ -6613,6 +6634,8 @@ def recommended_tickets(arr, race=None):
         return []
     if (race or {}).get('narMode'):
         return nar_tickets(race, a)
+    if (race or {}).get('banei'):
+        return []
     bb = best_bet(arr)
     if not bb or bb.get('skip'):
         return []
