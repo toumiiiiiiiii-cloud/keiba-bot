@@ -821,6 +821,8 @@ BC_PAST_K = 0.5      # 過去の走り（今までのAI。海外の成績は粗�
 BC_PTS_K = 3.0       # 調べた材料（傾向・ローテ・枠・脚質など）の効き
 # 能力（data/bc_2026.json の ab）：スピード指数・G1実績から。オッズは使わない
 BC_PUSH_EV = 1.1
+BC_LOCAL_EV = 1.1    # 現地オッズの勝率×日本のオッズ
+BC_GAP = 1.2         # 日本のオッズ÷現地オッズ（日本の方が2割以上高い）
 BC_POINTS = 15     # 3連単・3連複・馬連・ワイドの推奨は各15点まで
 
 
@@ -888,11 +890,12 @@ def bc_apply(race, arr):
 def bc_tickets(race, a):
     """BC専用モードの買い目：期待値1.1以上の単勝＋1万回で多かった3連単・3連複（各100円）"""
     recs = []
-    for h in [x for x in a if x.get('aiPush')][:2]:
+    for h in sorted([x for x in a if x.get('aiPush')], key=lambda x: -x['evLocal'])[:2]:
         recs.append({'kind': '単勝', 'method': 'single', 'title': '通常', 'labels': ['馬番'], 'cols': [[h['n']]],
                      'combos': [(h['n'],)], 'badge': 'イチ推し', 'hit': h['p'], 'per': 100,
-                     'note': f"{h['name']} 日本{h['o']}倍・期待値{h['evRaw']:.2f}",
-                     'why': f"単勝 {h['n']} {h['name']}（日本{h['o']}倍／現地{h.get('oLocal') or '—'}倍・勝率{h['p'] * 100:.1f}%・期待値{h['evRaw']:.2f}）"})
+                     'note': f"{h['name']} 日本{h['o']}倍／現地{h['oLocal']}倍",
+                     'why': f"単勝 {h['n']} {h['name']}（日本{h['o']}倍／現地{h['oLocal']}倍＝日本が{h['gapJL']:.1f}倍おいしい。"
+                            f"現地の評価だけでも期待値{h['evLocal']:.2f}、AIの期待値{h['evRaw']:.2f}）"})
     sim = SIMS.get(race.get('id')) or {}
     pa = {x['n']: max(1e-6, x['p']) for x in a}
     nums = [x['n'] for x in a][:10]                      # 勝率の上位10頭から組む
@@ -1092,7 +1095,11 @@ def ranked(race, horses, odds):
             h['sprintSkip'] = False
             continue
         if race.get('bcMode'):
-            h['aiPush'] = bool(h.get('evRaw') and h['evRaw'] >= BC_PUSH_EV and (h.get('o') or 999) <= 50)
+            # 現地の評価を信頼：現地オッズの勝率×日本のオッズ（＝日本で人気が無さすぎる度合い）を一番に見る
+            h['evLocal'] = (h['pLocal'] * h['o']) if h.get('pLocal') and h.get('o') else None
+            h['gapJL'] = (h['o'] / h['oLocal']) if h.get('o') and h.get('oLocal') else None
+            h['aiPush'] = bool(h.get('evLocal') and h['evLocal'] >= BC_LOCAL_EV and (h.get('gapJL') or 0) >= BC_GAP
+                               and (h.get('evRaw') or 0) >= 1.0 and (h.get('o') or 999) <= 50)
             h['sprintSkip'] = False
             continue
         if race.get('narMode'):
