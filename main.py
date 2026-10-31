@@ -816,7 +816,10 @@ try:
 except Exception as _e:
     print(f"[bc] BCの資料なし: {_e}", flush=True)
 BC_STYLE = {'逃': 0.02, '先': 0.18, '差': 0.55, '追': 0.82}
-BC_SIM_W = 0.5
+BC_ODDS_W = 0.3      # 現地オッズは3割だけ。残り7割は材料（＋シミュレーション）
+BC_PAST_K = 0.5      # 過去の走り（今までのAI。海外の成績は粗いので半分の効き）
+BC_PTS_K = 3.0       # 調べた材料（傾向・ローテ・枠・脚質など）の効き
+# 能力（data/bc_2026.json の ab）：スピード指数・G1実績から。オッズは使わない
 BC_PUSH_EV = 1.1
 
 
@@ -842,14 +845,22 @@ def bc_apply(race, arr):
             h['st'] = sty[h['n']]
             if not h.get('sim'):
                 h['earlyRatio'] = BC_STYLE.get(sty[h['n']], 0.5)
-    t2 = sum(raw.values())
+    # 材料側（7割）：過去の走り（今までのAI・オッズを使わない）×調べた材料（傾向・ローテ・枠・脚質・鞍上など）
+    ab = {int(k): float(v) for k, v in _it(info.get('ab') or {})}
+    mat = {h['n']: max(1e-4, h['p']) ** BC_PAST_K * math.exp(ab.get(h['n'], -2.5) + BC_PTS_K * sum(x[0] for x in pts.get(h['n'], [])))
+           for h in arr}
+    tm = sum(mat.values())
     for h in arr:
-        p0 = raw[h['n']] / t2
+        h['pPast'] = h['p']
+        h['pMat'] = mat[h['n']] / tm
+    for h in arr:
+        pm = h['pMat']
         hs = (sim or {}).get('horses', {}).get(str(h['n']))
-        if hs:
+        if hs:      # シミュレーション（材料側の勝率で1万回。展開の有利不利が入る）
             h['simWin'], h['simTop3'] = hs['win'], hs['top3']
             h['simP'] = (hs.get('p1', hs['win']), hs.get('p2', 0), hs.get('p3', 0))
-            p0 = (1 - BC_SIM_W) * p0 + BC_SIM_W * hs['win']
+            pm = hs['win']
+        p0 = BC_ODDS_W * h['pLocal'] + (1 - BC_ODDS_W) * pm
         h['pAI'] = h['pRaw'] = h['p'] = p0
         h['ev'] = h['p'] * h['o'] if h.get('o') else None
         notes = [x[1] for x in pts.get(h['n'], [])]
@@ -867,7 +878,8 @@ def bc_apply(race, arr):
     race['model'] = True
     race['bcMode'] = True
     race['bcInfo'] = info
-    race['modelNote'] = ('BC専用モード（現地オッズ＋傾向・各馬の材料' + (f"＋シミュレーション{sim['runs']:,}回を{BC_SIM_W * 100:.0f}%" if sim else '')
+    race['modelNote'] = (f"BC専用モード（現地オッズ{BC_ODDS_W * 100:.0f}%＋材料{(1 - BC_ODDS_W) * 100:.0f}%"
+                         + (f"〈過去の走り・傾向・各馬の材料でシミュレーション{sim['runs']:,}回〉" if sim else '〈過去の走り・傾向・各馬の材料〉')
                          + '。期待値は日本のオッズで）')
     return True
 
