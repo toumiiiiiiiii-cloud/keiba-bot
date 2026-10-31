@@ -5,6 +5,7 @@ netkeibaのURLを送ると、出馬表（5走表示）を読み込み、
 シェイクユアハートと同じ計算方式でスコア・勝率・予想印・買い目を返す。
 """
 import os
+import shutil
 import re
 import sys
 import math
@@ -803,6 +804,104 @@ def is_sprint(race):
         return False
 
 
+# ═════════════════════════════════════════
+# BC専用モード（ブリーダーズカップ2026・キーンランド）
+#   現地オッズ（Sportsbet.io）を土台に、調べた傾向・各馬の材料（data/bc_2026.json の pts）で補正し、
+#   1万回のシミュレーションの勝率を半分まぜる。日本のオッズ（JRA）との乖離で期待値を出す
+# ═════════════════════════════════════════
+BC = {}
+try:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'bc_2026.json'), encoding='utf-8') as _f:
+        BC = json.load(_f)
+except Exception as _e:
+    print(f"[bc] BCの資料なし: {_e}", flush=True)
+BC_STYLE = {'逃': 0.02, '先': 0.18, '差': 0.55, '追': 0.82}
+BC_SIM_W = 0.5
+BC_PUSH_EV = 1.1
+
+
+def bc_apply(race, arr):
+    info = BC.get(race.get('id') or '')
+    if not info or len(arr) < 3:
+        return False
+    _it = lambda x: x.items() if isinstance(x, dict) else x
+    loc = {int(k): float(v) for k, v in _it(info.get('local') or {})}
+    pts = {int(k): v for k, v in _it(info.get('pts') or {})}
+    sty = {int(k): v for k, v in _it(info.get('style') or {})}
+    inv = {h['n']: 1.0 / loc.get(h['n'], 81.0) for h in arr}
+    tot = sum(inv.values())
+    sim = SIMS.get(race['id']) if SIMS.get(race['id'], {}).get('bc') else None
+    raw = {}
+    for h in arr:
+        pl = inv[h['n']] / tot
+        adj = sum(x[0] for x in pts.get(h['n'], []))
+        h['pLocal'] = pl
+        h['oLocal'] = loc.get(h['n'])
+        raw[h['n']] = pl * math.exp(adj)
+        if sty.get(h['n']):
+            h['st'] = sty[h['n']]
+            if not h.get('sim'):
+                h['earlyRatio'] = BC_STYLE.get(sty[h['n']], 0.5)
+    t2 = sum(raw.values())
+    for h in arr:
+        p0 = raw[h['n']] / t2
+        hs = (sim or {}).get('horses', {}).get(str(h['n']))
+        if hs:
+            h['simWin'], h['simTop3'] = hs['win'], hs['top3']
+            h['simP'] = (hs.get('p1', hs['win']), hs.get('p2', 0), hs.get('p3', 0))
+            p0 = (1 - BC_SIM_W) * p0 + BC_SIM_W * hs['win']
+        h['pAI'] = h['pRaw'] = h['p'] = p0
+        h['ev'] = h['p'] * h['o'] if h.get('o') else None
+        notes = [x[1] for x in pts.get(h['n'], [])]
+        if h.get('oLocal') and h.get('o'):
+            r_ = h['o'] / h['oLocal']
+            notes.insert(0, f"日本{h['o']}倍／現地{h['oLocal']}倍" + ('（日本の方が高い＝おいしい）' if r_ >= 1.25 else
+                                                                  '（日本の方が低い＝人気しすぎ）' if r_ <= 0.8 else ''))
+        h['bcNotes'] = notes
+        h['why'] = notes[:3] + [w for w in h.get('why', []) if w not in notes][:1]
+    s_ = sum(h['p'] for h in arr)
+    for h in arr:
+        h['p'] /= s_
+        h['pAI'] = h['pRaw'] = h['p']
+        h['ev'] = h['p'] * h['o'] if h.get('o') else None
+    race['model'] = True
+    race['bcMode'] = True
+    race['bcInfo'] = info
+    race['modelNote'] = ('BC専用モード（現地オッズ＋傾向・各馬の材料' + (f"＋シミュレーション{sim['runs']:,}回を{BC_SIM_W * 100:.0f}%" if sim else '')
+                         + '。期待値は日本のオッズで）')
+    return True
+
+
+def bc_tickets(race, a):
+    """BC専用モードの買い目：期待値1.1以上の単勝＋1万回で多かった3連単・3連複（各100円）"""
+    recs = []
+    for h in [x for x in a if x.get('aiPush')][:2]:
+        recs.append({'kind': '単勝', 'method': 'single', 'title': '通常', 'labels': ['馬番'], 'cols': [[h['n']]],
+                     'combos': [(h['n'],)], 'badge': 'イチ推し', 'hit': h['p'], 'per': 100,
+                     'note': f"{h['name']} 日本{h['o']}倍・期待値{h['evRaw']:.2f}",
+                     'why': f"単勝 {h['n']} {h['name']}（日本{h['o']}倍／現地{h.get('oLocal') or '—'}倍・勝率{h['p'] * 100:.1f}%・期待値{h['evRaw']:.2f}）"})
+    sim = SIMS.get(race.get('id')) or {}
+    tri = [tuple(c['combo']) for c in (sim.get('trifecta') or [])][:6]
+    if tri:
+        n_ = sim['runs']
+        recs.append({'kind': '3連単', 'method': 'normal', 'title': '通常', 'labels': ['1着', '2着', '3着'],
+                     'cols': [list(t) for t in tri], 'combos': tri, 'badge': 'シミュ最多', 'hit': None, 'per': 100,
+                     'note': f"{n_:,}回で多かった並び上位{len(tri)}点",
+                     'why': f"3連単 {'／'.join('→'.join(map(str, t)) for t in tri)}（{n_:,}回走らせて多かった順。一番は{sim['trifecta'][0]['count']}回）"})
+        cnt = {}
+        for c in sim['trifecta']:
+            k = tuple(sorted(c['combo']))
+            cnt[k] = cnt.get(k, 0) + c['count']
+        tri3 = sorted(cnt, key=lambda k: -cnt[k])[:4]
+        recs.append({'kind': '3連複', 'method': 'normal', 'title': '通常', 'labels': ['組'], 'cols': [list(t) for t in tri3],
+                     'combos': tri3, 'badge': 'シミュ最多', 'hit': None, 'per': 100,
+                     'note': f"{n_:,}回で多かった組み合わせ{len(tri3)}点",
+                     'why': f"3連複 {'／'.join('-'.join(map(str, t)) for t in tri3)}（{n_:,}回で多かった組み合わせ）"})
+    for r in recs:
+        r['multi'] = False
+    return recs
+
+
 def nar_apply(race, arr):
     """地方競馬（帯広以外）：地方の結果で学習したAIで勝率を出し直す。オッズが全頭そろっているときだけ"""
     if not NM or 'nar.' not in race.get('base', '') or race.get('banei'):
@@ -915,7 +1014,7 @@ def ranked(race, horses, odds):
         arr.sort(key=lambda h: -h['p'])
         for i, h in enumerate(arr):
             h['rk'] = i + 1
-    if nar_apply(race, arr):
+    if bc_apply(race, arr) or nar_apply(race, arr):
         arr.sort(key=lambda h: -h['p'])
         for i, h in enumerate(arr):
             h['rk'] = i + 1
@@ -923,7 +1022,7 @@ def ranked(race, horses, odds):
             h['rank'] = 'S' if r_ >= 2.0 else 'A' if r_ >= 1.3 else 'B' if r_ >= 0.8 else 'C' if r_ >= 0.5 else 'D'
     for h in arr:
         h['pBase'] = h['p']      # 重点補正の前の勝率（穴の決め方はこの勝率で学習したので、穴選びにはこちらを使う）
-    if MANUAL_BOOST and not os.environ.get('SYH_BACKTEST') and not race.get('narMode') and not race.get('banei'):
+    if MANUAL_BOOST and not os.environ.get('SYH_BACKTEST') and not race.get('narMode') and not race.get('banei') and not race.get('bcMode'):
         try:
             if manual_boost(race, arr):
                 arr.sort(key=lambda h: -h['p'])
@@ -932,7 +1031,7 @@ def ranked(race, horses, odds):
         except Exception as e:
             traceback.print_exc()
             print(f"[boost] 重点補正を計算できず: {e}", flush=True)
-    if SIM_BLEND and SV and not os.environ.get('SYH_BACKTEST') and not race.get('narMode') and not race.get('banei'):
+    if SIM_BLEND and SV and not os.environ.get('SYH_BACKTEST') and not race.get('narMode') and not race.get('banei') and not race.get('bcMode'):
         try:
             if sim_blend(race, arr):
                 arr.sort(key=lambda h: -h['p'])
@@ -963,6 +1062,10 @@ def ranked(race, horses, odds):
             h['aiPush'] = False
             h['sprintSkip'] = False
             continue
+        if race.get('bcMode'):
+            h['aiPush'] = bool(h.get('evRaw') and h['evRaw'] >= BC_PUSH_EV and (h.get('o') or 999) <= 50)
+            h['sprintSkip'] = False
+            continue
         if race.get('narMode'):
             # 地方モード：期待値1.0以上・15倍以下・AIの4位以下（2024〜2026年の単勝 115%／104%／127%）
             h['aiPush'] = bool(h.get('evRaw') and h['evRaw'] >= NM.PUSH_EV and (h.get('o') or 999) <= NM.PUSH_MAX_ODDS
@@ -972,7 +1075,7 @@ def ranked(race, horses, odds):
         h['aiPush'] = bool(race.get('model') and h.get('evRaw') and h['evRaw'] >= AI_PUSH_EV and (h.get('o') or 999) <= AI_PUSH_MAX_ODDS
                            and not (SPRINT_SKIP and is_sprint(race)))
         h['sprintSkip'] = bool(SPRINT_SKIP and is_sprint(race))
-    race['sprintSkip'] = bool(SPRINT_SKIP and is_sprint(race)) and not race.get('narMode')
+    race['sprintSkip'] = bool(SPRINT_SKIP and is_sprint(race)) and not race.get('narMode') and not race.get('bcMode')
     race['aiPush'] = sorted([h for h in arr if h['aiPush']], key=lambda h: -h['evRaw'])
     return arr
 
@@ -6038,8 +6141,28 @@ def prebuilt_video(race, arr):
     return e
 
 
+def bc_video(race, arr, base):
+    """BC専用モード：1万回で一番多かった3連単の動画（data/bc_videos に作り置き）。取消などで顔ぶれが変わったら使わない"""
+    rid = race.get('id') or ''
+    d_ = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'bc_videos')
+    mp4, jpg = os.path.join(d_, rid + '.mp4'), os.path.join(d_, rid + '_pv.jpg')
+    sim = SIMS.get(rid) or {}
+    if not (race.get('bcMode') and os.path.exists(mp4) and os.path.exists(jpg)):
+        return None
+    if sim.get('nums') and sorted(sim['nums']) != sorted(h['n'] for h in arr if h.get('n')):
+        return None
+    os.makedirs(IMG_DIR, exist_ok=True)
+    for src, dst in ((mp4, f'bc_{rid}.mp4'), (jpg, f'bc_{rid}_pv.jpg')):
+        if not os.path.exists(os.path.join(IMG_DIR, dst)):
+            shutil.copy(src, os.path.join(IMG_DIR, dst))
+    return VideoSendMessage(original_content_url=f"{base}/img/bc_{rid}.mp4", preview_image_url=f"{base}/img/bc_{rid}_pv.jpg")
+
+
 def video_message(race, arr, base, allow_make=False):
     """LINEに送る動画のメッセージ。作り置きがあればそれ、無ければ allow_make のときだけその場で作る"""
+    bv = bc_video(race, arr, base)
+    if bv:
+        return bv
     e = prebuilt_video(race, arr)
     if e:
         return VideoSendMessage(original_content_url=e['mp4'], preview_image_url=e['jpg'])
@@ -6634,6 +6757,8 @@ def recommended_tickets(arr, race=None):
         return []
     if (race or {}).get('narMode'):
         return nar_tickets(race, a)
+    if (race or {}).get('bcMode'):
+        return bc_tickets(race, a)
     if (race or {}).get('banei'):
         return []
     bb = best_bet(arr)
@@ -7246,13 +7371,13 @@ def _build_prediction(text, base):
                     traceback.print_exc()
             imgs.append(render_short_image(race, arr))
             try:   # 展開図（動画と同じ「予想どおりの展開になった代表の1回」から）
-                if SV and len(imgs) < 4:
+                if SV and len(imgs) < 4 and not race.get('bcMode'):
                     sim = SV.simulate(race, arr)
                     if sim:
                         imgs.append(render_tenkai_image(race, arr, sim))
             except Exception:
                 traceback.print_exc()
-            keys = [save_image(im) for im in imgs[:4]]
+            keys = [save_image(im) for im in imgs[:3 if race.get('bcMode') else 4]]
         for key in keys:
             messages.append(ImageSendMessage(original_content_url=f"{base}/img/{key}.png",
                                              preview_image_url=f"{base}/img/{key}_pv.jpg"))

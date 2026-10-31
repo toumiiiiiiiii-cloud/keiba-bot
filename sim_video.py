@@ -31,7 +31,7 @@ def _early_ratio(h):
     return float(r)
 
 
-def simulate(race, arr, runs=1000, seed=None, match_prediction=True, extra=None, style_k=0.0, inner_k=0.0):
+def simulate(race, arr, runs=1000, seed=None, match_prediction=True, extra=None, style_k=0.0, inner_k=0.0, modal_trifecta=False):
     """各馬の位置取り（earlyRatio）と勝率（p）から、1000回レースを走らせて集計する。
     ・序盤：近走の位置取り＋ゆらぎ＋たまに出遅れ → 隊列とペースが決まる
     ・ゴール：勝率（Plackett-Luce：log p ＋ ガンベル乱数）に、その回のペースの有利不利を足す
@@ -108,6 +108,20 @@ def simulate(race, arr, runs=1000, seed=None, match_prediction=True, extra=None,
              + 0.5 * np.abs(early_rank[cand] - avg_early[None, :]).sum(axis=1))
     rep = int(cand[dist_.argmin()])
 
+    # 3連単（1〜3着の並び）の回数。modal_trifecta のときは、いちばん多かった並びの回から代表を選ぶ
+    top3_idx = np.argsort(fin_rank, axis=1)[:, :3]
+    codes = top3_idx[:, 0] * N * N + top3_idx[:, 1] * N + top3_idx[:, 2]
+    uq, cnt = np.unique(codes, return_counts=True)
+    order_c = np.argsort(-cnt)[:20]
+    trif = [{'combo': [int(nums[c // (N * N)]), int(nums[(c // N) % N]), int(nums[c % N])], 'count': int(k_)}
+            for c, k_ in zip(uq[order_c], cnt[order_c])]
+    if modal_trifecta:
+        cand2 = np.where(codes == uq[order_c[0]])[0]
+        d2 = (np.abs(fin_rank[cand2] - (avg_fin - 1)[None, :]).sum(axis=1)
+              + 0.5 * np.abs(early_rank[cand2] - avg_early[None, :]).sum(axis=1))
+        rep = int(cand2[d2.argmin()])
+        match = 'trifecta'
+
     # 代表レースの着差（強さの差を馬身に）
     fo = np.argsort(fin_rank[rep])
     s_sorted = S[rep][fo]
@@ -124,7 +138,10 @@ def simulate(race, arr, runs=1000, seed=None, match_prediction=True, extra=None,
         'horses': {str(int(nums[i])): {'early': float(E[:, i].mean()), 'group': group[i],
                                        'win': float(win[i]), 'top3': float(top3[i]), 'avg': float(avg_fin[i]),
                                        'lead': float(lead_cnt[i] / runs),
+                                       'p1': float((fin_rank[:, i] == 0).mean()), 'p2': float((fin_rank[:, i] == 1).mean()),
+                                       'p3': float((fin_rank[:, i] == 2).mean()),
                                        'pos_cnt': [int(x) for x in np.bincount(fin_rank[:, i], minlength=N)]} for i in range(N)},
+        'trifecta': trif,                                # 3連単の多かった並び（上位20）
         'rep': {
             'early_order': [int(nums[i]) for i in np.argsort(early_rank[rep])],
             'finish_order': [int(nums[i]) for i in fo],
@@ -160,6 +177,7 @@ TRACK = {   # (周回, 直線)
     ('新潟', 'ダ'): (1472, 354), ('東京', 'ダ'): (1899, 501), ('中山', 'ダ'): (1493, 308),
     ('中京', 'ダ'): (1530, 410), ('京都', 'ダ'): (1608, 329), ('阪神', 'ダ'): (1517, 352),
     ('小倉', 'ダ'): (1445, 291),
+    ('キーンランド', 'ダ'): (1710, 358), ('キーンランド', '芝'): (1509, 358),
 }
 
 
@@ -317,12 +335,16 @@ def make_video(race, arr, sim, out_mp4, out_jpg=None, seconds=14):
     d.rounded_rectangle((W - 36 - tw_ - 24, 58, W - 30, 90), radius=14, fill=(48, 38, 16), outline=GOLD_D)
     d.text((W - 36 - tw_ - 12, 62), tag, font=font('b', 19), fill=GOLD)
     rep = sim['rep']
-    if rep.get('match', '').startswith('pred'):
+    if rep.get('match') == 'trifecta' and sim.get('trifecta'):
+        t0_ = sim['trifecta'][0]
+        pl = f"{sim['runs']:,}回で一番多かった3連単：{'→'.join(map(str, t0_['combo']))}（{t0_['count']}回）"
+        foot = f"※{sim['runs']:,}回走らせて一番多かった着順（3連単）の回を再現。コース形状は目安です"
+    elif rep.get('match', '').startswith('pred'):
         pl = f"予想の展開：{PACE_LABEL[rep['pace']]}ペース・{rep['leader']}番が逃げ"
-        pl += f"（1000回中{rep['n_match']}回）" if rep['match'] == 'pred' else '（ペースのみ一致）'
+        pl += f"（{sim['runs']}回中{rep['n_match']}回）" if rep['match'] == 'pred' else '（ペースのみ一致）'
         foot = '※予想と同じ展開になった回のうち、平均的な1回を再現。コース形状は目安です'
     else:
-        pl, foot = '', '※1000回で最も多かった展開に近い1回を再現。コース形状は目安です'
+        pl, foot = '', f"※{sim['runs']}回で最も多かった展開に近い1回を再現。コース形状は目安です"
     if pl:
         pw = d.textlength(pl, font=font('b', 17))
         d.rounded_rectangle((W - 36 - pw - 24, 96, W - 30, 124), radius=12, fill=(18, 40, 60), outline=(70, 120, 170))
@@ -333,6 +355,7 @@ def make_video(race, arr, sim, out_mp4, out_jpg=None, seconds=14):
     f_small = font('b', 13)
     n_run = int(FPS * seconds)
     n_hold = FPS * 4
+    n_rates = FPS * 7 if sim['horses'] and 'p1' in next(iter(sim['horses'].values())) else 0   # 最後に全頭の1・2・3着率
     lanes = {n: 6 + (gate[n][1] - 1) * (BAND - 18) / max(1, len(nums) - 1) for n in nums}
 
     writer = imageio_ffmpeg.write_frames(
@@ -341,7 +364,7 @@ def make_video(race, arr, sim, out_mp4, out_jpg=None, seconds=14):
     writer.send(None)
     last = None
     try:
-        for f in range(n_run + n_hold):
+        for f in range(n_run + n_hold + n_rates):
             u = min(f / n_run, 1.0) * 1.03            # 先頭の進み具合（少しだけゴールを過ぎるまで）
             front = u * dist
             t_form = _smooth(u / 0.12)                # 序盤で隊列ができる
@@ -384,7 +407,9 @@ def make_video(race, arr, sim, out_mp4, out_jpg=None, seconds=14):
                 fc, tc = WAKU.get(w, WAKU[1])
                 dd.ellipse((cx_ - 12, H - 66, cx_ + 12, H - 42), fill=fc, outline=(20, 20, 20))
                 dd.text((cx_ - dd.textlength(str(n), font=f_small) / 2, H - 63), str(n), font=f_small, fill=tc)
-            if f >= n_run:                            # 最後の4秒：結果
+            if f >= n_run + n_hold:                   # 最後：全頭の1着率・2着率・3着率
+                img = _rates_panel(sim, by_n, race, (f - n_run - n_hold) / FPS)
+            elif f >= n_run:                          # 結果
                 _result_panel(img, sim, by_n, (f - n_run) / FPS)
             last = img
             writer.send(img.tobytes())
@@ -408,9 +433,9 @@ def _result_panel(img, sim, by_n, t):
         return
     d = ImageDraw.Draw(img)
     x0, y = bx[0] + 30, bx[1] + 20
-    d.text((x0, y), '代表レースの着順', font=font('b', 24), fill=GOLD)
-    d.text((bx[2] - 30 - d.textlength('1000回の勝率／3着内率', font=font('r', 16)), y + 8),
-           '1000回の勝率／3着内率', font=font('r', 16), fill=MUTED)
+    d.text((x0, y), '一番多かった着順' if sim['rep'].get('match') == 'trifecta' else '代表レースの着順', font=font('b', 24), fill=GOLD)
+    lab_ = f"{sim['runs']:,}回の勝率／3着内率"
+    d.text((bx[2] - 30 - d.textlength(lab_, font=font('r', 16)), y + 8), lab_, font=font('r', 16), fill=MUTED)
     y += 46
     rep = sim['rep']
     for i, n in enumerate(rep['finish_order'][:5]):
@@ -426,6 +451,40 @@ def _result_panel(img, sim, by_n, t):
         r_ = f"{st.get('win', 0) * 100:.0f}% ／ {st.get('top3', 0) * 100:.0f}%"
         d.text((bx[2] - 30 - d.textlength(r_, font=font('b', 20)), y + 2), r_, font=font('b', 20), fill=GOLD)
         y += 46
+
+
+def _rates_panel(sim, by_n, race, t):
+    """全頭の1着率・2着率・3着率（シミュレーション全体）"""
+    img = _bg()
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((8, 8, W - 8, H - 8), radius=18, outline=GOLD_D, width=2)
+    d.text((28, 20), f"{race.get('name', '')}  {sim['runs']:,}回走らせた結果", font=font('b', 28), fill=GOLD)
+    rows = sorted(sim['horses'].items(), key=lambda kv: -(kv[1].get('p1', 0) + kv[1].get('p2', 0) * 0.5 + kv[1].get('p3', 0) * 0.25))
+    n = len(rows)
+    top, bottom = 72, H - 46
+    rh = min(34, (bottom - top - 34) / max(1, n))
+    xs = [40, 92, 420, 560, 700, 840]
+    fh = font('b', 18)
+    for x, lab in zip(xs, ['', '馬名', '1着率', '2着率', '3着率', '3着内率']):
+        d.text((x, top), lab, font=fh, fill=MUTED)
+    y = top + 30
+    fz = font('b', max(14, int(rh * 0.6)))
+    for i, (k, st) in enumerate(rows):
+        h = by_n.get(int(k), {})
+        fc, tc = WAKU.get(h.get('w') or 1, WAKU[1])
+        cy = y + i * rh
+        d.ellipse((xs[0], cy + 2, xs[0] + rh - 6, cy + rh - 4), fill=fc, outline=(20, 20, 20))
+        d.text((xs[0] + (rh - 6) / 2 - d.textlength(k, font=fz) / 2, cy + 3), k, font=fz, fill=tc)
+        d.text((xs[1], cy + 2), (h.get('name') or '')[:14], font=fz, fill=SILVER)
+        vals = [st.get('p1', 0), st.get('p2', 0), st.get('p3', 0), st.get('top3', 0)]
+        for x, v in zip(xs[2:], vals):
+            bw = int(110 * v)
+            d.rounded_rectangle((x, cy + 6, x + max(2, bw), cy + rh - 8), radius=4, fill=(70, 60, 30))
+            d.text((x + 4, cy + 2), f"{v * 100:.1f}%", font=fz, fill=GOLD if x == xs[2] else SILVER)
+    if sim.get('trifecta'):
+        tops = '　'.join(f"{'→'.join(map(str, c['combo']))}（{c['count']}回）" for c in sim['trifecta'][:4])
+        d.text((28, H - 38), f"多かった3連単：{tops}", font=font('b', 16), fill=MUTED)
+    return img
 
 
 # ═════════════════════════════════════════
