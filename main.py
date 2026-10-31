@@ -405,8 +405,8 @@ def parse_race_info(soup, race_id, base):
     dm = re.search(r'(芝|ダ|障)\s*(\d{3,4})m', d1t)
     r['surf'] = dm.group(1) if dm else '芝'
     r['dist'] = int(dm.group(2)) if dm else 0
-    cm = re.search(r'[(（]([^)）]*)[)）]', d1t)
-    r['courseNote'] = cm.group(1) if cm else ''          # 例「右 外 A」（動画のコース形状に使う）
+    cm = re.search(r'\d{3,4}m\s*[(（]([^)）]*)[)）]', d1t) or re.search(r'\d{3,4}m\s*([右左直][^/]*)', d1t)
+    r['courseNote'] = cm.group(1).replace('\xa0', ' ').strip() if cm else ''          # 例「右 外 A」（動画のコース形状に使う）
     tm = re.search(r'(\d{1,2}:\d{2})発走', d1t)
     r['time'] = tm.group(1) if tm else ''
     gm = re.search(r'馬場\s*[:：]\s*(良|稍重?|重|不良?)', d1t)
@@ -6154,20 +6154,30 @@ def prebuilt_video(race, arr):
 
 
 def bc_video(race, arr, base):
-    """BC専用モード：1万回で一番多かった3連単の動画（data/bc_videos に作り置き）。取消などで顔ぶれが変わったら使わない"""
+    """作り置きの縦長動画（1万回で一番多かった着順）。BCは data/bc_videos、ほかのレースは data/videos
+    取消などで顔ぶれが変わっていたら使わない"""
     rid = race.get('id') or ''
-    d_ = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'bc_videos')
-    mp4, jpg = os.path.join(d_, rid + '.mp4'), os.path.join(d_, rid + '_pv.jpg')
-    sim = SIMS.get(rid) or {}
-    if not (race.get('bcMode') and os.path.exists(mp4) and os.path.exists(jpg)):
-        return None
-    if sim.get('nums') and sorted(sim['nums']) != sorted(h['n'] for h in arr if h.get('n')):
-        return None
-    os.makedirs(IMG_DIR, exist_ok=True)
-    for src, dst in ((mp4, f'bc_{rid}.mp4'), (jpg, f'bc_{rid}_pv.jpg')):
-        if not os.path.exists(os.path.join(IMG_DIR, dst)):
-            shutil.copy(src, os.path.join(IMG_DIR, dst))
-    return VideoSendMessage(original_content_url=f"{base}/img/bc_{rid}.mp4", preview_image_url=f"{base}/img/bc_{rid}_pv.jpg")
+    here = os.path.dirname(os.path.abspath(__file__))
+    for sub, need_bc in (('bc_videos', True), ('videos', False)):
+        d_ = os.path.join(here, 'data', sub)
+        mp4, jpg = os.path.join(d_, rid + '.mp4'), os.path.join(d_, rid + '_pv.jpg')
+        if not (os.path.exists(mp4) and os.path.exists(jpg)) or (need_bc and not race.get('bcMode')):
+            continue
+        nums = (SIMS.get(rid) or {}).get('nums')
+        meta = os.path.join(d_, rid + '.json')
+        if os.path.exists(meta):
+            try:
+                nums = json.load(open(meta, encoding='utf-8')).get('nums') or nums
+            except Exception:
+                pass
+        if nums and sorted(nums) != sorted(h['n'] for h in arr if h.get('n')):
+            continue
+        os.makedirs(IMG_DIR, exist_ok=True)
+        for src, dst in ((mp4, f'pv_{rid}.mp4'), (jpg, f'pv_{rid}_pv.jpg')):
+            if not os.path.exists(os.path.join(IMG_DIR, dst)):
+                shutil.copy(src, os.path.join(IMG_DIR, dst))
+        return VideoSendMessage(original_content_url=f"{base}/img/pv_{rid}.mp4", preview_image_url=f"{base}/img/pv_{rid}_pv.jpg")
+    return None
 
 
 def video_message(race, arr, base, allow_make=False):

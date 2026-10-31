@@ -16,6 +16,12 @@ from PIL import Image, ImageDraw
 COURSE = {
     ('キーンランド', 'ダ'): {'L': 1710.0, 'S': 400.0, 'stretch': 377.0, 'elev': '高低差ほぼなし　平坦'},
     ('キーンランド', '芝'): {'L': 1509.0, 'S': 380.0, 'stretch': 340.0, 'elev': '高低差ほぼなし　平坦'},
+    # JRA（JRAの公表値：1周・直線・高低差）
+    ('東京', '芝'): {'L': 2083.1, 'S': 530.0, 'stretch': 525.9, 'elev': '高低差2.7m　直線に坂'},
+    ('東京', 'ダ'): {'L': 1899.0, 'S': 505.0, 'stretch': 501.6, 'elev': '高低差2.5m　直線に坂'},
+    ('京都', '芝外'): {'L': 1894.3, 'S': 410.0, 'stretch': 403.7, 'elev': '高低差4.3m　3コーナーに坂'},
+    ('京都', '芝'): {'L': 1782.8, 'S': 335.0, 'stretch': 328.4, 'elev': '高低差3.1m　3コーナーに坂'},
+    ('京都', 'ダ'): {'L': 1607.6, 'S': 335.0, 'stretch': 329.1, 'elev': '高低差3.0m'},
 }
 # レースごとのスタート地点の説明（race id → 文）。finish_back：本来のゴール板から手前に何mでゴールするか
 RACE_NOTE = {
@@ -29,7 +35,8 @@ RACE_NOTE = {
 
 
 def course_of(race):
-    c = COURSE.get((race.get('venue'), race.get('surf')))
+    outer = '外' in (race.get('courseNote') or '') and race.get('surf') == '芝'
+    c = COURSE.get((race.get('venue'), '芝外' if outer else race.get('surf'))) or COURSE.get((race.get('venue'), race.get('surf')))
     if not c:
         L = 1700.0 if race.get('surf') == 'ダ' else 1600.0
         c = {'L': L, 'S': 380.0, 'stretch': 360.0, 'elev': ''}
@@ -210,7 +217,13 @@ class Scene:
         self.w, self.h = w, h
         c = course_of(race)
         note = RACE_NOTE.get(race.get('id') or '', {})
-        self.trk = Track(c, right=False, finish_back=note.get('finish_back', 0.0))
+        try:
+            import sim_video as _SV
+            right = bool(_SV.track_of(race).get('right'))
+        except Exception:
+            right = False
+        self.trk = Track(c, right=right, finish_back=note.get('finish_back', 0.0))
+        self.sgn = -1.0 if right else 1.0
         self.dist = float(race.get('dist') or 1600)
         self.cam = Cam(w, h)
         self.surf = race.get('surf')
@@ -243,14 +256,14 @@ class Scene:
         mid = (lead_run * 0.6 + pack_run * 0.4)
         pt, h, turn = self.pos3(mid, T.W * 0.3)
         fwd = np.array([math.cos(h), math.sin(h), 0.0])
-        out = np.array([math.sin(h), -math.cos(h), 0.0])       # 外向き（左回りでは進行方向の右）
+        out = self.sgn * np.array([math.sin(h), -math.cos(h), 0.0])   # 外向き（左回りは進行方向の右、右回りは左）
         if phase == 'gate':                                     # ゲート：内側の斜め前から
             pos = pt + fwd * 16 - out * 14 + [0, 0, 4.5]
             tgt = pt - fwd * 2 + out * 4 + [0, 0, 1.0]
         elif phase == 'goal':                                   # ゴール板の内側から（スタンドが奥に見える）
             g, gh, _ = self.pos3(self.dist, T.W * 0.4)
             gf = np.array([math.cos(gh), math.sin(gh), 0.0])
-            go = np.array([math.sin(gh), -math.cos(gh), 0.0])
+            go = self.sgn * np.array([math.sin(gh), -math.cos(gh), 0.0])
             pos = g - go * 20 + gf * 2 + [0, 0, 3.5]
             tgt = g - gf * 3 + [0, 0, 1.2]
         elif phase == 'stretch':                                # 直線：横（内側）から並走
@@ -342,7 +355,8 @@ class Scene:
                         fz = F(max(12, min(24, int(cam.fpx * 1.4 / Z))))
                         d.text((sx - d.textlength(t, font=fz) / 2, sy - hh - fz.size - 2), t, font=fz, fill=(120, 80, 10), stroke_width=2, stroke_fill=(255, 245, 210))
         # スタンド（ホームの直線の外）
-        st0, st1 = T.xf - 260, T.xf + 60
+        fx = T.center(0, 0)[0]
+        st0, st1 = (fx - 260, fx + 60) if not T.right else (fx - 60, fx + 260)
         yo = -(T.r + T.W + 40)
         for (x0, x1, h0, col) in ((st0, st1, 22, (222, 214, 196)),):
             box = [np.array([x0, yo, 0]), np.array([x1, yo, 0]), np.array([x1, yo - 20, h0]), np.array([x0, yo - 20, h0])]

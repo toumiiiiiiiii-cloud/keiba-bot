@@ -303,7 +303,12 @@ def make_video(race, arr, sim, out_mp4, out_jpg=None, seconds=34):
     mini, where = _mini_course(dist, tr)
     F = lambda s: SV.font('b', s)
     FR = lambda s: SV.font('r', s)
+    import re as _re
     title = race.get('name', '')
+    _g = _re.search(r'\s*\(?(G[1-3]|Jpn[1-3]|L|OP)\)?\s*$', title)
+    if _g and not race.get('grade'):
+        title = title[:_g.start()].strip()
+        race = dict(race, grade=_g.group(1), name=title)
     sub = f"{race.get('venue', '')} {race.get('surf', '')}{dist}m {N}頭 ｜ 基準：{sim['runs']:,}回で最多の着順"
 
     # 動かない部分（見出し・枠・下の帯）
