@@ -324,7 +324,15 @@ def make_video(race, arr, sim, out_mp4, out_jpg=None, seconds=34):
     brand = 'シェイクユアハート 隊列シミュレーション'
     d.text((VW / 2 - d.textlength(brand, font=F(22)) / 2, 1244), brand, font=F(22), fill=(150, 150, 156))
 
-    PRE = int(FPS * 1.6)                     # ゲートイン
+    import sim_video_3d as V3
+    S3 = V3.Scene(race, nums, {n: _colors(race, by_n[n]) for n in nums}, VW, SCN_H, F, seed=N + dist)
+    sky3 = _sky(VW, SCN_H)
+    elev = V3.course_of(race).get('elev', '')
+    note_ = V3.RACE_NOTE.get(race.get('id') or '', {}).get('note')
+    if note_:
+        plan.insert(1, (-0.5, note_))
+    seconds = max(seconds, dist / 26.0)
+    PRE = int(FPS * 3.2)                     # ゲートイン（コースの説明も）
     n_run = int(FPS * seconds)
     n_after = int(FPS * 2.0)
     n_res = FPS * 5
@@ -373,68 +381,38 @@ def make_video(race, arr, sim, out_mp4, out_jpg=None, seconds=34):
             cam_left = cam - (VW * 0.5) / ppm
 
             img = base.copy()
-            scn = Image.new('RGB', (VW, SCN_H))
-            scn.paste(sky, (0, 0))
-            sx = int((cam_left * 2.6) % (stand.width - VW))
-            st_ = stand.crop((sx, 0, sx + VW, 170))
-            scn.paste(st_, (0, -12), st_)
-            scn.paste(ground, (0, 150))
-            sd = ImageDraw.Draw(scn)
-            s_in = 0.75
-            _rail(sd, cam_left * s_in, Y_INNER, ppm * s_in, 15, VW)
-            for m in range(0, dist + 1, 200):           # ハロン棒・ゴール板
-                x = (m - cam_left) * ppm * s_in + VW * 0.5 * (1 - s_in)
-                if -60 < x < VW + 60:
-                    if m == dist:
-                        sd.rectangle((x - 3, Y_INNER - 110, x + 3, Y_INNER), fill=(250, 250, 250))
-                        sd.ellipse((x - 24, Y_INNER - 140, x + 24, Y_INNER - 92), fill=(250, 250, 250), outline=(210, 40, 40), width=5)
-                        xn = (m - cam_left) * ppm * 1.3 + VW * 0.5 * (1 - 1.3)
-                        sd.polygon([(x - 3, Y_INNER), (x + 3, Y_INNER), (xn + 10, SCN_H), (xn - 10, SCN_H)], fill=(250, 250, 250))
-                    else:
-                        rem = dist - m
-                        sd.rectangle((x - 2, Y_INNER - 40, x + 2, Y_INNER), fill=(220, 40, 40) if rem % 400 == 0 else (250, 250, 250))
-                        if rem % 400 == 0 and rem:
-                            sd.text((x - sd.textlength(str(rem), font=F(16)) / 2, Y_INNER - 62), str(rem), font=F(16), fill=(110, 80, 20))
-            label_n = None
-            for n in sorted(nums, key=lambda n: lane[n]):
-                z = min(1.0, lane[n] / 6.5)
-                sc = (0.92 + 0.62 * z) * zoom
-                yg = Y_INNER + 36 + (Y_OUTER - Y_INNER - 26) * z
-                x = (pos[n] - cam_left) * ppm * sc / zoom + VW * 0.5 * (1 - sc / zoom)
-                if x < -140 or x > VW + 140:
-                    continue
-                if fr_run < 0:
-                    fr = 2
-                else:
-                    fr = int(((f / FPS) * (2.3 if u < 1.0 else 1.5) + ph0[n]) * 10) % 10
-                sw, sh = int(140 * sc), int(120 * sc)
-                s2 = sprites[n][fr].resize((sw, sh), Image.BILINEAR)
-                sh_ = Image.new('RGBA', (sw, 12), (0, 0, 0, 0))
-                ImageDraw.Draw(sh_).ellipse((sw * 0.15, 0, sw * 0.85, 11), fill=(0, 0, 0, 60))
-                scn.paste(sh_, (int(x - sw * 0.43), int(yg - 7)), sh_)
-                scn.paste(s2, (int(x - sw * 0.43), int(yg - sh + 4)), s2)
-                if n == order[0] and fr_run >= 0:
-                    label_n = (n, x, yg - sh)
-            if fr_run >= 0 and label_n:                 # 先頭の馬の名札
-                n, x, y = label_n
-                t = name[n]
-                tw_ = sd.textlength(t, font=F(20))
-                bx = max(4, min(VW - tw_ - 24, x - tw_ / 2))
-                sd.rounded_rectangle((bx, y - 4, bx + tw_ + 20, y + 28), radius=8, fill=(20, 20, 24), outline=(240, 240, 240))
-                sd.text((bx + 10, y - 1), t, font=F(20), fill=(255, 255, 255))
+            if S3 is not None:
+                remain_ = dist - pos[order[0]]
+                phase = ('gate' if fr_run < FPS * 0.8 else 'goal' if remain_ < 45 or fr_run > n_run
+                         else 'stretch' if remain_ < 260 else 'run')
+                hs_ = [(n, pos[n], 1.0 + lane[n] * 1.6, fr_run >= 0) for n in nums]
+                scn = S3.render(hs_, pos[order[0]], pos[order[min(3, N - 1)]], phase, sky3, f,
+                                label_n=order[0] if fr_run >= 0 else None, name=name[order[0]], F=F)
+                sd = ImageDraw.Draw(scn)
+            else:
+                raise RuntimeError('3Dの映像が必要です')
             remain = max(0, dist - front)
             if fr_run < int(FPS * 1.2) and fr_run >= 0 or remain <= 0:
                 lab = 'スタート' if remain > 0 else 'ゴール'
                 lw = sd.textlength(lab, font=F(34))
                 sd.rounded_rectangle((VW / 2 - lw / 2 - 40, 14, VW / 2 + lw / 2 + 40, 66), radius=12, fill=(24, 24, 28), outline=(200, 160, 80), width=2)
                 sd.text((VW / 2 - lw / 2, 18), lab, font=F(34), fill=(255, 255, 255))
+            if elev:                                     # 高低差の箱
+                ov_ = Image.new('RGBA', (300, 92), (0, 0, 0, 0))
+                od_ = ImageDraw.Draw(ov_)
+                od_.rectangle((0, 0, 299, 91), fill=(20, 40, 24, 190))
+                od_.text((10, 6), elev, font=F(20), fill=(240, 240, 240))
+                od_.line((12, 66, 288, 66), fill=(150, 230, 150), width=3)
+                px_ = 12 + 276 * min(1.0, max(0.0, front / dist))
+                od_.ellipse((px_ - 7, 59, px_ + 7, 73), fill=(250, 210, 60))
+                scn.paste(ov_, (0, SCN_H - 102), ov_)
             # コース図
             mm = mini.copy()
             md = ImageDraw.Draw(mm)
             for n in reversed(order):
                 mx, my = where(max(0.0, min(dist, pos[n])))
                 md.ellipse((mx - 7, my - 7, mx + 7, my + 7), fill=cloth_of[n], outline=(20, 20, 20))
-            scn.paste(mm, (10, SCN_H - mini.height - 10), mm)
+            scn.paste(mm, (VW - mini.width - 10, SCN_H - mini.height - 10), mm)
             img.paste(scn, (0, SCN_Y))
 
             d = ImageDraw.Draw(img)
@@ -477,15 +455,19 @@ def make_video(race, arr, sim, out_mp4, out_jpg=None, seconds=34):
                     pt_ = f"{pop[n]}人気"
                     d.text((x0 + 340 - d.textlength(pt_, font=F(18)), y0 + 4), pt_, font=F(18), fill=(200, 200, 200))
             # 実況
-            cur = [t for uu, t in plan if (uu <= u if fr_run >= 0 else uu < 0)]
+            cur = [t for uu, t in plan if (uu <= u if fr_run >= 0 else uu <= -1.0 + 1.0 * (f / max(1, PRE)) * 0.99)]
             txt = cur[-1] if cur else ''
-            lines = []
-            for part in txt.split('\n'):
-                lines += _wrap(d, part, F(42), VW - 30)
-            yy = 1174 - len(lines) * 27
+            for fs_ in (42, 34, 28, 24):
+                lines = []
+                for part in txt.split('\n'):
+                    lines += _wrap(d, part, F(fs_), VW - 30)
+                if len(lines) * fs_ * 1.28 <= 116:
+                    break
+            lh_ = int(fs_ * 1.28)
+            yy = 1174 - len(lines) * lh_ / 2
             for ln in lines:
-                d.text((VW / 2 - d.textlength(ln, font=F(42)) / 2, yy), ln, font=F(42), fill=(250, 250, 250))
-                yy += 54
+                d.text((VW / 2 - d.textlength(ln, font=F(fs_)) / 2, yy), ln, font=F(fs_), fill=(250, 250, 250))
+                yy += lh_
             if pv is None and u >= 0.8:
                 pv = img.copy()
             last = img
