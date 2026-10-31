@@ -920,7 +920,7 @@ def bc_tickets(race, a):
         if kind == 'ワイド':      # 同じレースで複数当たるので、どれか1つでも当たる見込みは別に出す
             hit = None
         src = f"{sim['runs']:,}回のシミュで多かった順" if kind == '3連単' and sim.get('trifecta') else 'AIの勝率から当たりやすい順'
-        recs.append({'kind': kind, 'method': 'normal', 'title': '通常', 'labels': [], 'cols': [],
+        recs.append({'kind': kind, 'method': 'normal', 'title': f"通常 {len(combos)}点", 'labels': ['本線'], 'cols': [list(combos[0])],
                      'combos': combos, 'badge': '推奨', 'hit': hit, 'per': 100,
                      'note': f"{src}・{len(combos)}点",
                      'why': f"{kind} {len(combos)}点×100円（{src}）："
