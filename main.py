@@ -4996,8 +4996,14 @@ def make_reasons(race, h):
         R.append(('重点補正', '・'.join(h['boostNotes']) + f"（勝率×{math.exp(h['boostAdj']):.2f}）"))
     if h.get('sim'):
         hs = h['sim']
-        R.append(('シミュレーション', f"{race['simulation']['runs']}回走らせて平均{hs['avg']:.1f}着（{hs['rank']}位）・"
-                  f"勝率{hs['win'] * 100:.1f}%・3着内{hs['top3'] * 100:.1f}%。位置取りは主に{hs['group']}"))
+        sm_ = race.get('simulation') or {}
+        rk_ = hs.get('rank')
+        if rk_ is None:
+            rk_ = sorted(v['avg'] for v in (sm_.get('horses') or {}).values()).index(hs['avg']) + 1 if sm_.get('horses') else '-'
+        p123 = (f"1着{hs['p1'] * 100:.1f}%・2着{hs['p2'] * 100:.1f}%・3着{hs['p3'] * 100:.1f}%" if 'p1' in hs
+                else f"勝率{hs['win'] * 100:.1f}%・3着内{hs['top3'] * 100:.1f}%")
+        R.append(('シミュレーション', f"{sm_.get('runs', 1000):,}回走らせて平均{hs['avg']:.1f}着（{rk_}位）・"
+                  f"{p123}。位置取りは主に{hs.get('group', '')}"))
     if h.get('flowNotes'):
         R.append(('近走の中身', '。'.join(h['flowNotes']) + sgn(h.get('bFlow', 0))))
     if h.get('careerNotes'):
