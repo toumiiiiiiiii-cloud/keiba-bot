@@ -821,6 +821,7 @@ BC_PAST_K = 0.5      # 過去の走り（今までのAI。海外の成績は粗�
 BC_PTS_K = 3.0       # 調べた材料（傾向・ローテ・枠・脚質など）の効き
 # 能力（data/bc_2026.json の ab）：スピード指数・G1実績から。オッズは使わない
 BC_PUSH_EV = 1.1
+BC_POINTS = 15     # 3連単・3連複・馬連・ワイドの推奨は各15点まで
 
 
 def bc_apply(race, arr):
@@ -893,22 +894,38 @@ def bc_tickets(race, a):
                      'note': f"{h['name']} 日本{h['o']}倍・期待値{h['evRaw']:.2f}",
                      'why': f"単勝 {h['n']} {h['name']}（日本{h['o']}倍／現地{h.get('oLocal') or '—'}倍・勝率{h['p'] * 100:.1f}%・期待値{h['evRaw']:.2f}）"})
     sim = SIMS.get(race.get('id')) or {}
-    tri = [tuple(c['combo']) for c in (sim.get('trifecta') or [])][:6]
-    if tri:
-        n_ = sim['runs']
-        recs.append({'kind': '3連単', 'method': 'normal', 'title': '通常', 'labels': ['1着', '2着', '3着'],
-                     'cols': [list(t) for t in tri], 'combos': tri, 'badge': 'シミュ最多', 'hit': None, 'per': 100,
-                     'note': f"{n_:,}回で多かった並び上位{len(tri)}点",
-                     'why': f"3連単 {'／'.join('→'.join(map(str, t)) for t in tri)}（{n_:,}回走らせて多かった順。一番は{sim['trifecta'][0]['count']}回）"})
-        cnt = {}
-        for c in sim['trifecta']:
-            k = tuple(sorted(c['combo']))
-            cnt[k] = cnt.get(k, 0) + c['count']
-        tri3 = sorted(cnt, key=lambda k: -cnt[k])[:4]
-        recs.append({'kind': '3連複', 'method': 'normal', 'title': '通常', 'labels': ['組'], 'cols': [list(t) for t in tri3],
-                     'combos': tri3, 'badge': 'シミュ最多', 'hit': None, 'per': 100,
-                     'note': f"{n_:,}回で多かった組み合わせ{len(tri3)}点",
-                     'why': f"3連複 {'／'.join('-'.join(map(str, t)) for t in tri3)}（{n_:,}回で多かった組み合わせ）"})
+    pa = {x['n']: max(1e-6, x['p']) for x in a}
+    nums = [x['n'] for x in a][:10]                      # 勝率の上位10頭から組む
+    cands = {'3連単': list(itertools.permutations(nums, 3)), '3連複': list(itertools.combinations(nums, 3)),
+             '馬連': list(itertools.combinations(nums, 2)), 'ワイド': list(itertools.combinations(nums, 2))}
+    labels = {'3連単': ['1着', '2着', '3着'], '3連複': ['組'], '馬連': ['組'], 'ワイド': ['組']}
+    joiner = {'3連単': '→', '3連複': '-', '馬連': '-', 'ワイド': '-'}
+    for kind in ('3連単', '3連複', '馬連', 'ワイド'):
+        if kind == '3連単' and sim.get('trifecta'):
+            # 3連単は1万回で多かった並び（足りなければ勝率から）
+            got = [tuple(c['combo']) for c in sim['trifecta']]
+            rest = sorted((c for c in cands[kind] if c not in got), key=lambda c: -combo_prob(kind, c, pa))
+            combos = (got + rest)[:BC_POINTS]
+        else:
+            combos = [tuple(sorted(c)) for c in sorted(cands[kind], key=lambda c: -combo_prob(kind, c, pa))][:BC_POINTS]
+        # 少頭数で当たりすぎる（トリガミになる）ほど買わない：見込み80%に届いたら打ち切り。ワイドは頭数＋1点まで
+        cut, acc = [], 0.0
+        for c in combos:
+            cut.append(c)
+            acc += combo_prob(kind, c, pa)
+            if kind != 'ワイド' and acc >= 0.8:
+                break
+        combos = cut[:len(a) + 1] if kind == 'ワイド' else cut
+        hit = sum(combo_prob(kind, c, pa) for c in combos)
+        if kind == 'ワイド':      # 同じレースで複数当たるので、どれか1つでも当たる見込みは別に出す
+            hit = None
+        src = f"{sim['runs']:,}回のシミュで多かった順" if kind == '3連単' and sim.get('trifecta') else 'AIの勝率から当たりやすい順'
+        recs.append({'kind': kind, 'method': 'normal', 'title': '通常', 'labels': [], 'cols': [],
+                     'combos': combos, 'badge': '推奨', 'hit': hit, 'per': 100,
+                     'note': f"{src}・{len(combos)}点",
+                     'why': f"{kind} {len(combos)}点×100円（{src}）："
+                            + '／'.join(joiner[kind].join(map(str, c)) for c in combos)
+                            + (f"。当たる見込み 約{hit * 100:.0f}%" if hit else '')})
     for r in recs:
         r['multi'] = False
     return recs
