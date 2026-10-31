@@ -850,7 +850,20 @@ def bc_apply(race, arr):
                 h['earlyRatio'] = BC_STYLE.get(sty[h['n']], 0.5)
     # 材料側（7割）：過去の走り（今までのAI・オッズを使わない）×調べた材料（傾向・ローテ・枠・脚質・鞍上など）
     ab = {int(k): float(v) for k, v in _it(info.get('ab') or {})}
-    mat = {h['n']: max(1e-4, h['p']) ** BC_PAST_K * math.exp(ab.get(h['n'], -2.5) + BC_PTS_K * sum(x[0] for x in pts.get(h['n'], [])))
+    rt = {int(k): float(v) for k, v in _it(info.get('rating') or {})}
+    if rt:      # 着差のレーティング（馬身）があればそちらを能力に使う
+        k_ = float(info.get('rating_k') or 0.4)
+        ab = {n: k_ * v for n, v in rt.items()}
+    past_k = float(info['past_k']) if 'past_k' in info else BC_PAST_K
+    gap_w = float(info.get('gap_w') or 0.0)
+    odds_w = float(info['odds_w']) if 'odds_w' in info else BC_ODDS_W
+
+    def _gap(h):        # 現地の方が評価している（日本の方がオッズが高い）ほどプラス
+        if gap_w and h.get('o') and loc.get(h['n']):
+            return gap_w * max(-1.0, min(1.0, math.log(h['o'] / loc[h['n']])))
+        return 0.0
+    mat = {h['n']: max(1e-4, h['p']) ** past_k * math.exp(ab.get(h['n'], min(ab.values()) if ab else -2.5)
+                                                          + BC_PTS_K * sum(x[0] for x in pts.get(h['n'], [])) + _gap(h))
            for h in arr}
     tm = sum(mat.values())
     for h in arr:
@@ -863,7 +876,7 @@ def bc_apply(race, arr):
             h['simWin'], h['simTop3'] = hs['win'], hs['top3']
             h['simP'] = (hs.get('p1', hs['win']), hs.get('p2', 0), hs.get('p3', 0))
             pm = hs['win']
-        p0 = BC_ODDS_W * h['pLocal'] + (1 - BC_ODDS_W) * pm
+        p0 = odds_w * h['pLocal'] + (1 - odds_w) * pm
         h['pAI'] = h['pRaw'] = h['p'] = p0
         h['ev'] = h['p'] * h['o'] if h.get('o') else None
         notes = [x[1] for x in pts.get(h['n'], [])]
@@ -881,7 +894,8 @@ def bc_apply(race, arr):
     race['model'] = True
     race['bcMode'] = True
     race['bcInfo'] = info
-    race['modelNote'] = (f"BC専用モード（現地オッズ{BC_ODDS_W * 100:.0f}%＋材料{(1 - BC_ODDS_W) * 100:.0f}%"
+    race['modelNote'] = ((f"BC専用モード（全AI：着差レーティング・傾向・現地と日本のオッズ差" if odds_w == 0 else
+                          f"BC専用モード（現地オッズ{odds_w * 100:.0f}%＋材料{(1 - odds_w) * 100:.0f}%")
                          + (f"〈過去の走り・傾向・各馬の材料でシミュレーション{sim['runs']:,}回〉" if sim else '〈過去の走り・傾向・各馬の材料〉')
                          + '。期待値は日本のオッズで）')
     return True
