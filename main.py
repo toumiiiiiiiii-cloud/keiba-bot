@@ -913,6 +913,10 @@ def bc_tickets(race, a):
             if not combos:
                 if t['method'] == 'single':
                     combos = [tuple(cols[0])]
+                elif t['method'] == 'form':
+                    combos = [c for c in itertools.product(*cols) if len(set(c)) == len(c)]
+                    if not t['kind'] in ORDERED_K:
+                        combos = sorted({tuple(sorted(c)) for c in combos})
                 elif t['method'] == 'box':
                     k_ = 3 if t['kind'].startswith('3連') else 2
                     combos = [tuple(sorted(c)) for c in itertools.combinations(cols[0], k_)]
