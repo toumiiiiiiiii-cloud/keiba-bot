@@ -5472,6 +5472,38 @@ def draw_lineup(d, race, x0, y0, x1):
             ctext(d, rx, ry - 15, str(h['n']), F('sans_b', 22), fg)
 
 
+def render_combo_ticket(race, r):
+    """推奨の買い目を、全部の組番が並んだ馬券風の画像にする（3連単20点など）"""
+    combos = r['combos']
+    sep = '→' if r['kind'] in ORDERED_K else '-'
+    per_row = 3 if len(combos[0]) == 3 else 4
+    rows = math.ceil(len(combos) / per_row)
+    W_, rh = 1080, 92
+    H_ = 300 + rows * rh + 120
+    img = Image.new('RGB', (W_, H_), (250, 246, 232))
+    d = ImageDraw.Draw(img)
+    INK, ACC = (30, 30, 34), (190, 60, 50)
+    d.rectangle((0, 0, W_, 120), fill=(40, 120, 70))
+    d.text((40, 22), f"{race.get('venue', '')}{race.get('R', '')}R  {race.get('name', '')}", font=F('sans_b', 34), fill=(255, 255, 255))
+    d.text((40, 70), 'AI推奨の馬券', font=F('sans_b', 26), fill=(220, 240, 225))
+    d.rectangle((40, 140, 300, 230), outline=INK, width=4)
+    d.text((170 - d.textlength(r['kind'], font=F('sans_b', 56)) / 2, 148), r['kind'], font=F('sans_b', 56), fill=INK)
+    t2 = f"{r.get('title') or METHOD_JP.get(r['method'], '')}　{len(combos)}点 × {r.get('per', 100):,}円 ＝ {len(combos) * r.get('per', 100):,}円"
+    d.text((330, 168), t2, font=F('sans_b', 36), fill=INK)
+    cw = (W_ - 80) / per_row
+    for i, c in enumerate(combos):
+        x = 40 + (i % per_row) * cw
+        y = 260 + (i // per_row) * rh
+        d.rounded_rectangle((x + 6, y, x + cw - 6, y + rh - 14), radius=12, fill=(255, 255, 255), outline=INK, width=3)
+        lab = sep.join(map(str, c))
+        fz = F('sans_b', 44 if len(lab) <= 8 else 36)
+        d.text((x + 22, y + 14), f"{i + 1}", font=F('sans_b', 22), fill=ACC)
+        d.text((x + cw / 2 - d.textlength(lab, font=fz) / 2 + 10, y + (rh - 14 - fz.size) / 2 - 4), lab, font=fz, fill=INK)
+    note = (r.get('note') or '')[:60]
+    d.text((40, H_ - 90), note, font=F('sans_b', 24), fill=(90, 90, 90))
+    return img
+
+
 def save_image(img):
     """画像を保存して、ファイル名を返す（1日より古い画像は消す）"""
     os.makedirs(IMG_DIR, exist_ok=True)
@@ -7384,6 +7416,27 @@ def build_messages(text, base, uid='anon'):
         if not sess:
             return [TextSendMessage(text="先にレースのURLを送ってください。予想のあと30分間は「買い目」で全部の買い目を出します")], None
         return [TextSendMessage(text=bets_text(*sess)[:4900])], None
+    mk_ = re.match(r'^\s*(3連単|三連単|3連複|三連複|馬連|ワイド|単勝)\s*(本線|全部|全点|馬券)?\s*$', text)
+    if mk_:
+        kind_ = mk_.group(1).replace('三', '3')
+        sess = get_session(uid)
+        if not sess:
+            return [TextSendMessage(text=f"先にレースのURLを送ってください。予想のあと30分間は「{kind_}本線」で馬券の画像を送ります")], None
+        race_, arr_ = sess
+        rs_ = [r for r in recommended_tickets(arr_, race_) if r['kind'] == kind_]
+        if not rs_:
+            return [TextSendMessage(text=f"このレースの推奨に{kind_}はありません")], None
+        msgs = []
+        try:
+            with _render_lock:
+                for r in rs_[:4]:
+                    key = save_image(render_combo_ticket(race_, r))
+                    msgs.append(ImageSendMessage(original_content_url=f"{base}/img/{key}.png",
+                                                 preview_image_url=f"{base}/img/{key}_pv.jpg"))
+        except Exception as e:
+            traceback.print_exc()
+            return [TextSendMessage(text=f"馬券の画像を作れませんでした（{e}）")], None
+        return msgs, None
     if text.strip() in ('動画', '展開動画'):
         sess = get_session(uid)
         if not sess:
