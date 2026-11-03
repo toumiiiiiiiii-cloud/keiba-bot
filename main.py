@@ -894,7 +894,8 @@ def bc_apply(race, arr):
     race['model'] = True
     race['bcMode'] = True
     race['bcInfo'] = info
-    race['modelNote'] = ((f"BC専用モード（全AI：着差レーティング・傾向・現地と日本のオッズ差" if odds_w == 0 else
+    _mode = 'BC専用モード' if info.get('name', '').startswith('BC') else f"{info.get('name', '')}専用モード"
+    race['modelNote'] = ((f"{_mode}（全AI：実力・距離・傾向・展開の材料だけ" if odds_w == 0 else
                           f"BC専用モード（現地オッズ{odds_w * 100:.0f}%＋材料{(1 - odds_w) * 100:.0f}%")
                          + (f"〈過去の走り・傾向・各馬の材料でシミュレーション{sim['runs']:,}回〉" if sim else '〈過去の走り・傾向・各馬の材料〉')
                          + '。期待値は日本のオッズで）')
@@ -904,6 +905,26 @@ def bc_apply(race, arr):
 def bc_tickets(race, a):
     """BC専用モードの買い目：期待値1.1以上の単勝＋1万回で多かった3連単・3連複（各100円）"""
     recs = []
+    fixed = (race.get('bcInfo') or {}).get('tickets')
+    if fixed:       # レースごとに決めた買い目（メルボルンカップなど）
+        for t in fixed:
+            combos = [tuple(c) for c in t['combos']] if t.get('combos') else None
+            cols = t.get('cols') or [list(combos[0])]
+            if not combos:
+                if t['method'] == 'single':
+                    combos = [tuple(cols[0])]
+                elif t['method'] == 'box':
+                    k_ = 3 if t['kind'].startswith('3連') else 2
+                    combos = [tuple(sorted(c)) for c in itertools.combinations(cols[0], k_)]
+                else:   # ながし
+                    ax, mates = cols[0], cols[1]
+                    k_ = 3 if t['kind'].startswith('3連') else 2
+                    combos = [tuple(sorted(ax + list(c))) for c in itertools.combinations(mates, k_ - len(ax))]
+            recs.append({'kind': t['kind'], 'method': t['method'], 'title': METHOD_JP[t['method']] + f" {len(combos)}点",
+                         'labels': t['labels'], 'cols': cols, 'combos': combos, 'badge': '推奨', 'hit': None, 'per': 100,
+                         'note': t['why'], 'why': t['why'] + ('：' + '／'.join('→'.join(map(str, c)) for c in combos) if t['method'] == 'normal' else ''),
+                         'multi': False})
+        return recs
     for h in sorted([x for x in a if x.get('aiPush')], key=lambda x: -x['evLocal'])[:2]:
         recs.append({'kind': '単勝', 'method': 'single', 'title': '通常', 'labels': ['馬番'], 'cols': [[h['n']]],
                      'combos': [(h['n'],)], 'badge': 'イチ推し', 'hit': h['p'], 'per': 100,
@@ -7443,7 +7464,7 @@ def _build_prediction(text, base):
                         imgs.append(render_tenkai_image(race, arr, sim))
             except Exception:
                 traceback.print_exc()
-            keys = [save_image(im) for im in imgs[:3 if race.get('bcMode') else 4]]
+            keys = [save_image(im) for im in imgs[:3 if race.get('bcMode') and not (race.get('bcInfo') or {}).get('no_video') else 4]]
         for key in keys:
             messages.append(ImageSendMessage(original_content_url=f"{base}/img/{key}.png",
                                              preview_image_url=f"{base}/img/{key}_pv.jpg"))
