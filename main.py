@@ -1117,7 +1117,8 @@ def ranked(race, horses, odds):
         for h in arr:
             h['anaFlag'] = h['n'] in ana_ids
     try:
-        arr = role_marks(arr)
+        if not race.get('bcMode'):     # 専用モード（オッズ抜き）は勝率の順のまま
+            arr = role_marks(arr)
     except Exception as e:
         traceback.print_exc()
         print(f"[marks] 印の役割を付けられず: {e}", flush=True)
